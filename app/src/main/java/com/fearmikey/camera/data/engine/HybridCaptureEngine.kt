@@ -4,6 +4,9 @@ import androidx.camera.core.CameraSelector
 import androidx.camera.core.Preview
 import androidx.lifecycle.LifecycleOwner
 import com.fearmikey.camera.domain.model.CameraMode
+import com.fearmikey.camera.domain.model.ProConfig
+import com.fearmikey.camera.domain.model.CameraHardwareCapabilities
+import com.fearmikey.camera.domain.model.UserPreferences
 
 class HybridCaptureEngine(
     private val cameraXProvider: CameraXProvider,
@@ -28,24 +31,63 @@ class HybridCaptureEngine(
         camera2Provider.setMode(mode)
     }
 
+    override fun applySettings(prefs: UserPreferences) {
+        cameraXProvider.applySettings(prefs)
+        camera2Provider.applySettings(prefs)
+    }
+
     override fun capturePhoto(onSuccess: (String) -> Unit, onError: (Exception) -> Unit) {
         when (currentMode) {
-            CameraMode.PHOTO, CameraMode.VIDEO -> {
+            CameraMode.PHOTO, CameraMode.VIDEO, CameraMode.PORTRAIT -> {
                 cameraXProvider.capturePhoto(onSuccess, onError)
             }
-            CameraMode.NIGHT, CameraMode.PORTRAIT, CameraMode.SLOW_MO -> {
-                // In these modes, we would use Camera2 for advanced control
-                // For now, falling back to CameraX until Camera2 is fully implemented
-                cameraXProvider.capturePhoto(onSuccess, onError)
+            CameraMode.NIGHT, CameraMode.HDR -> {
+                camera2Provider.capturePhoto(onSuccess, onError)
+            }
+            CameraMode.SLOW_MO -> {
+                onError(Exception("Capture photo not supported in Slow Mo mode. Use video."))
             }
         }
     }
 
     override fun startSlowMoVideo(onSuccess: (String) -> Unit, onError: (Exception) -> Unit) {
-        camera2Provider.startSlowMoVideo(onSuccess, onError)
+        if (currentMode == CameraMode.SLOW_MO) {
+            camera2Provider.startSlowMoVideo(onSuccess, onError)
+        } else {
+            cameraXProvider.startSlowMoVideo(onSuccess, onError)
+        }
     }
 
     override fun stopSlowMoVideo() {
-        camera2Provider.stopSlowMoVideo()
+        if (currentMode == CameraMode.SLOW_MO) {
+            camera2Provider.stopSlowMoVideo()
+        } else {
+            cameraXProvider.stopSlowMoVideo()
+        }
+    }
+
+    override fun updateManualConfig(config: ProConfig) {
+        cameraXProvider.updateManualConfig(config)
+        // camera2Provider.updateManualConfig(config)
+    }
+
+    override fun getCapabilities(): CameraHardwareCapabilities? {
+        return camera2Provider.getCapabilities()
+    }
+
+    override fun setProMode(enabled: Boolean) {
+        cameraXProvider.setProMode(enabled)
+        // Only CameraX handles Pro mode preview/config for now to avoid Surface conflicts
+        // camera2Provider.setProMode(enabled) 
+    }
+
+    override fun setZoom(ratio: Float) {
+        cameraXProvider.setZoom(ratio)
+        // camera2Provider.setZoom(ratio)
+    }
+
+    override fun focusAt(x: Float, y: Float) {
+        cameraXProvider.focusAt(x, y)
+        // camera2Provider.focusAt(x, y)
     }
 }

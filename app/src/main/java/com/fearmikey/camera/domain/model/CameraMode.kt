@@ -4,6 +4,7 @@ enum class CameraMode {
     PHOTO,
     VIDEO,
     NIGHT,
+    HDR,
     SLOW_MO,
     PORTRAIT
 }

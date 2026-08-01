@@ -4,6 +4,7 @@ import android.annotation.SuppressLint
 import android.content.ContentValues
 import android.content.Context
 import android.hardware.camera2.*
+import android.hardware.camera2.params.RggbChannelVector
 import android.media.MediaRecorder
 import android.net.Uri
 import android.os.Build
@@ -24,14 +25,35 @@ import java.util.*
 import androidx.core.content.ContextCompat
 import java.util.concurrent.Executor
 
+import android.graphics.Bitmap
+import android.graphics.BitmapFactory
+import android.graphics.ImageFormat
+import android.graphics.Rect
+import android.media.ImageReader
+import com.fearmikey.camera.data.engine.processing.ImageProcessor
+import com.fearmikey.camera.domain.model.ProConfig
+import com.fearmikey.camera.domain.model.CameraHardwareCapabilities
+import com.fearmikey.camera.domain.model.UserPreferences
+import com.fearmikey.camera.domain.model.AspectRatio as DomainAspectRatio
+import com.fearmikey.camera.domain.model.VideoResolution as DomainVideoResolution
+import com.fearmikey.camera.domain.model.VideoCodec as DomainVideoCodec
+import java.io.FileOutputStream
+import java.util.concurrent.atomic.AtomicInteger
+
 class Camera2Provider(
-    private val context: Context
+    private val context: Context,
+    private val processor: ImageProcessor
 ) : CaptureEngine {
 
     private val cameraManager = context.getSystemService(Context.CAMERA_SERVICE) as CameraManager
     private var cameraDevice: CameraDevice? = null
     private var captureSession: CameraCaptureSession? = null
     
+    private var imageReader: ImageReader? = null
+    private val capturedBitmaps = mutableListOf<Bitmap>()
+    private val burstSize = 10
+    private var captureCounter = AtomicInteger(0)
+
     private var mediaRecorder: MediaRecorder? = null
     private var currentVideoPath: String? = null
     
@@ -41,6 +63,12 @@ class Camera2Provider(
     private var currentMode: CameraMode = CameraMode.PHOTO
     private var previewSurface: Surface? = null
     private var lifecycleOwner: LifecycleOwner? = null
+    private var surfaceProvider: Preview.SurfaceProvider? = null
+    private var currentProConfig: ProConfig = ProConfig()
+    private var currentPrefs: UserPreferences = UserPreferences()
+    private var rawImageReader: ImageReader? = null
+    private var latestCaptureResult: TotalCaptureResult? = null
+    private var currentZoomRatio: Float = 1.0f
 
     private fun startBackgroundThread() {
         if (backgroundThread == null) {
@@ -67,6 +95,7 @@ class Camera2Provider(
         cameraSelector: CameraSelector
     ) {
         this.lifecycleOwner = lifecycleOwner
+        this.surfaceProvider = surfaceProvider
         startBackgroundThread()
     }
 
@@ -86,8 +115,381 @@ class Camera2Provider(
         }
     }
 
+    override fun applySettings(prefs: UserPreferences) {
+        currentPrefs = prefs
+        // If in slow-mo or pro mode, we might need to reconfigure
+        if (currentMode == CameraMode.SLOW_MO) {
+            // Re-setup media recorder or session if codec/resolution changed
+        }
+    }
+
+    override fun getCapabilities(): CameraHardwareCapabilities? {
+        val cameraId = findBackCamera() ?: return null
+        val characteristics = cameraManager.getCameraCharacteristics(cameraId)
+        
+        val isoRange = characteristics.get(CameraCharacteristics.SENSOR_INFO_SENSITIVITY_RANGE) ?: Range(100, 3200)
+        val shutterSpeedRange = characteristics.get(CameraCharacteristics.SENSOR_INFO_EXPOSURE_TIME_RANGE) ?: Range(1_000_000L, 1_000_000_000L)
+        val minFocusDistance = characteristics.get(CameraCharacteristics.LENS_INFO_MINIMUM_FOCUS_DISTANCE) ?: 0.0f
+        
+        return CameraHardwareCapabilities(isoRange, shutterSpeedRange, minFocusDistance)
+    }
+
     override fun capturePhoto(onSuccess: (String) -> Unit, onError: (Exception) -> Unit) {
-        // Implement burst capture for Night mode using Camera2
+        startBackgroundThread()
+        val cameraId = findBackCamera() ?: run {
+            onError(Exception("No back camera found"))
+            return
+        }
+
+        if (currentMode == CameraMode.NIGHT) {
+            openCameraAndCaptureNightBurst(cameraId, onSuccess, onError)
+        } else if (currentMode == CameraMode.HDR) {
+            openCameraAndCaptureHDRBurst(cameraId, onSuccess, onError)
+        } else {
+            // Pro Capture or Standard (fallback)
+            openCameraAndCapturePro(cameraId, onSuccess, onError)
+        }
+    }
+
+    private fun findBackCamera(): String? {
+        for (id in cameraManager.cameraIdList) {
+            val characteristics = cameraManager.getCameraCharacteristics(id)
+            val facing = characteristics.get(CameraCharacteristics.LENS_FACING)
+            if (facing == CameraCharacteristics.LENS_FACING_BACK) return id
+        }
+        return null
+    }
+
+    @SuppressLint("MissingPermission")
+    private fun openCameraAndCaptureNightBurst(
+        cameraId: String,
+        onSuccess: (String) -> Unit,
+        onError: (Exception) -> Unit
+    ) {
+        cameraManager.openCamera(cameraId, object : CameraDevice.StateCallback() {
+            override fun onOpened(camera: CameraDevice) {
+                cameraDevice = camera
+                setupNightBurstSession(camera, onSuccess, onError)
+            }
+
+            override fun onDisconnected(camera: CameraDevice) {
+                camera.close()
+                cameraDevice = null
+            }
+
+            override fun onError(camera: CameraDevice, error: Int) {
+                camera.close()
+                cameraDevice = null
+                onError(Exception("Camera open error: $error"))
+            }
+        }, backgroundHandler)
+    }
+
+    @SuppressLint("MissingPermission")
+    private fun openCameraAndCapturePro(
+        cameraId: String,
+        onSuccess: (String) -> Unit,
+        onError: (Exception) -> Unit
+    ) {
+        cameraManager.openCamera(cameraId, object : CameraDevice.StateCallback() {
+            override fun onOpened(camera: CameraDevice) {
+                cameraDevice = camera
+                setupProCaptureSession(camera, onSuccess, onError)
+            }
+
+            override fun onDisconnected(camera: CameraDevice) {
+                camera.close()
+                cameraDevice = null
+            }
+
+            override fun onError(camera: CameraDevice, error: Int) {
+                camera.close()
+                cameraDevice = null
+                onError(Exception("Camera open error: $error"))
+            }
+        }, backgroundHandler)
+    }
+
+    private fun setupProCaptureSession(
+        camera: CameraDevice,
+        onSuccess: (String) -> Unit,
+        onError: (Exception) -> Unit
+    ) {
+        val characteristics = cameraManager.getCameraCharacteristics(camera.id)
+        val configs = characteristics.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)
+        
+        val largestJpeg = configs?.getOutputSizes(ImageFormat.JPEG)?.maxByOrNull { it.width * it.height } ?: Size(1920, 1080)
+        val largestRaw = configs?.getOutputSizes(ImageFormat.RAW_SENSOR)?.maxByOrNull { it.width * it.height } ?: Size(1920, 1080)
+
+        imageReader = ImageReader.newInstance(largestJpeg.width, largestJpeg.height, ImageFormat.JPEG, 2)
+        rawImageReader = if (currentProConfig.isRawEnabled) {
+            ImageReader.newInstance(largestRaw.width, largestRaw.height, ImageFormat.RAW_SENSOR, 2)
+        } else null
+
+        val surfaces = mutableListOf(imageReader!!.surface)
+        rawImageReader?.let { surfaces.add(it.surface) }
+        previewSurface?.let { surfaces.add(it) }
+
+        camera.createCaptureSession(surfaces, object : CameraCaptureSession.StateCallback() {
+            override fun onConfigured(session: CameraCaptureSession) {
+                captureSession = session
+                captureProPhoto(camera, session, onSuccess, onError)
+            }
+
+            override fun onConfigureFailed(session: CameraCaptureSession) {
+                onError(Exception("Session configuration failed"))
+            }
+        }, backgroundHandler)
+    }
+
+    private fun captureProPhoto(
+        camera: CameraDevice,
+        session: CameraCaptureSession,
+        onSuccess: (String) -> Unit,
+        onError: (Exception) -> Unit
+    ) {
+        val builder = camera.createCaptureRequest(CameraDevice.TEMPLATE_STILL_CAPTURE)
+        builder.addTarget(imageReader!!.surface)
+        rawImageReader?.let { builder.addTarget(it.surface) }
+        
+        applyProConfig(builder)
+
+        // Callback for JPEG
+        imageReader!!.setOnImageAvailableListener({ reader ->
+            val image = reader.acquireLatestImage()
+            val buffer = image.planes[0].buffer
+            val bytes = ByteArray(buffer.remaining())
+            buffer.get(bytes)
+            image.close()
+            
+            val bitmap = BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
+            val path = saveBitmapToFile(bitmap, "PRO")
+            onSuccess(path)
+        }, backgroundHandler)
+
+        // Callback for RAW
+        rawImageReader?.setOnImageAvailableListener({ reader ->
+            val image = reader.acquireLatestImage()
+            val result = latestCaptureResult
+            if (result != null) {
+                saveRawImage(image, result)
+            } else {
+                image.close()
+            }
+        }, backgroundHandler)
+
+        session.capture(builder.build(), object : CameraCaptureSession.CaptureCallback() {
+            override fun onCaptureCompleted(session: CameraCaptureSession, request: CaptureRequest, result: TotalCaptureResult) {
+                latestCaptureResult = result
+            }
+        }, backgroundHandler)
+    }
+
+    private fun saveRawImage(image: android.media.Image, result: TotalCaptureResult) {
+        val cameraId = findBackCamera() ?: return
+        val characteristics = cameraManager.getCameraCharacteristics(cameraId)
+        val dngCreator = DngCreator(characteristics, result)
+        
+        val file = File(
+            context.externalCacheDir,
+            "PRO_" + SimpleDateFormat("yyyy-MM-dd-HH-mm-ss-SSS", Locale.US)
+                .format(System.currentTimeMillis()) + ".dng"
+        )
+        
+        FileOutputStream(file).use { out ->
+            dngCreator.writeImage(out, image)
+        }
+        image.close()
+        dngCreator.close()
+    }
+
+    private fun setupNightBurstSession(
+        camera: CameraDevice,
+        onSuccess: (String) -> Unit,
+        onError: (Exception) -> Unit
+    ) {
+        val characteristics = cameraManager.getCameraCharacteristics(camera.id)
+        val configs = characteristics.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)
+        val largestSize = configs?.getOutputSizes(ImageReader::class.java)?.maxByOrNull { it.width * it.height } ?: Size(1920, 1080)
+
+        imageReader = ImageReader.newInstance(largestSize.width, largestSize.height, android.graphics.ImageFormat.JPEG, burstSize).apply {
+            setOnImageAvailableListener({ reader ->
+                val image = reader.acquireLatestImage()
+                val buffer = image.planes[0].buffer
+                val bytes = ByteArray(buffer.remaining())
+                buffer.get(bytes)
+                val bitmap = BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
+                image.close()
+
+                if (bitmap != null) {
+                    synchronized(capturedBitmaps) {
+                        capturedBitmaps.add(bitmap)
+                        if (captureCounter.incrementAndGet() >= burstSize) {
+                            // All frames captured, process them
+                            val bitmapsToProcess = capturedBitmaps.toList()
+                            capturedBitmaps.clear()
+                            captureCounter.set(0)
+                            
+                            // Close session and camera as we have the frames
+                            captureSession?.close()
+                            captureSession = null
+                            cameraDevice?.close()
+                            cameraDevice = null
+                            
+                            backgroundHandler?.post {
+                                try {
+                                    val stackedBitmap = processor.stackFrames(bitmapsToProcess)
+                                    val path = saveBitmapToFile(stackedBitmap, "NIGHT")
+                                    onSuccess(path)
+                                } catch (e: Exception) {
+                                    onError(e)
+                                }
+                            }
+                        }
+                    }
+                }
+            }, backgroundHandler)
+        }
+
+        val surfaces = listOf(imageReader!!.surface)
+        camera.createCaptureSession(surfaces, object : CameraCaptureSession.StateCallback() {
+            override fun onConfigured(session: CameraCaptureSession) {
+                captureSession = session
+                
+                // Create burst request list with Exposure Bracketing
+                val requests = mutableListOf<CaptureRequest>()
+                for (i in 0 until burstSize) {
+                    val builder = camera.createCaptureRequest(CameraDevice.TEMPLATE_STILL_CAPTURE)
+                    builder.addTarget(imageReader!!.surface)
+                    
+                    // Bracketing: alternate between short and long exposure
+                    // Note: In real app, we would use CONTROL_AE_MODE = OFF for full manual control
+                    // For this demo, we'll use AE compensation for bracketing
+                    val exposureValue = if (i % 2 == 0) -2 else 2 // Ev -2 and Ev +2
+                    builder.set(CaptureRequest.CONTROL_AE_EXPOSURE_COMPENSATION, exposureValue)
+                    
+                    // Hardware Sync: Ensure high quality
+                    builder.set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_PICTURE)
+                    builder.set(CaptureRequest.CONTROL_AE_MODE, CaptureRequest.CONTROL_AE_MODE_ON)
+                    
+                    requests.add(builder.build())
+                }
+                
+                session.captureBurst(requests, object : CameraCaptureSession.CaptureCallback() {
+                    override fun onCaptureCompleted(session: CameraCaptureSession, request: CaptureRequest, result: TotalCaptureResult) {
+                        // Optional: Filter frames based on TotalCaptureResult (e.g. lens state, focus)
+                    }
+                }, backgroundHandler)
+            }
+
+            override fun onConfigureFailed(session: CameraCaptureSession) {
+                onError(Exception("Session configuration failed"))
+            }
+        }, backgroundHandler)
+    }
+
+    @SuppressLint("MissingPermission")
+    private fun openCameraAndCaptureHDRBurst(
+        cameraId: String,
+        onSuccess: (String) -> Unit,
+        onError: (Exception) -> Unit
+    ) {
+        cameraManager.openCamera(cameraId, object : CameraDevice.StateCallback() {
+            override fun onOpened(camera: CameraDevice) {
+                cameraDevice = camera
+                setupHDRBurstSession(camera, onSuccess, onError)
+            }
+
+            override fun onDisconnected(camera: CameraDevice) {
+                camera.close()
+                cameraDevice = null
+            }
+
+            override fun onError(camera: CameraDevice, error: Int) {
+                camera.close()
+                cameraDevice = null
+                onError(Exception("Camera open error: $error"))
+            }
+        }, backgroundHandler)
+    }
+
+    private fun setupHDRBurstSession(
+        camera: CameraDevice,
+        onSuccess: (String) -> Unit,
+        onError: (Exception) -> Unit
+    ) {
+        val hdrBurstSize = 3
+        val characteristics = cameraManager.getCameraCharacteristics(camera.id)
+        val configs = characteristics.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)
+        val largestSize = configs?.getOutputSizes(ImageReader::class.java)?.maxByOrNull { it.width * it.height } ?: Size(1920, 1080)
+
+        imageReader = ImageReader.newInstance(largestSize.width, largestSize.height, android.graphics.ImageFormat.JPEG, hdrBurstSize).apply {
+            setOnImageAvailableListener({ reader ->
+                val image = reader.acquireLatestImage()
+                val buffer = image.planes[0].buffer
+                val bytes = ByteArray(buffer.remaining())
+                buffer.get(bytes)
+                val bitmap = BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
+                image.close()
+
+                if (bitmap != null) {
+                    capturedBitmaps.add(bitmap)
+                    if (captureCounter.incrementAndGet() >= hdrBurstSize) {
+                        // All frames captured, process them
+                        val fusedBitmap = processor.fuseHDRFrames(capturedBitmaps)
+                        val path = saveBitmapToFile(fusedBitmap, "HDR")
+                        capturedBitmaps.clear()
+                        captureCounter.set(0)
+                        
+                        captureSession?.close()
+                        cameraDevice?.close()
+                        
+                        onSuccess(path)
+                    }
+                }
+            }, backgroundHandler)
+        }
+
+        val surfaces = listOf(imageReader!!.surface)
+        camera.createCaptureSession(surfaces, object : CameraCaptureSession.StateCallback() {
+            override fun onConfigured(session: CameraCaptureSession) {
+                captureSession = session
+                
+                val requests = mutableListOf<CaptureRequest>()
+                val exposures = listOf(-2, 0, 2)
+                
+                for (ev in exposures) {
+                    val builder = camera.createCaptureRequest(CameraDevice.TEMPLATE_STILL_CAPTURE)
+                    builder.addTarget(imageReader!!.surface)
+                    
+                    builder.set(CaptureRequest.CONTROL_AE_MODE, CaptureRequest.CONTROL_AE_MODE_ON)
+                    builder.set(CaptureRequest.CONTROL_AE_EXPOSURE_COMPENSATION, ev)
+                    
+                    // Lock AF for consistency across the burst
+                    builder.set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_PICTURE)
+                    
+                    requests.add(builder.build())
+                }
+                
+                session.captureBurst(requests, null, backgroundHandler)
+            }
+
+            override fun onConfigureFailed(session: CameraCaptureSession) {
+                onError(Exception("Session configuration failed"))
+            }
+        }, backgroundHandler)
+    }
+
+    private fun saveBitmapToFile(bitmap: Bitmap, prefix: String = "NIGHT"): String {
+        val file = File(
+            context.externalCacheDir,
+            "${prefix}_" + SimpleDateFormat("yyyy-MM-dd-HH-mm-ss-SSS", Locale.US)
+                .format(System.currentTimeMillis()) + ".jpg"
+        )
+        FileOutputStream(file).use { out ->
+            bitmap.compress(Bitmap.CompressFormat.JPEG, 95, out)
+        }
+        return file.absolutePath
     }
 
     override fun startSlowMoVideo(onSuccess: (String) -> Unit, onError: (Exception) -> Unit) {
@@ -246,6 +648,147 @@ class Camera2Provider(
                 onError(Exception("Session configuration failed"))
             }
         }, backgroundHandler)
+    }
+
+    private fun applyProConfig(builder: CaptureRequest.Builder) {
+        currentProConfig.iso?.let {
+            builder.set(CaptureRequest.CONTROL_AE_MODE, CaptureRequest.CONTROL_AE_MODE_OFF)
+            builder.set(CaptureRequest.SENSOR_SENSITIVITY, it)
+        }
+        currentProConfig.shutterSpeedNs?.let {
+            builder.set(CaptureRequest.CONTROL_AE_MODE, CaptureRequest.CONTROL_AE_MODE_OFF)
+            builder.set(CaptureRequest.SENSOR_EXPOSURE_TIME, it)
+        }
+        currentProConfig.focusDistance?.let {
+            builder.set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_OFF)
+            builder.set(CaptureRequest.LENS_FOCUS_DISTANCE, it)
+        }
+        currentProConfig.whiteBalanceKelvin?.let { kelvin ->
+            builder.set(CaptureRequest.CONTROL_AWB_MODE, CaptureRequest.CONTROL_AWB_MODE_OFF)
+            // Approximate Kelvin to color gains (simplified for demo)
+            val gains = kelvinToColorGains(kelvin)
+            builder.set(CaptureRequest.COLOR_CORRECTION_GAINS, gains)
+        }
+    }
+
+    private fun kelvinToColorGains(kelvin: Int): RggbChannelVector {
+        // Simplified mapping for demo purposes
+        val r = if (kelvin < 5000) 2.0f else 1.0f
+        val g = 1.0f
+        val b = if (kelvin > 5000) 2.0f else 1.0f
+        return RggbChannelVector(r, g, g, b)
+    }
+
+    override fun setProMode(enabled: Boolean) {
+        if (enabled) {
+            startProPreview()
+        } else {
+            stopProPreview()
+        }
+    }
+
+    override fun setZoom(ratio: Float) {
+        currentZoomRatio = ratio
+        val session = captureSession ?: return
+        val camera = cameraDevice ?: return
+        val handler = backgroundHandler ?: return
+
+        try {
+            val builder = camera.createCaptureRequest(
+                if (currentMode == CameraMode.VIDEO || currentMode == CameraMode.SLOW_MO)
+                    CameraDevice.TEMPLATE_RECORD
+                else
+                    CameraDevice.TEMPLATE_PREVIEW
+            )
+            previewSurface?.let { builder.addTarget(it) }
+            
+            val characteristics = cameraManager.getCameraCharacteristics(camera.id)
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                builder.set(CaptureRequest.CONTROL_ZOOM_RATIO, ratio)
+            } else {
+                // Fallback to SCALER_CROP_REGION for older devices
+                val sensorRect = characteristics.get(CameraCharacteristics.SENSOR_INFO_ACTIVE_ARRAY_SIZE)
+                if (sensorRect != null) {
+                    val left = (sensorRect.width() / 2 * (1 - 1 / ratio)).toInt()
+                    val top = (sensorRect.height() / 2 * (1 - 1 / ratio)).toInt()
+                    val right = sensorRect.width() - left
+                    val bottom = sensorRect.height() - top
+                    builder.set(CaptureRequest.SCALER_CROP_REGION, Rect(left, top, right, bottom))
+                }
+            }
+
+            session.setRepeatingRequest(builder.build(), null, handler)
+        } catch (e: Exception) {
+            e.printStackTrace()
+        }
+    }
+
+    override fun focusAt(x: Float, y: Float) {
+        val session = captureSession ?: return
+        val camera = cameraDevice ?: return
+        val handler = backgroundHandler ?: return
+
+        try {
+            val builder = camera.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW)
+            previewSurface?.let { builder.addTarget(it) }
+            
+            val characteristics = cameraManager.getCameraCharacteristics(camera.id)
+            val sensorRect = characteristics.get(CameraCharacteristics.SENSOR_INFO_ACTIVE_ARRAY_SIZE) ?: Rect(0, 0, 1920, 1080)
+            
+            // Map 0..1 coordinates to sensor coordinates
+            val centerX = (x * sensorRect.width()).toInt()
+            val centerY = (y * sensorRect.height()).toInt()
+            val regionSize = 100
+            val rect = Rect(
+                (centerX - regionSize).coerceIn(0, sensorRect.width()),
+                (centerY - regionSize).coerceIn(0, sensorRect.height()),
+                (centerX + regionSize).coerceIn(0, sensorRect.width()),
+                (centerY + regionSize).coerceIn(0, sensorRect.height())
+            )
+            
+            builder.set(CaptureRequest.CONTROL_AF_REGIONS, arrayOf(android.hardware.camera2.params.MeteringRectangle(rect, 1000)))
+            builder.set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_AUTO)
+            builder.set(CaptureRequest.CONTROL_AF_TRIGGER, CaptureRequest.CONTROL_AF_TRIGGER_START)
+            
+            session.setRepeatingRequest(builder.build(), null, handler)
+        } catch (e: Exception) {
+            e.printStackTrace()
+        }
+    }
+
+    private fun startProPreview() {
+        // Simplified surface handling
+        // In a real app, we would use provider.onSurfaceRequested(...)
+        // But for this demo, we'll assume previewSurface is already set or handled elsewhere
+        // Actually, let's just make it work with the existing session if it exists
+        updateManualConfig(currentProConfig)
+    }
+
+    private fun stopProPreview() {
+        captureSession?.close()
+        captureSession = null
+        cameraDevice?.close()
+        cameraDevice = null
+    }
+
+    override fun updateManualConfig(config: ProConfig) {
+        currentProConfig = config
+        val session = captureSession ?: return
+        val camera = cameraDevice ?: return
+        
+        try {
+            val builder = camera.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW)
+            previewSurface?.let { builder.addTarget(it) }
+            applyProConfig(builder)
+            
+            session.setRepeatingRequest(builder.build(), object : CameraCaptureSession.CaptureCallback() {
+                override fun onCaptureCompleted(session: CameraCaptureSession, request: CaptureRequest, result: TotalCaptureResult) {
+                    latestCaptureResult = result
+                }
+            }, backgroundHandler)
+        } catch (e: CameraAccessException) {
+            e.printStackTrace()
+        }
     }
 
     private fun saveToMediaStore(path: String) {

@@ -24,12 +24,12 @@ class PortraitSegmenter(
                 addDelegate(gpuDelegate)
             }
             interpreter = Interpreter(loadModelFile(), options)
-        } catch (e: Exception) {
+        } catch (e: Throwable) {
             e.printStackTrace()
-            // Fallback to CPU if GPU fails
+            // Fallback to CPU if GPU fails (e.g. NoClassDefFoundError, UnsatisfiedLinkError)
             try {
                 interpreter = Interpreter(loadModelFile())
-            } catch (ex: Exception) {
+            } catch (ex: Throwable) {
                 ex.printStackTrace()
             }
         }
