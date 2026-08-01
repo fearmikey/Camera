@@ -5,6 +5,9 @@ A high-performance Android camera application featuring advanced capture modes a
 ## Features
 
 - Photo and Video Capture: Standard media capture using CameraX.
+- Redesigned UI: Modern interface inspired by Google Camera with intuitive mode and zoom switching.
+- Dynamic Zoom: Automatic detection of hardware zoom capabilities and physical lens presets.
+- Smart Rotation: Control icons rotate based on device orientation while maintaining stable preview.
 - Night Sight: Multi-frame burst stacking for improved low-light performance.
 - HDR: Exposure bracketing and fusion for high dynamic range photography.
 - Portrait Mode: AI-powered background segmentation and bokeh effects.

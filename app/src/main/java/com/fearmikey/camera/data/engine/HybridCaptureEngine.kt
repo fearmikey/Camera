@@ -50,7 +50,7 @@ class HybridCaptureEngine(
         }
     }
 
-    override fun startSlowMoVideo(onSuccess: (String) -> Unit, onError: (Exception) -> Unit) {
+    override fun startSlowMoVideo(onSuccess: () -> Unit, onError: (Exception) -> Unit) {
         if (currentMode == CameraMode.SLOW_MO) {
             camera2Provider.startSlowMoVideo(onSuccess, onError)
         } else {
@@ -58,11 +58,11 @@ class HybridCaptureEngine(
         }
     }
 
-    override fun stopSlowMoVideo() {
+    override fun stopSlowMoVideo(onSuccess: (String) -> Unit) {
         if (currentMode == CameraMode.SLOW_MO) {
-            camera2Provider.stopSlowMoVideo()
+            camera2Provider.stopSlowMoVideo(onSuccess)
         } else {
-            cameraXProvider.stopSlowMoVideo()
+            cameraXProvider.stopSlowMoVideo(onSuccess)
         }
     }
 

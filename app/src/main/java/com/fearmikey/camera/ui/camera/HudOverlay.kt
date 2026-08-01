@@ -28,7 +28,7 @@ fun HudOverlay(
             RuleOfThirdsGrid()
         }
         
-        if (uiState.userPreferences.showLeveler) {
+        if (uiState.userPreferences.showLeveler || uiState.autoShowLeveler) {
             HorizonLeveler(tilt = uiState.horizonTilt)
         }
         
@@ -67,13 +67,36 @@ fun HorizonLeveler(tilt: Float) {
         val centerX = size.width / 2
         val centerY = size.height / 2
         val lineLength = 100.dp.toPx()
-        val isLevel = abs(tilt) < 1.0f
+        
+        // Find the closest 90-degree reference point
+        val targetRotation = when {
+            tilt > -45f && tilt <= 45f -> 0f
+            tilt > 45f && tilt <= 135f -> 90f
+            tilt > 135f || tilt <= -135f -> 180f
+            else -> -90f
+        }
+        
+        val relativeTilt = tilt - targetRotation
+        val isLevel = abs(relativeTilt) < 1.0f
         val color = if (isLevel) Color.Yellow else Color.White
         val strokeWidth = if (isLevel) 2.dp.toPx() else 1.dp.toPx()
         
         withTransform({
-            rotate(degrees = -tilt, pivot = Offset(centerX, centerY))
+            // Rotate the entire leveler to match the device orientation
+            rotate(degrees = -targetRotation, pivot = Offset(centerX, centerY))
+            // Then rotate the line relative to that for precision
+            rotate(degrees = -relativeTilt, pivot = Offset(centerX, centerY))
         }) {
+            val shadowColor = Color.Black.copy(alpha = 0.5f)
+            
+            // Draw shadow for visibility
+            drawLine(
+                color = shadowColor,
+                start = Offset(centerX - lineLength / 2 + 2f, centerY + 2f),
+                end = Offset(centerX + lineLength / 2 + 2f, centerY + 2f),
+                strokeWidth = strokeWidth
+            )
+
             // Main horizon line
             drawLine(
                 color = color,

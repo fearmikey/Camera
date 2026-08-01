@@ -13,5 +13,7 @@ data class ProConfig(
 data class CameraHardwareCapabilities(
     val isoRange: Range<Int>,
     val shutterSpeedRange: Range<Long>,
-    val minFocusDistance: Float
+    val minFocusDistance: Float,
+    val zoomRange: Range<Float> = Range(1f, 10f),
+    val zoomPresets: List<Float> = listOf(0.6f, 1.0f, 2.0f)
 )

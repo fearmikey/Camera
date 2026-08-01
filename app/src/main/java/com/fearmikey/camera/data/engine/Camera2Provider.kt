@@ -5,9 +5,9 @@ import android.content.ContentValues
 import android.content.Context
 import android.hardware.camera2.*
 import android.hardware.camera2.params.RggbChannelVector
+import android.hardware.camera2.params.OutputConfiguration
+import android.hardware.camera2.params.SessionConfiguration
 import android.media.MediaRecorder
-import android.net.Uri
-import android.os.Build
 import android.os.Handler
 import android.os.HandlerThread
 import android.provider.MediaStore
@@ -42,7 +42,7 @@ import java.util.concurrent.atomic.AtomicInteger
 
 class Camera2Provider(
     private val context: Context,
-    private val processor: ImageProcessor
+    private val processor: ImageProcessor,
 ) : CaptureEngine {
 
     private val cameraManager = context.getSystemService(Context.CAMERA_SERVICE) as CameraManager
@@ -88,6 +88,42 @@ class Camera2Provider(
         }
     }
 
+    private fun createCaptureSession(
+        camera: CameraDevice,
+        surfaces: List<Surface>,
+        callback: CameraCaptureSession.StateCallback,
+    ) {
+        val outputConfigs = surfaces.map { OutputConfiguration(it) }
+        val executor = backgroundHandler?.let { h -> Executor { r -> h.post(r) } } 
+            ?: ContextCompat.getMainExecutor(context)
+            
+        val sessionConfig = SessionConfiguration(
+            SessionConfiguration.SESSION_REGULAR,
+            outputConfigs,
+            executor,
+            callback
+        )
+        camera.createCaptureSession(sessionConfig)
+    }
+
+    private fun createHighSpeedSession(
+        camera: CameraDevice,
+        surfaces: List<Surface>,
+        callback: CameraCaptureSession.StateCallback
+    ) {
+        val outputConfigs = surfaces.map { OutputConfiguration(it) }
+        val executor = backgroundHandler?.let { h -> Executor { r -> h.post(r) } } 
+            ?: ContextCompat.getMainExecutor(context)
+            
+        val sessionConfig = SessionConfiguration(
+            SessionConfiguration.SESSION_HIGH_SPEED,
+            outputConfigs,
+            executor,
+            callback
+        )
+        camera.createCaptureSession(sessionConfig)
+    }
+
     @SuppressLint("MissingPermission")
     override fun bindToLifecycle(
         lifecycleOwner: LifecycleOwner,
@@ -102,12 +138,12 @@ class Camera2Provider(
     override fun setMode(mode: CameraMode) {
         val oldMode = currentMode
         currentMode = mode
-        if (oldMode != CameraMode.SLOW_MO && mode == CameraMode.SLOW_MO) {
+        if ((oldMode != CameraMode.SLOW_MO) && (mode == CameraMode.SLOW_MO)) {
             previewSurface?.let { surface ->
                 cameraDevice?.close()
                 findHighSpeedCamera()?.let { openCameraForPreview(it, surface) }
             }
-        } else if (oldMode == CameraMode.SLOW_MO && mode != CameraMode.SLOW_MO) {
+        } else if ((oldMode == CameraMode.SLOW_MO) && (mode != CameraMode.SLOW_MO)) {
             cameraDevice?.close()
             cameraDevice = null
             captureSession?.close()
@@ -120,6 +156,7 @@ class Camera2Provider(
         // If in slow-mo or pro mode, we might need to reconfigure
         if (currentMode == CameraMode.SLOW_MO) {
             // Re-setup media recorder or session if codec/resolution changed
+            // Implementation pending
         }
     }
 
@@ -127,11 +164,28 @@ class Camera2Provider(
         val cameraId = findBackCamera() ?: return null
         val characteristics = cameraManager.getCameraCharacteristics(cameraId)
         
-        val isoRange = characteristics.get(CameraCharacteristics.SENSOR_INFO_SENSITIVITY_RANGE) ?: Range(100, 3200)
-        val shutterSpeedRange = characteristics.get(CameraCharacteristics.SENSOR_INFO_EXPOSURE_TIME_RANGE) ?: Range(1_000_000L, 1_000_000_000L)
-        val minFocusDistance = characteristics.get(CameraCharacteristics.LENS_INFO_MINIMUM_FOCUS_DISTANCE) ?: 0.0f
+        val isoRange = characteristics[CameraCharacteristics.SENSOR_INFO_SENSITIVITY_RANGE] ?: Range(100, 3200)
+        val shutterSpeedRange = characteristics[CameraCharacteristics.SENSOR_INFO_EXPOSURE_TIME_RANGE] ?: Range(1_000_000L, 1_000_000_000L)
+        val minFocusDistance = characteristics[CameraCharacteristics.LENS_INFO_MINIMUM_FOCUS_DISTANCE] ?: 0.0f
         
-        return CameraHardwareCapabilities(isoRange, shutterSpeedRange, minFocusDistance)
+        val zoomRange = characteristics[CameraCharacteristics.CONTROL_ZOOM_RATIO_RANGE] ?: Range(1.0f, 10.0f)
+
+        // Determine presets within the supported range
+        val presets = mutableListOf<Float>()
+        
+        // Fallback/Standard presets
+        if (zoomRange.lower <= 0.6f) presets.add(0.6f)
+        presets.add(1.0f)
+        if (zoomRange.upper >= 2.0f) presets.add(2.0f)
+        if (zoomRange.upper >= 5.0f) presets.add(5.0f)
+
+        return CameraHardwareCapabilities(
+            isoRange = isoRange,
+            shutterSpeedRange = shutterSpeedRange,
+            minFocusDistance = minFocusDistance,
+            zoomRange = zoomRange,
+            zoomPresets = presets.asSequence().distinct().sorted().toList()
+        )
     }
 
     override fun capturePhoto(onSuccess: (String) -> Unit, onError: (Exception) -> Unit) {
@@ -141,20 +195,17 @@ class Camera2Provider(
             return
         }
 
-        if (currentMode == CameraMode.NIGHT) {
-            openCameraAndCaptureNightBurst(cameraId, onSuccess, onError)
-        } else if (currentMode == CameraMode.HDR) {
-            openCameraAndCaptureHDRBurst(cameraId, onSuccess, onError)
-        } else {
-            // Pro Capture or Standard (fallback)
-            openCameraAndCapturePro(cameraId, onSuccess, onError)
+        when (currentMode) {
+            CameraMode.NIGHT -> openCameraAndCaptureNightBurst(cameraId, onSuccess, onError)
+            CameraMode.HDR -> openCameraAndCaptureHDRBurst(cameraId, onSuccess, onError)
+            else -> openCameraAndCapturePro(cameraId, onSuccess, onError)
         }
     }
 
     private fun findBackCamera(): String? {
         for (id in cameraManager.cameraIdList) {
             val characteristics = cameraManager.getCameraCharacteristics(id)
-            val facing = characteristics.get(CameraCharacteristics.LENS_FACING)
+            val facing = characteristics[CameraCharacteristics.LENS_FACING]
             if (facing == CameraCharacteristics.LENS_FACING_BACK) return id
         }
         return null
@@ -164,10 +215,12 @@ class Camera2Provider(
     private fun openCameraAndCaptureNightBurst(
         cameraId: String,
         onSuccess: (String) -> Unit,
-        onError: (Exception) -> Unit
+        onError: (Exception) -> Unit,
     ) {
-        cameraManager.openCamera(cameraId, object : CameraDevice.StateCallback() {
-            override fun onOpened(camera: CameraDevice) {
+        cameraManager.openCamera(
+            cameraId,
+            object : CameraDevice.StateCallback() {
+                override fun onOpened(camera: CameraDevice) {
                 cameraDevice = camera
                 setupNightBurstSession(camera, onSuccess, onError)
             }
@@ -182,7 +235,9 @@ class Camera2Provider(
                 cameraDevice = null
                 onError(Exception("Camera open error: $error"))
             }
-        }, backgroundHandler)
+        },
+            backgroundHandler
+        )
     }
 
     @SuppressLint("MissingPermission")
@@ -207,16 +262,18 @@ class Camera2Provider(
                 cameraDevice = null
                 onError(Exception("Camera open error: $error"))
             }
-        }, backgroundHandler)
+        },
+            backgroundHandler
+        )
     }
 
     private fun setupProCaptureSession(
         camera: CameraDevice,
         onSuccess: (String) -> Unit,
-        onError: (Exception) -> Unit
+        onError: (Exception) -> Unit,
     ) {
         val characteristics = cameraManager.getCameraCharacteristics(camera.id)
-        val configs = characteristics.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)
+        val configs = characteristics[CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP]
         
         val largestJpeg = configs?.getOutputSizes(ImageFormat.JPEG)?.maxByOrNull { it.width * it.height } ?: Size(1920, 1080)
         val largestRaw = configs?.getOutputSizes(ImageFormat.RAW_SENSOR)?.maxByOrNull { it.width * it.height } ?: Size(1920, 1080)
@@ -230,7 +287,7 @@ class Camera2Provider(
         rawImageReader?.let { surfaces.add(it.surface) }
         previewSurface?.let { surfaces.add(it) }
 
-        camera.createCaptureSession(surfaces, object : CameraCaptureSession.StateCallback() {
+        createCaptureSession(camera, surfaces, object : CameraCaptureSession.StateCallback() {
             override fun onConfigured(session: CameraCaptureSession) {
                 captureSession = session
                 captureProPhoto(camera, session, onSuccess, onError)
@@ -239,7 +296,7 @@ class Camera2Provider(
             override fun onConfigureFailed(session: CameraCaptureSession) {
                 onError(Exception("Session configuration failed"))
             }
-        }, backgroundHandler)
+        })
     }
 
     private fun captureProPhoto(
@@ -259,12 +316,13 @@ class Camera2Provider(
             val image = reader.acquireLatestImage()
             val buffer = image.planes[0].buffer
             val bytes = ByteArray(buffer.remaining())
-            buffer.get(bytes)
+            buffer[bytes]
             image.close()
             
             val bitmap = BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
-            val path = saveBitmapToFile(bitmap, "PRO")
+            val path = saveBitmapToMediaStore(bitmap, "PRO")
             onSuccess(path)
+            bitmap.recycle()
         }, backgroundHandler)
 
         // Callback for RAW
@@ -281,6 +339,10 @@ class Camera2Provider(
         session.capture(builder.build(), object : CameraCaptureSession.CaptureCallback() {
             override fun onCaptureCompleted(session: CameraCaptureSession, request: CaptureRequest, result: TotalCaptureResult) {
                 latestCaptureResult = result
+            }
+
+            override fun onCaptureFailed(session: CameraCaptureSession, request: CaptureRequest, failure: CaptureFailure) {
+                onError(Exception("Capture failed: ${failure.reason}"))
             }
         }, backgroundHandler)
     }
@@ -306,15 +368,15 @@ class Camera2Provider(
     private fun setupNightBurstSession(
         camera: CameraDevice,
         onSuccess: (String) -> Unit,
-        onError: (Exception) -> Unit
+        onError: (Exception) -> Unit,
     ) {
         val characteristics = cameraManager.getCameraCharacteristics(camera.id)
-        val configs = characteristics.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)
+        val configs = characteristics[CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP]
         val largestSize = configs?.getOutputSizes(ImageReader::class.java)?.maxByOrNull { it.width * it.height } ?: Size(1920, 1080)
 
-        imageReader = ImageReader.newInstance(largestSize.width, largestSize.height, android.graphics.ImageFormat.JPEG, burstSize).apply {
+        imageReader = ImageReader.newInstance(largestSize.width, largestSize.height, ImageFormat.JPEG, burstSize).apply {
             setOnImageAvailableListener({ reader ->
-                val image = reader.acquireLatestImage()
+                val image = reader.acquireNextImage() ?: return@setOnImageAvailableListener
                 val buffer = image.planes[0].buffer
                 val bytes = ByteArray(buffer.remaining())
                 buffer.get(bytes)
@@ -324,7 +386,7 @@ class Camera2Provider(
                 if (bitmap != null) {
                     synchronized(capturedBitmaps) {
                         capturedBitmaps.add(bitmap)
-                        if (captureCounter.incrementAndGet() >= burstSize) {
+                        if (capturedBitmaps.size >= burstSize) {
                             // All frames captured, process them
                             val bitmapsToProcess = capturedBitmaps.toList()
                             capturedBitmaps.clear()
@@ -339,8 +401,11 @@ class Camera2Provider(
                             backgroundHandler?.post {
                                 try {
                                     val stackedBitmap = processor.stackFrames(bitmapsToProcess)
-                                    val path = saveBitmapToFile(stackedBitmap, "NIGHT")
+                                    val path = saveBitmapToMediaStore(stackedBitmap, "NIGHT")
                                     onSuccess(path)
+                                    // Clean up
+                                    stackedBitmap.recycle()
+                                    bitmapsToProcess.forEach { it.recycle() }
                                 } catch (e: Exception) {
                                     onError(e)
                                 }
@@ -352,7 +417,7 @@ class Camera2Provider(
         }
 
         val surfaces = listOf(imageReader!!.surface)
-        camera.createCaptureSession(surfaces, object : CameraCaptureSession.StateCallback() {
+        createCaptureSession(camera, surfaces, object : CameraCaptureSession.StateCallback() {
             override fun onConfigured(session: CameraCaptureSession) {
                 captureSession = session
                 
@@ -366,11 +431,11 @@ class Camera2Provider(
                     // Note: In real app, we would use CONTROL_AE_MODE = OFF for full manual control
                     // For this demo, we'll use AE compensation for bracketing
                     val exposureValue = if (i % 2 == 0) -2 else 2 // Ev -2 and Ev +2
-                    builder.set(CaptureRequest.CONTROL_AE_EXPOSURE_COMPENSATION, exposureValue)
+                    builder[CaptureRequest.CONTROL_AE_EXPOSURE_COMPENSATION] = exposureValue
                     
                     // Hardware Sync: Ensure high quality
-                    builder.set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_PICTURE)
-                    builder.set(CaptureRequest.CONTROL_AE_MODE, CaptureRequest.CONTROL_AE_MODE_ON)
+                    builder[CaptureRequest.CONTROL_AF_MODE] = CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_PICTURE
+                    builder[CaptureRequest.CONTROL_AE_MODE] = CaptureRequest.CONTROL_AE_MODE_ON
                     
                     requests.add(builder.build())
                 }
@@ -385,7 +450,7 @@ class Camera2Provider(
             override fun onConfigureFailed(session: CameraCaptureSession) {
                 onError(Exception("Session configuration failed"))
             }
-        }, backgroundHandler)
+        })
     }
 
     @SuppressLint("MissingPermission")
@@ -410,20 +475,22 @@ class Camera2Provider(
                 cameraDevice = null
                 onError(Exception("Camera open error: $error"))
             }
-        }, backgroundHandler)
+        },
+            backgroundHandler
+        )
     }
 
     private fun setupHDRBurstSession(
         camera: CameraDevice,
         onSuccess: (String) -> Unit,
-        onError: (Exception) -> Unit
+        onError: (Exception) -> Unit,
     ) {
         val hdrBurstSize = 3
         val characteristics = cameraManager.getCameraCharacteristics(camera.id)
-        val configs = characteristics.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)
+        val configs = characteristics[CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP]
         val largestSize = configs?.getOutputSizes(ImageReader::class.java)?.maxByOrNull { it.width * it.height } ?: Size(1920, 1080)
 
-        imageReader = ImageReader.newInstance(largestSize.width, largestSize.height, android.graphics.ImageFormat.JPEG, hdrBurstSize).apply {
+        imageReader = ImageReader.newInstance(largestSize.width, largestSize.height, ImageFormat.JPEG, hdrBurstSize).apply {
             setOnImageAvailableListener({ reader ->
                 val image = reader.acquireLatestImage()
                 val buffer = image.planes[0].buffer
@@ -437,7 +504,7 @@ class Camera2Provider(
                     if (captureCounter.incrementAndGet() >= hdrBurstSize) {
                         // All frames captured, process them
                         val fusedBitmap = processor.fuseHDRFrames(capturedBitmaps)
-                        val path = saveBitmapToFile(fusedBitmap, "HDR")
+                        val path = saveBitmapToMediaStore(fusedBitmap, "HDR")
                         capturedBitmaps.clear()
                         captureCounter.set(0)
                         
@@ -451,7 +518,7 @@ class Camera2Provider(
         }
 
         val surfaces = listOf(imageReader!!.surface)
-        camera.createCaptureSession(surfaces, object : CameraCaptureSession.StateCallback() {
+        createCaptureSession(camera, surfaces, object : CameraCaptureSession.StateCallback() {
             override fun onConfigured(session: CameraCaptureSession) {
                 captureSession = session
                 
@@ -462,11 +529,11 @@ class Camera2Provider(
                     val builder = camera.createCaptureRequest(CameraDevice.TEMPLATE_STILL_CAPTURE)
                     builder.addTarget(imageReader!!.surface)
                     
-                    builder.set(CaptureRequest.CONTROL_AE_MODE, CaptureRequest.CONTROL_AE_MODE_ON)
-                    builder.set(CaptureRequest.CONTROL_AE_EXPOSURE_COMPENSATION, ev)
+                    builder[CaptureRequest.CONTROL_AE_MODE] = CaptureRequest.CONTROL_AE_MODE_ON
+                    builder[CaptureRequest.CONTROL_AE_EXPOSURE_COMPENSATION] = ev
                     
                     // Lock AF for consistency across the burst
-                    builder.set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_PICTURE)
+                    builder[CaptureRequest.CONTROL_AF_MODE] = CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_PICTURE
                     
                     requests.add(builder.build())
                 }
@@ -477,22 +544,44 @@ class Camera2Provider(
             override fun onConfigureFailed(session: CameraCaptureSession) {
                 onError(Exception("Session configuration failed"))
             }
-        }, backgroundHandler)
+        })
     }
 
-    private fun saveBitmapToFile(bitmap: Bitmap, prefix: String = "NIGHT"): String {
-        val file = File(
-            context.externalCacheDir,
-            "${prefix}_" + SimpleDateFormat("yyyy-MM-dd-HH-mm-ss-SSS", Locale.US)
-                .format(System.currentTimeMillis()) + ".jpg"
-        )
-        FileOutputStream(file).use { out ->
-            bitmap.compress(Bitmap.CompressFormat.JPEG, 95, out)
+    private fun saveBitmapToMediaStore(bitmap: Bitmap, prefix: String): String {
+        val name = "${prefix}_" + SimpleDateFormat("yyyy-MM-dd-HH-mm-ss-SSS", Locale.US)
+            .format(System.currentTimeMillis())
+        
+        val rotation = getRotationDegrees()
+        val rotatedBitmap = if (rotation != 0) {
+            val matrix = android.graphics.Matrix().apply { postRotate(rotation.toFloat()) }
+            Bitmap.createBitmap(bitmap, 0, 0, bitmap.width, bitmap.height, matrix, true)
+        } else bitmap
+
+        val values = ContentValues().apply {
+            put(MediaStore.MediaColumns.DISPLAY_NAME, name)
+            put(MediaStore.MediaColumns.MIME_TYPE, "image/jpeg")
+            put(MediaStore.Images.Media.ORIENTATION, rotation)
+            put(MediaStore.Images.Media.RELATIVE_PATH, "DCIM/Camera")
         }
-        return file.absolutePath
+
+        val uri = context.contentResolver.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, values)
+        uri?.let {
+            context.contentResolver.openOutputStream(it)?.use { out ->
+                rotatedBitmap.compress(Bitmap.CompressFormat.JPEG, 95, out)
+            }
+            if (rotatedBitmap != bitmap) rotatedBitmap.recycle()
+            return it.toString()
+        }
+        return ""
     }
 
-    override fun startSlowMoVideo(onSuccess: (String) -> Unit, onError: (Exception) -> Unit) {
+    private fun getRotationDegrees(): Int {
+        val cameraId = findBackCamera() ?: return 0
+        val characteristics = cameraManager.getCameraCharacteristics(cameraId)
+        return characteristics[CameraCharacteristics.SENSOR_ORIENTATION] ?: 0
+    }
+
+    override fun startSlowMoVideo(onSuccess: () -> Unit, onError: (Exception) -> Unit) {
         startBackgroundThread()
         val cameraId = findHighSpeedCamera()
         if (cameraId == null) {
@@ -500,10 +589,10 @@ class Camera2Provider(
             return
         }
 
-        openCameraAndStartHighSpeedSession(cameraId, onSuccess, onError)
+        openCameraAndStartHighSpeedSession(cameraId, { onSuccess() }, onError)
     }
 
-    override fun stopSlowMoVideo() {
+    override fun stopSlowMoVideo(onSuccess: (String) -> Unit) {
         try {
             mediaRecorder?.stop()
             mediaRecorder?.reset()
@@ -511,19 +600,30 @@ class Camera2Provider(
             cameraDevice?.close()
             
             currentVideoPath?.let { path ->
-                saveToMediaStore(path)
+                val uri = saveToMediaStore(path)
+                onSuccess(uri)
             }
         } catch (e: Exception) {
             e.printStackTrace()
         } finally {
             stopBackgroundThread()
+            backgroundHandler?.postDelayed({
+                // Re-bind to restore preview after video
+                val owner = lifecycleOwner
+                val provider = surfaceProvider
+                if (owner != null && provider != null) {
+                    ContextCompat.getMainExecutor(context).execute {
+                        bindToLifecycle(owner, provider, CameraSelector.DEFAULT_BACK_CAMERA)
+                    }
+                }
+            }, 500)
         }
     }
 
     private fun findHighSpeedCamera(): String? {
         for (id in cameraManager.cameraIdList) {
             val characteristics = cameraManager.getCameraCharacteristics(id)
-            val capabilities = characteristics.get(CameraCharacteristics.REQUEST_AVAILABLE_CAPABILITIES)
+            val capabilities = characteristics[CameraCharacteristics.REQUEST_AVAILABLE_CAPABILITIES]
             if (capabilities?.contains(CameraMetadata.REQUEST_AVAILABLE_CAPABILITIES_CONSTRAINED_HIGH_SPEED_VIDEO) == true) {
                 return id
             }
@@ -553,24 +653,24 @@ class Camera2Provider(
 
     private fun startHighSpeedPreview(camera: CameraDevice, surface: Surface) {
         val characteristics = cameraManager.getCameraCharacteristics(camera.id)
-        val configs = characteristics.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)
-        val targetSize = configs?.getHighSpeedVideoSizes()?.firstOrNull { it.width <= 1920 } ?: Size(1280, 720)
+        val configs = characteristics[CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP]
+        val targetSize = configs?.highSpeedVideoSizes?.firstOrNull { it.width <= 1920 } ?: Size(1280, 720)
         val targetFpsRange = configs?.getHighSpeedVideoFpsRangesFor(targetSize)?.maxByOrNull { it.upper } ?: Range(120, 120)
 
-        camera.createConstrainedHighSpeedCaptureSession(listOf(surface), object : CameraCaptureSession.StateCallback() {
+        createHighSpeedSession(camera, listOf(surface), object : CameraCaptureSession.StateCallback() {
             override fun onConfigured(session: CameraCaptureSession) {
                 captureSession = session
                 val highSpeedSession = session as CameraConstrainedHighSpeedCaptureSession
                 val builder = camera.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW)
                 builder.addTarget(surface)
-                builder.set(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE, targetFpsRange)
+                builder[CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE] = targetFpsRange
                 
                 val requestList = highSpeedSession.createHighSpeedRequestList(builder.build())
                 highSpeedSession.setRepeatingBurst(requestList, null, backgroundHandler)
             }
 
             override fun onConfigureFailed(session: CameraCaptureSession) {}
-        }, backgroundHandler)
+        })
     }
 
     @SuppressLint("MissingPermission")
@@ -595,18 +695,20 @@ class Camera2Provider(
                 cameraDevice = null
                 onError(Exception("Camera open error: $error"))
             }
-        }, backgroundHandler)
+        },
+            backgroundHandler
+        )
     }
 
     private fun setupMediaRecorderAndSession(
         camera: CameraDevice,
         cameraId: String,
         onSuccess: (String) -> Unit,
-        onError: (Exception) -> Unit
+        onError: (Exception) -> Unit,
     ) {
         val characteristics = cameraManager.getCameraCharacteristics(cameraId)
-        val configs = characteristics.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)
-        val targetSize = configs?.getHighSpeedVideoSizes()?.firstOrNull { it.width <= 1920 } ?: Size(1280, 720)
+        val configs = characteristics[CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP]
+        val targetSize = configs?.highSpeedVideoSizes?.firstOrNull { it.width <= 1920 } ?: Size(1280, 720)
         val targetFpsRange = configs?.getHighSpeedVideoFpsRangesFor(targetSize)?.maxByOrNull { it.upper } ?: Range(120, 120)
 
         val videoFile = createVideoFile()
@@ -627,7 +729,7 @@ class Camera2Provider(
         val surfaces = mutableListOf(recorderSurface)
         previewSurface?.let { surfaces.add(it) }
         
-        camera.createConstrainedHighSpeedCaptureSession(surfaces, object : CameraCaptureSession.StateCallback() {
+        createHighSpeedSession(camera, surfaces, object : CameraCaptureSession.StateCallback() {
             override fun onConfigured(session: CameraCaptureSession) {
                 captureSession = session
                 val highSpeedSession = session as CameraConstrainedHighSpeedCaptureSession
@@ -635,7 +737,7 @@ class Camera2Provider(
                 val builder = camera.createCaptureRequest(CameraDevice.TEMPLATE_RECORD)
                 builder.addTarget(recorderSurface)
                 previewSurface?.let { builder.addTarget(it) }
-                builder.set(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE, targetFpsRange)
+                builder[CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE] = targetFpsRange
                 
                 val requestList = highSpeedSession.createHighSpeedRequestList(builder.build())
                 highSpeedSession.setRepeatingBurst(requestList, null, backgroundHandler)
@@ -647,27 +749,27 @@ class Camera2Provider(
             override fun onConfigureFailed(session: CameraCaptureSession) {
                 onError(Exception("Session configuration failed"))
             }
-        }, backgroundHandler)
+        })
     }
 
     private fun applyProConfig(builder: CaptureRequest.Builder) {
         currentProConfig.iso?.let {
-            builder.set(CaptureRequest.CONTROL_AE_MODE, CaptureRequest.CONTROL_AE_MODE_OFF)
-            builder.set(CaptureRequest.SENSOR_SENSITIVITY, it)
+            builder[CaptureRequest.CONTROL_AE_MODE] = CaptureRequest.CONTROL_AE_MODE_OFF
+            builder[CaptureRequest.SENSOR_SENSITIVITY] = it
         }
         currentProConfig.shutterSpeedNs?.let {
-            builder.set(CaptureRequest.CONTROL_AE_MODE, CaptureRequest.CONTROL_AE_MODE_OFF)
-            builder.set(CaptureRequest.SENSOR_EXPOSURE_TIME, it)
+            builder[CaptureRequest.CONTROL_AE_MODE] = CaptureRequest.CONTROL_AE_MODE_OFF
+            builder[CaptureRequest.SENSOR_EXPOSURE_TIME] = it
         }
         currentProConfig.focusDistance?.let {
-            builder.set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_OFF)
-            builder.set(CaptureRequest.LENS_FOCUS_DISTANCE, it)
+            builder[CaptureRequest.CONTROL_AF_MODE] = CaptureRequest.CONTROL_AF_MODE_OFF
+            builder[CaptureRequest.LENS_FOCUS_DISTANCE] = it
         }
         currentProConfig.whiteBalanceKelvin?.let { kelvin ->
-            builder.set(CaptureRequest.CONTROL_AWB_MODE, CaptureRequest.CONTROL_AWB_MODE_OFF)
+            builder[CaptureRequest.CONTROL_AWB_MODE] = CaptureRequest.CONTROL_AWB_MODE_OFF
             // Approximate Kelvin to color gains (simplified for demo)
             val gains = kelvinToColorGains(kelvin)
-            builder.set(CaptureRequest.COLOR_CORRECTION_GAINS, gains)
+            builder[CaptureRequest.COLOR_CORRECTION_GAINS] = gains
         }
     }
 
@@ -702,20 +804,7 @@ class Camera2Provider(
             )
             previewSurface?.let { builder.addTarget(it) }
             
-            val characteristics = cameraManager.getCameraCharacteristics(camera.id)
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-                builder.set(CaptureRequest.CONTROL_ZOOM_RATIO, ratio)
-            } else {
-                // Fallback to SCALER_CROP_REGION for older devices
-                val sensorRect = characteristics.get(CameraCharacteristics.SENSOR_INFO_ACTIVE_ARRAY_SIZE)
-                if (sensorRect != null) {
-                    val left = (sensorRect.width() / 2 * (1 - 1 / ratio)).toInt()
-                    val top = (sensorRect.height() / 2 * (1 - 1 / ratio)).toInt()
-                    val right = sensorRect.width() - left
-                    val bottom = sensorRect.height() - top
-                    builder.set(CaptureRequest.SCALER_CROP_REGION, Rect(left, top, right, bottom))
-                }
-            }
+            builder[CaptureRequest.CONTROL_ZOOM_RATIO] = ratio
 
             session.setRepeatingRequest(builder.build(), null, handler)
         } catch (e: Exception) {
@@ -733,7 +822,7 @@ class Camera2Provider(
             previewSurface?.let { builder.addTarget(it) }
             
             val characteristics = cameraManager.getCameraCharacteristics(camera.id)
-            val sensorRect = characteristics.get(CameraCharacteristics.SENSOR_INFO_ACTIVE_ARRAY_SIZE) ?: Rect(0, 0, 1920, 1080)
+            val sensorRect = characteristics[CameraCharacteristics.SENSOR_INFO_ACTIVE_ARRAY_SIZE] ?: Rect(0, 0, 1920, 1080)
             
             // Map 0..1 coordinates to sensor coordinates
             val centerX = (x * sensorRect.width()).toInt()
@@ -746,9 +835,9 @@ class Camera2Provider(
                 (centerY + regionSize).coerceIn(0, sensorRect.height())
             )
             
-            builder.set(CaptureRequest.CONTROL_AF_REGIONS, arrayOf(android.hardware.camera2.params.MeteringRectangle(rect, 1000)))
-            builder.set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_AUTO)
-            builder.set(CaptureRequest.CONTROL_AF_TRIGGER, CaptureRequest.CONTROL_AF_TRIGGER_START)
+            builder[CaptureRequest.CONTROL_AF_REGIONS] = arrayOf(android.hardware.camera2.params.MeteringRectangle(rect, 1000))
+            builder[CaptureRequest.CONTROL_AF_MODE] = CaptureRequest.CONTROL_AF_MODE_AUTO
+            builder[CaptureRequest.CONTROL_AF_TRIGGER] = CaptureRequest.CONTROL_AF_TRIGGER_START
             
             session.setRepeatingRequest(builder.build(), null, handler)
         } catch (e: Exception) {
@@ -791,7 +880,7 @@ class Camera2Provider(
         }
     }
 
-    private fun saveToMediaStore(path: String) {
+    private fun saveToMediaStore(path: String): String {
         val file = File(path)
         val values = ContentValues().apply {
             put(MediaStore.Video.Media.DISPLAY_NAME, file.name)
@@ -807,7 +896,9 @@ class Camera2Provider(
                 }
             }
             file.delete()
+            return it.toString()
         }
+        return ""
     }
 
     private fun createVideoFile(): File {

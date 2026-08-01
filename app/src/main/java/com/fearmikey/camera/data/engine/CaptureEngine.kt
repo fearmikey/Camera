@@ -17,8 +17,8 @@ interface CaptureEngine {
     fun setMode(mode: CameraMode)
     fun applySettings(prefs: UserPreferences)
     fun capturePhoto(onSuccess: (String) -> Unit, onError: (Exception) -> Unit)
-    fun startSlowMoVideo(onSuccess: (String) -> Unit, onError: (Exception) -> Unit)
-    fun stopSlowMoVideo()
+    fun startSlowMoVideo(onSuccess: () -> Unit, onError: (Exception) -> Unit)
+    fun stopSlowMoVideo(onSuccess: (String) -> Unit)
     fun updateManualConfig(config: ProConfig)
     fun getCapabilities(): CameraHardwareCapabilities?
     fun setProMode(enabled: Boolean)

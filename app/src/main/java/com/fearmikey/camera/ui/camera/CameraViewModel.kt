@@ -5,6 +5,7 @@ import android.hardware.Sensor
 import android.hardware.SensorEvent
 import android.hardware.SensorEventListener
 import android.hardware.SensorManager
+import androidx.camera.core.CameraSelector
 import androidx.camera.core.Preview
 import androidx.lifecycle.LifecycleOwner
 import androidx.lifecycle.ViewModel
@@ -17,6 +18,7 @@ import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.*
 import kotlinx.coroutines.launch
+import kotlin.math.abs
 
 class CameraViewModel(
     private val captureEngine: CaptureEngine,
@@ -32,7 +34,7 @@ class CameraViewModel(
     
     // Low-pass filter variables
     private var currentTilt = 0f
-    private val alpha = 0.15f // Smoothing factor
+    private val alpha = 0.3f // Increased for more responsiveness
     
     private var focusJob: Job? = null
 
@@ -44,8 +46,15 @@ class CameraViewModel(
     private fun observePreferences() {
         viewModelScope.launch {
             userPreferencesRepository.userPreferencesFlow.collect { prefs ->
+                val prevShowLeveler = _uiState.value.userPreferences.showLeveler
                 _uiState.update { it.copy(userPreferences = prefs) }
                 captureEngine.applySettings(prefs)
+                
+                if (prefs.showLeveler && !prevShowLeveler) {
+                    startLeveler()
+                } else if (!prefs.showLeveler && prevShowLeveler) {
+                    stopLeveler()
+                }
             }
         }
     }
@@ -88,9 +97,42 @@ class CameraViewModel(
         _uiState.update { it.copy(showSettingsSheet = show) }
     }
 
+    private var currentLifecycleOwner: LifecycleOwner? = null
+    private var currentSurfaceProvider: Preview.SurfaceProvider? = null
+
     fun bindToLifecycle(lifecycleOwner: LifecycleOwner, surfaceProvider: Preview.SurfaceProvider) {
-        captureEngine.bindToLifecycle(lifecycleOwner, surfaceProvider)
-        _uiState.update { it.copy(capabilities = captureEngine.getCapabilities()) }
+        currentLifecycleOwner = lifecycleOwner
+        currentSurfaceProvider = surfaceProvider
+        
+        val selector = if (_uiState.value.isFrontCamera) {
+            CameraSelector.DEFAULT_FRONT_CAMERA
+        } else {
+            CameraSelector.DEFAULT_BACK_CAMERA
+        }
+        
+        captureEngine.bindToLifecycle(lifecycleOwner, surfaceProvider, selector)
+        val capabilities = captureEngine.getCapabilities()
+        _uiState.update { it.copy(
+            capabilities = capabilities,
+            zoomPresets = capabilities?.zoomPresets ?: listOf(1.0f)
+        ) }
+    }
+
+    fun toggleCamera() {
+        val nextIsFront = !_uiState.value.isFrontCamera
+        _uiState.update { it.copy(isFrontCamera = nextIsFront) }
+        
+        val lifecycleOwner = currentLifecycleOwner
+        val surfaceProvider = currentSurfaceProvider
+        
+        if (lifecycleOwner != null && surfaceProvider != null) {
+            val selector = if (nextIsFront) {
+                CameraSelector.DEFAULT_FRONT_CAMERA
+            } else {
+                CameraSelector.DEFAULT_BACK_CAMERA
+            }
+            captureEngine.bindToLifecycle(lifecycleOwner, surfaceProvider, selector)
+        }
     }
 
     fun setMode(mode: CameraMode) {
@@ -101,10 +143,14 @@ class CameraViewModel(
     fun takePicture() {
         _uiState.update { it.copy(isProcessing = true) }
         captureEngine.capturePhoto(
-            onSuccess = { path ->
-                val uri = if (path.startsWith("/")) Uri.fromFile(java.io.File(path)) else Uri.parse(path)
+            onSuccess = { uriString ->
+                val uri = Uri.parse(uriString)
                 _uiState.update { it.copy(lastCapturedUri = uri, isProcessing = false) }
-                // Don't call refreshThumbnail immediately as MediaStore might not be ready
+                // Delay refresh to allow MediaStore to index the new file
+                viewModelScope.launch {
+                    delay(500)
+                    refreshThumbnail()
+                }
             },
             onError = { error ->
                 error.printStackTrace()
@@ -129,9 +175,8 @@ class CameraViewModel(
     fun startVideo() {
         _uiState.update { it.copy(isRecording = true) }
         captureEngine.startSlowMoVideo(
-            onSuccess = { path ->
-                val uri = if (path.startsWith("/")) Uri.fromFile(java.io.File(path)) else Uri.parse(path)
-                _uiState.update { it.copy(lastCapturedUri = uri, isRecording = false) }
+            onSuccess = {
+                // Recording actually started
             },
             onError = { error ->
                 error.printStackTrace()
@@ -141,9 +186,16 @@ class CameraViewModel(
     }
 
     fun stopVideo() {
-        _uiState.update { it.copy(isRecording = false) }
-        captureEngine.stopSlowMoVideo()
-        refreshThumbnail()
+        captureEngine.stopSlowMoVideo(
+            onSuccess = { uriString ->
+                val uri = Uri.parse(uriString)
+                _uiState.update { it.copy(lastCapturedUri = uri, isRecording = false) }
+                viewModelScope.launch {
+                    delay(800) // Slightly longer delay for video indexing
+                    refreshThumbnail()
+                }
+            }
+        )
     }
 
     fun quickTakeStart() {
@@ -158,7 +210,7 @@ class CameraViewModel(
     }
 
     fun setZoom(ratio: Float) {
-        val clampedRatio = ratio.coerceIn(1.0f, 10.0f) // Assuming 10x max zoom
+        val clampedRatio = ratio.coerceIn(0.5f, 10.0f)
         _uiState.update { it.copy(zoomLevel = clampedRatio) }
         captureEngine.setZoom(clampedRatio)
     }
@@ -200,10 +252,12 @@ class CameraViewModel(
     fun initSensors(sensorManager: SensorManager) {
         this.sensorManager = sensorManager
         this.rotationSensor = sensorManager.getDefaultSensor(Sensor.TYPE_ROTATION_VECTOR)
-        
-        if (uiState.value.userPreferences.showLeveler) {
-            startLeveler()
+        // Fallback to accelerometer if rotation vector is not available
+        if (this.rotationSensor == null) {
+            this.rotationSensor = sensorManager.getDefaultSensor(Sensor.TYPE_ACCELEROMETER)
         }
+        
+        startLeveler()
     }
 
     private fun startLeveler() {
@@ -213,23 +267,54 @@ class CameraViewModel(
     }
 
     private fun stopLeveler() {
-        sensorManager?.unregisterListener(this)
+        // We only stop if we're not using orientation for icons either
+        // But for this requirement, we want it always
+        // sensorManager?.unregisterListener(this)
     }
 
     override fun onSensorChanged(event: SensorEvent?) {
         if (event?.sensor?.type == Sensor.TYPE_ROTATION_VECTOR) {
             val rotationMatrix = FloatArray(9)
             SensorManager.getRotationMatrixFromVector(rotationMatrix, event.values)
-            
             val orientation = FloatArray(3)
             SensorManager.getOrientation(rotationMatrix, orientation)
             
             val roll = Math.toDegrees(orientation[2].toDouble()).toFloat()
+            val pitch = Math.toDegrees(orientation[1].toDouble()).toFloat()
             
-            // Apply low-pass filter
+            updateOrientationFromRoll(roll)
+
+            if (abs(pitch) < 75) {
+                currentTilt = currentTilt + alpha * (roll - currentTilt)
+                _uiState.update { it.copy(horizonTilt = currentTilt) }
+            }
+        } else if (event?.sensor?.type == Sensor.TYPE_ACCELEROMETER) {
+            val ax = event.values[0]
+            val ay = event.values[1]
+            val roll = Math.toDegrees(Math.atan2(-ax.toDouble(), ay.toDouble())).toFloat()
+            
+            updateOrientationFromRoll(roll)
+
             currentTilt = currentTilt + alpha * (roll - currentTilt)
-            
             _uiState.update { it.copy(horizonTilt = currentTilt) }
+        }
+    }
+
+    private fun updateOrientationFromRoll(roll: Float) {
+        val newOrientation = when {
+            roll > -45 && roll <= 45 -> 0
+            roll > 45 && roll <= 135 -> 270
+            roll > -135 && roll <= -45 -> 90
+            else -> 180
+        }
+        
+        val isLandscape = newOrientation == 90 || newOrientation == 270
+        
+        if (newOrientation != _uiState.value.orientation || isLandscape != _uiState.value.autoShowLeveler) {
+            _uiState.update { it.copy(
+                orientation = newOrientation,
+                autoShowLeveler = isLandscape
+            ) }
         }
     }
 

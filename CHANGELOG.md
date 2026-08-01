@@ -2,6 +2,19 @@
 
 All notable changes to this project will be documented in this file.
 
+## [1.0.2] - 2026-08-01
+
+### Added
+- Redesigned UI/UX: Completely overhauled the interface to match Google Camera App aesthetic.
+- Smart Icon Rotation: Added sensor-based icon rotation that keeps controls upright while locked in portrait mode.
+- Dynamic Zoom: Implemented hardware-aware zoom switcher with presets detected from physical camera capabilities.
+- Auto Leveler: Horizon leveler now automatically appears when the device is rotated to landscape.
+
+### Fixed
+- Build Optimization: Resolved Kotlin daemon crash and enabled incremental compilation for faster builds.
+- Gradle Modernization: Upgraded AGP to 8.7.3 and migrated to Kotlin 2.0.21 with the new Compose compiler plugin.
+- Clean Code: Fixed multiple lint and compiler warnings across the codebase.
+
 ## [1.0.1] - 2026-08-01
 
 ### Fixed

@@ -146,9 +146,10 @@ class ImageProcessor(
         // In a real production app, use a fast blur algorithm like StackBlur 
         // or a GPU-accelerated shader (Vulkan/RenderScript).
         // Scaling down and back up is a "poor man's" blur for this architecture demo.
-        val scale = 0.2f
-        val width = (bitmap.width * scale).toInt()
-        val height = (bitmap.height * scale).toInt()
+        // Use radius to influence the scale for a rudimentary blur effect
+        val scale = (1.0f / (radius.coerceAtLeast(1) / 5f)).coerceIn(0.05f, 0.5f)
+        val width = (bitmap.width * scale).toInt().coerceAtLeast(1)
+        val height = (bitmap.height * scale).toInt().coerceAtLeast(1)
         
         val smallBitmap = Bitmap.createScaledBitmap(bitmap, width, height, true)
         return Bitmap.createScaledBitmap(smallBitmap, bitmap.width, bitmap.height, true)

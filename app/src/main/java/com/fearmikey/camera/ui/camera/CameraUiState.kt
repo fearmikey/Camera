@@ -13,10 +13,14 @@ data class CameraUiState(
     val isProMode: Boolean = false,
     val isProcessing: Boolean = false,
     val zoomLevel: Float = 1.0f,
+    val zoomPresets: List<Float> = listOf(0.6f, 1.0f, 2.0f),
     val proConfig: ProConfig = ProConfig(),
     val capabilities: CameraHardwareCapabilities? = null,
     val userPreferences: UserPreferences = UserPreferences(),
     val showSettingsSheet: Boolean = false,
     val horizonTilt: Float = 0f,
+    val orientation: Int = 0,
+    val isFrontCamera: Boolean = false,
+    val autoShowLeveler: Boolean = false,
     val focusPoint: androidx.compose.ui.geometry.Offset? = null
 )

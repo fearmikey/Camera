@@ -1,7 +1,6 @@
 package com.fearmikey.camera
 
 import android.Manifest
-import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.hardware.SensorManager
@@ -48,11 +47,21 @@ import com.fearmikey.camera.data.engine.processing.ImageProcessor
 import com.fearmikey.camera.data.engine.processing.PortraitSegmenter
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Settings
+import androidx.compose.foundation.lazy.LazyRow
+import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.rememberLazyListState
+import androidx.compose.ui.draw.rotate
+import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.material.icons.filled.Cached
+import androidx.compose.material.icons.filled.FlashOn
+import androidx.compose.material.icons.filled.History
+import androidx.compose.ui.text.font.FontWeight
 import com.fearmikey.camera.domain.model.AspectRatio as DomainAspectRatio
 import com.fearmikey.camera.data.repository.MediaRepository
 import com.fearmikey.camera.data.repository.UserPreferencesRepository
 import com.fearmikey.camera.ui.settings.SettingsSheet
 import kotlinx.coroutines.delay
+import kotlin.time.Duration.Companion.milliseconds
 import kotlin.math.abs
 
 class MainActivity : ComponentActivity() {
@@ -68,7 +77,7 @@ class MainActivity : ComponentActivity() {
         val userPreferencesRepository = UserPreferencesRepository(this)
         val viewModel = CameraViewModel(hybridCaptureEngine, mediaRepository, userPreferencesRepository)
 
-        val sensorManager = getSystemService(Context.SENSOR_SERVICE) as SensorManager
+        val sensorManager = getSystemService(SENSOR_SERVICE) as SensorManager
         viewModel.initSensors(sensorManager)
 
         setContent {
@@ -106,11 +115,10 @@ fun CameraScreen(
     }
 
     val launcher = rememberLauncherForActivityResult(
-        contract = ActivityResultContracts.RequestPermission(),
-        onResult = { granted ->
-            hasCameraPermission = granted
-        }
-    )
+        contract = ActivityResultContracts.RequestPermission()
+    ) { granted ->
+        hasCameraPermission = granted
+    }
 
     LaunchedEffect(key1 = true) {
         if (!hasCameraPermission) {
@@ -138,12 +146,87 @@ fun CameraScreen(
                 }
             )
 
+            // Top Bar
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(top = systemBarsPadding.calculateTopPadding() + 8.dp, start = 16.dp, end = 16.dp),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                IconButton(
+                    onClick = { viewModel.setShowSettingsSheet(true) },
+                    modifier = Modifier.background(Color.Black.copy(alpha = 0.3f), CircleShape)
+                ) {
+                    RotatableIcon(
+                        imageVector = Icons.Default.Settings,
+                        contentDescription = "Settings",
+                        targetRotation = uiState.orientation,
+                        tint = Color.White
+                    )
+                }
+                
+                Row {
+                    IconButton(
+                        onClick = { viewModel.toggleProMode() },
+                        modifier = Modifier.background(
+                            if (uiState.isProMode) Color.Yellow.copy(alpha = 0.5f) else Color.Black.copy(alpha = 0.3f),
+                            CircleShape
+                        )
+                    ) {
+                        val rotation by animateFloatAsState(
+                            targetValue = uiState.orientation.toFloat(),
+                            animationSpec = spring(stiffness = Spring.StiffnessLow),
+                            label = "proTextRotation"
+                        )
+                        Text(
+                            "PRO",
+                            color = if (uiState.isProMode) Color.Black else Color.White,
+                            style = MaterialTheme.typography.labelSmall,
+                            fontWeight = FontWeight.Bold,
+                            modifier = Modifier.rotate(rotation)
+                        )
+                    }
+
+                    Spacer(modifier = Modifier.width(8.dp))
+
+                    IconButton(
+                        onClick = { /* Flash Toggle */ },
+                        modifier = Modifier.background(Color.Black.copy(alpha = 0.3f), CircleShape)
+                    ) {
+                        RotatableIcon(
+                            imageVector = Icons.Default.FlashOn,
+                            contentDescription = "Flash",
+                            targetRotation = uiState.orientation,
+                            tint = Color.White
+                        )
+                    }
+                    
+                    Spacer(modifier = Modifier.width(8.dp))
+                    
+                    IconButton(
+                        onClick = { /* Timer Toggle */ },
+                        modifier = Modifier.background(Color.Black.copy(alpha = 0.3f), CircleShape)
+                    ) {
+                        RotatableIcon(
+                            imageVector = Icons.Default.History,
+                            contentDescription = "Timer",
+                            targetRotation = uiState.orientation,
+                            tint = Color.White
+                        )
+                    }
+                }
+            }
+
             // UI Overlays
             if (uiState.isProMode) {
                 ProControlOverlay(
                     uiState = uiState,
                     onConfigChange = { viewModel.updateProConfig(it) },
-                    modifier = Modifier.align(Alignment.CenterEnd).width(250.dp).fillMaxHeight()
+                    modifier = Modifier
+                        .align(Alignment.CenterEnd)
+                        .width(250.dp)
+                        .fillMaxHeight()
                 )
             }
 
@@ -155,13 +238,12 @@ fun CameraScreen(
                 onModeSelected = { viewModel.setMode(it) },
                 onCapture = { 
                     viewModel.toggleCapture()
-                    if (!uiState.isRecording && uiState.currentMode != CameraMode.VIDEO) {
+                    if (!uiState.isRecording && (uiState.currentMode != CameraMode.VIDEO)) {
                         showFlash = true
                     }
                 },
                 onQuickTakeStart = { viewModel.quickTakeStart() },
                 onQuickTakeStop = { viewModel.quickTakeStop() },
-                onProToggle = { viewModel.toggleProMode() },
                 onThumbnailClick = {
                     val intent = Intent(Intent.ACTION_VIEW).apply {
                         type = "image/*"
@@ -169,7 +251,8 @@ fun CameraScreen(
                     }
                     context.startActivity(intent)
                 },
-                onSettingsClick = { viewModel.setShowSettingsSheet(true) }
+                onZoomSelected = { viewModel.setZoom(it) },
+                onFlipCamera = { viewModel.toggleCamera() }
             )
 
             if (uiState.showSettingsSheet) {
@@ -188,9 +271,9 @@ fun CameraScreen(
 
             // Flash Overlay
             if (showFlash) {
-                Box(modifier = Modifier.fillMaxSize().background(Color.White))
+                Box(modifier = Modifier.fillMaxSize().background(Color.Black))
                 LaunchedEffect(Unit) {
-                    delay(50)
+                    delay(50.milliseconds)
                     showFlash = false
                 }
             }
@@ -251,20 +334,31 @@ fun CameraPreview(
                         onModeSwiped(dragAmount)
                     }
                 }
-            }
+            },
+        contentAlignment = Alignment.Center
     ) {
-        val width = maxWidth
-        val height = if (aspectRatio > 0) {
-            width / aspectRatio
+        val previewWidth: androidx.compose.ui.unit.Dp
+        val previewHeight: androidx.compose.ui.unit.Dp
+
+        if (aspectRatio > 0) {
+            val constraintsRatio = maxWidth / maxHeight
+            if (constraintsRatio > aspectRatio) {
+                // Constraints are wider than aspect ratio
+                previewHeight = maxHeight
+                previewWidth = maxHeight * aspectRatio
+            } else {
+                // Constraints are taller than aspect ratio
+                previewWidth = maxWidth
+                previewHeight = maxWidth / aspectRatio
+            }
         } else {
-            maxHeight
+            previewWidth = maxWidth
+            previewHeight = maxHeight
         }
 
         Box(
             modifier = Modifier
-                .width(width)
-                .height(height)
-                .align(Alignment.Center)
+                .size(previewWidth, previewHeight)
                 .pointerInput(Unit) {
                     detectTapGestures { offset ->
                         viewModel.focusAt(offset.x / size.width, offset.y / size.height)
@@ -286,12 +380,115 @@ fun CameraPreview(
                 modifier = Modifier.fillMaxSize()
             )
         }
-        
-        // Remove the old GridLinesOverlay call if it was outside
     }
 }
 
 // Remove old GridLinesOverlay Composable
+
+@Composable
+fun RotatableIcon(
+    imageVector: ImageVector,
+    contentDescription: String?,
+    targetRotation: Int,
+    modifier: Modifier = Modifier,
+    tint: Color = Color.White
+) {
+    val rotation by animateFloatAsState(
+        targetValue = targetRotation.toFloat(),
+        animationSpec = spring(stiffness = Spring.StiffnessLow),
+        label = "iconRotation"
+    )
+    
+    Icon(
+        imageVector = imageVector,
+        contentDescription = contentDescription,
+        modifier = modifier.rotate(rotation),
+        tint = tint
+    )
+}
+
+@Composable
+fun CameraModeSelector(
+    modes: List<CameraMode>,
+    currentMode: CameraMode,
+    onModeSelected: (CameraMode) -> Unit,
+    modifier: Modifier = Modifier
+) {
+    val listState = rememberLazyListState()
+    
+    // Auto-scroll to current mode if needed
+    LaunchedEffect(currentMode) {
+        val index = modes.indexOf(currentMode)
+        if (index != -1) {
+            listState.animateScrollToItem(index)
+        }
+    }
+
+    LazyRow(
+        state = listState,
+        modifier = modifier.fillMaxWidth(),
+        horizontalArrangement = Arrangement.Center,
+        contentPadding = PaddingValues(horizontal = 16.dp),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        items(modes) { mode ->
+            val isSelected = mode == currentMode
+            Text(
+                text = mode.name,
+                color = if (isSelected) Color.Yellow else Color.White,
+                modifier = Modifier
+                    .padding(horizontal = 16.dp, vertical = 8.dp)
+                    .clickable { onModeSelected(mode) },
+                style = MaterialTheme.typography.labelLarge.copy(
+                    fontWeight = if (isSelected) FontWeight.Bold else FontWeight.Normal
+                )
+            )
+        }
+    }
+}
+
+@Composable
+fun ZoomSwitcher(
+    currentZoom: Float,
+    zoomPresets: List<Float>,
+    onZoomSelected: (Float) -> Unit,
+    modifier: Modifier = Modifier
+) {
+    Surface(
+        color = Color.Black.copy(alpha = 0.5f),
+        shape = CircleShape,
+        modifier = modifier
+    ) {
+        Row(
+            modifier = Modifier.padding(horizontal = 4.dp, vertical = 2.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            zoomPresets.forEach { zoom ->
+                val isSelected = abs(currentZoom - zoom) < 0.05f
+                Box(
+                    modifier = Modifier
+                        .size(36.dp)
+                        .clip(CircleShape)
+                        .background(if (isSelected) Color.White else Color.Transparent)
+                        .clickable { onZoomSelected(zoom) },
+                    contentAlignment = Alignment.Center
+                ) {
+                    val label = when {
+                        zoom < 1f -> ".${(zoom * 10).toInt()}"
+                        zoom == zoom.toInt().toFloat() -> "${zoom.toInt()}x"
+                        else -> "${zoom}x"
+                    }
+                    Text(
+                        text = label,
+                        color = if (isSelected) Color.Black else Color.White,
+                        style = MaterialTheme.typography.labelSmall,
+                        fontWeight = FontWeight.Bold
+                    )
+                }
+            }
+        }
+    }
+}
 
 @Composable
 fun CameraControls(
@@ -301,93 +498,58 @@ fun CameraControls(
     onCapture: () -> Unit,
     onQuickTakeStart: () -> Unit,
     onQuickTakeStop: () -> Unit,
-    onProToggle: () -> Unit,
     onThumbnailClick: () -> Unit,
-    onSettingsClick: () -> Unit
+    onZoomSelected: (Float) -> Unit,
+    onFlipCamera: () -> Unit
 ) {
     Column(
-        modifier = modifier
-            .fillMaxWidth()
-            .padding(bottom = 32.dp),
+        modifier = modifier.fillMaxWidth(),
         horizontalAlignment = Alignment.CenterHorizontally
     ) {
+        // Zoom Pill
+        ZoomSwitcher(
+            currentZoom = uiState.zoomLevel,
+            zoomPresets = uiState.zoomPresets,
+            onZoomSelected = onZoomSelected,
+            modifier = Modifier.padding(bottom = 16.dp)
+        )
+
+        // Mode Selector
+        CameraModeSelector(
+            modes = CameraMode.entries,
+            currentMode = uiState.currentMode,
+            onModeSelected = onModeSelected,
+            modifier = Modifier.padding(bottom = 24.dp)
+        )
+
+        // Main Controls Row
         Row(
-            modifier = Modifier.fillMaxWidth().padding(horizontal = 24.dp),
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(horizontal = 48.dp)
+                .padding(bottom = 32.dp),
             horizontalArrangement = Arrangement.SpaceBetween,
             verticalAlignment = Alignment.CenterVertically
         ) {
-            Row(verticalAlignment = Alignment.CenterVertically) {
-                // Settings Button
-                IconButton(onClick = onSettingsClick) {
-                    Icon(
-                        imageVector = Icons.Default.Settings,
-                        contentDescription = "Settings",
-                        tint = Color.White
-                    )
-                }
-
-                Spacer(modifier = Modifier.width(8.dp))
-
-                // Pro Toggle
-                Button(
-                    onClick = onProToggle,
-                    colors = ButtonDefaults.buttonColors(
-                        containerColor = if (uiState.isProMode) Color.Yellow else Color.DarkGray
-                    ),
-                    contentPadding = PaddingValues(horizontal = 12.dp, vertical = 4.dp),
-                    modifier = Modifier.height(36.dp)
-                ) {
-                    Text("PRO", color = if (uiState.isProMode) Color.Black else Color.White)
-                }
-            }
-
-            // Mode Selector
-            Row(
-                horizontalArrangement = Arrangement.Center,
-                modifier = Modifier.weight(1f)
-            ) {
-                CameraMode.entries.forEach { mode ->
-                    Text(
-                        text = mode.name,
-                        color = if (mode == uiState.currentMode) Color.Yellow else Color.White,
-                        modifier = Modifier
-                            .padding(horizontal = 12.dp)
-                            .clickable { onModeSelected(mode) },
-                        style = MaterialTheme.typography.labelLarge
-                    )
-                }
-            }
-            
-            // Placeholder for balance
-            Spacer(modifier = Modifier.width(64.dp))
-        }
-
-        Spacer(modifier = Modifier.height(24.dp))
-
-        Row(
-            modifier = Modifier.fillMaxWidth().padding(horizontal = 48.dp),
-            horizontalArrangement = Arrangement.SpaceBetween,
-            verticalAlignment = Alignment.CenterVertically
-        ) {
-            // Recent Media Thumbnail
+            // Gallery Thumbnail
             Box(
                 modifier = Modifier
-                    .size(56.dp)
+                    .size(52.dp)
                     .clip(CircleShape)
-                    .background(Color.DarkGray)
-                    .clickable { onThumbnailClick() }
+                    .background(Color.DarkGray.copy(alpha = 0.5f))
+                    .clickable { onThumbnailClick() },
             ) {
-                if (uiState.lastCapturedUri != null) {
+                uiState.lastCapturedUri?.let { uri ->
                     AsyncImage(
-                        model = uiState.lastCapturedUri,
+                        model = uri,
                         contentDescription = "Last captured media",
                         modifier = Modifier.fillMaxSize(),
-                        contentScale = ContentScale.Crop
+                        contentScale = ContentScale.Crop,
                     )
                 }
             }
 
-            // Shutter Button with Quick Take and Progress
+            // Shutter Button
             val progress by animateFloatAsState(
                 targetValue = if (uiState.isProcessing) 1f else 0f,
                 animationSpec = tween(durationMillis = 3000, easing = LinearEasing),
@@ -395,7 +557,7 @@ fun CameraControls(
             )
 
             Box(
-                modifier = Modifier.size(80.dp),
+                modifier = Modifier.size(86.dp),
                 contentAlignment = Alignment.Center
             ) {
                 if (uiState.isProcessing && (uiState.currentMode == CameraMode.NIGHT || uiState.currentMode == CameraMode.HDR)) {
@@ -416,30 +578,28 @@ fun CameraControls(
 
                 val isVideoMode = uiState.currentMode == CameraMode.VIDEO || uiState.currentMode == CameraMode.SLOW_MO
                 val shutterColor = if (isVideoMode || uiState.isRecording) Color.Red else Color.White
-                val shutterShape = if (uiState.isRecording) androidx.compose.foundation.shape.RoundedCornerShape(12.dp) else CircleShape
+                val shutterInnerShape = if (uiState.isRecording) androidx.compose.foundation.shape.RoundedCornerShape(8.dp) else CircleShape
 
                 Box(
                     modifier = Modifier
-                        .size(70.dp)
-                        .background(shutterColor, CircleShape)
+                        .size(76.dp)
+                        .background(Color.White.copy(alpha = 0.2f), CircleShape)
                         .padding(4.dp)
                         .background(Color.Black, CircleShape)
                         .padding(4.dp)
-                        .clip(shutterShape)
+                        .clip(shutterInnerShape)
                         .background(shutterColor)
                         .pointerInput(Unit) {
                             awaitEachGesture {
-                                val down = awaitFirstDown()
+                                awaitFirstDown()
                                 val result = withTimeoutOrNull(500) {
                                     waitForUpOrCancellation()
                                 }
                                 if (result == null) {
-                                    // Long press
                                     onQuickTakeStart()
                                     waitForUpOrCancellation()
                                     onQuickTakeStop()
                                 } else {
-                                    // Tap
                                     onCapture()
                                 }
                             }
@@ -447,8 +607,22 @@ fun CameraControls(
                 )
             }
 
-            // Empty spacer for balance
-            Spacer(modifier = Modifier.size(56.dp))
+            // Camera Flip Button
+            Box(
+                modifier = Modifier
+                    .size(52.dp)
+                    .clip(CircleShape)
+                    .background(Color.DarkGray.copy(alpha = 0.5f))
+                    .clickable { onFlipCamera() },
+                contentAlignment = Alignment.Center
+            ) {
+                RotatableIcon(
+                    imageVector = Icons.Default.Cached,
+                    contentDescription = "Switch Camera",
+                    targetRotation = uiState.orientation,
+                    modifier = Modifier.size(28.dp)
+                )
+            }
         }
     }
 }
