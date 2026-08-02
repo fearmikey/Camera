@@ -23,6 +23,12 @@ import kotlin.math.atan2
 import kotlin.math.sqrt
 import kotlin.time.Duration.Companion.milliseconds
 
+data class GestureOverlayState(
+    val handBox: androidx.compose.ui.geometry.Rect? = null,
+    val faceBox: androidx.compose.ui.geometry.Rect? = null,
+    val isTimerPending: Boolean = false
+)
+
 class CameraViewModel(
     private val captureEngine: CaptureEngine,
     private val mediaRepository: MediaRepository,
@@ -31,6 +37,21 @@ class CameraViewModel(
 
     private val _uiState = MutableStateFlow(CameraUiState())
     val uiState: StateFlow<CameraUiState> = _uiState.asStateFlow()
+
+    private val _tiltState = MutableStateFlow(0f)
+    val tiltState: StateFlow<Float> = _tiltState.asStateFlow()
+
+    private val _gestureState = MutableStateFlow(GestureOverlayState())
+    val gestureState: StateFlow<GestureOverlayState> = _gestureState.asStateFlow()
+
+    private val _orientationState = MutableStateFlow(0)
+    val orientationState: StateFlow<Int> = _orientationState.asStateFlow()
+
+    private val _focusState = MutableStateFlow<androidx.compose.ui.geometry.Offset?>(null)
+    val focusState: StateFlow<androidx.compose.ui.geometry.Offset?> = _focusState.asStateFlow()
+
+    private val _autoShowLeveler = MutableStateFlow(false)
+    val autoShowLeveler: StateFlow<Boolean> = _autoShowLeveler.asStateFlow()
 
     private var sensorManager: SensorManager? = null
     private var rotationSensor: Sensor? = null
@@ -411,7 +432,7 @@ class CameraViewModel(
                 } else {
                     smoothedFaceBox = null
                 }
-                _uiState.update { it.copy(faceBoundingBox = smoothedFaceBox) }
+                _gestureState.update { it.copy(faceBox = smoothedFaceBox) }
                 
                 if (currentHandBox != null) {
                     // 2. Smooth the hand bounding box
@@ -425,16 +446,16 @@ class CameraViewModel(
                             bottom = smoothedHandBox!!.bottom + boxSmoothing * (currentHandBox.bottom - smoothedHandBox!!.bottom)
                         )
                     }
-                    _uiState.update { it.copy(handBoundingBox = smoothedHandBox) }
+                    _gestureState.update { it.copy(handBox = smoothedHandBox) }
                     
                     // 3. Manage the "ghosting" timeout
                     boxClearJob?.cancel()
                     boxClearJob = launch {
                         delay(600) // Bridge detection gaps
                         smoothedHandBox = null
-                        _uiState.update { it.copy(
-                            handBoundingBox = null,
-                            isHandTimerPending = false
+                        _gestureState.update { it.copy(
+                            handBox = null,
+                            isTimerPending = false
                         ) }
                         gestureTriggerJob?.cancel()
                         gestureTriggerJob = null
@@ -445,9 +466,9 @@ class CameraViewModel(
                         !_uiState.value.isRecording && _uiState.value.captureType == CaptureType.PHOTO) {
                         
                         gestureTriggerJob = launch {
-                            _uiState.update { it.copy(isHandTimerPending = true) }
+                            _gestureState.update { it.copy(isTimerPending = true) }
                             delay(1000) // 1s lock-on delay
-                            _uiState.update { it.copy(isHandTimerPending = false) }
+                            _gestureState.update { it.copy(isTimerPending = false) }
                             startTimer(3)
                             gestureTriggerJob = null
                         }
@@ -494,12 +515,12 @@ class CameraViewModel(
 
     fun focusAt(x: Float, y: Float) {
         captureEngine.focusAt(x, y)
-        _uiState.update { it.copy(focusPoint = androidx.compose.ui.geometry.Offset(x, y)) }
+        _focusState.value = androidx.compose.ui.geometry.Offset(x, y)
         
         focusJob?.cancel()
         focusJob = viewModelScope.launch {
             delay(2000)
-            _uiState.update { it.copy(focusPoint = null) }
+            _focusState.value = null
         }
     }
 
@@ -539,13 +560,11 @@ class CameraViewModel(
             updateOrientationFromRoll(roll)
 
             // Auto leveler fix: if pitch is too steep, it's hard to define a "horizon"
-            // Instead of sticking, we should clear the tilt or use a wider threshold
             if (abs(pitch) < 60) {
                 currentTilt += alpha * (roll - currentTilt)
-                _uiState.update { it.copy(horizonTilt = currentTilt) }
+                _tiltState.value = currentTilt
             } else {
-                // Fade out leveler if device is too vertical/horizontal
-                _uiState.update { it.copy(horizonTilt = 0f) }
+                _tiltState.value = 0f
             }
         } else if (event?.sensor?.type == Sensor.TYPE_ACCELEROMETER) {
             val ax = event.values[0]
@@ -559,9 +578,9 @@ class CameraViewModel(
 
             if (abs(pitch) < 60) {
                 currentTilt += alpha * (roll - currentTilt)
-                _uiState.update { it.copy(horizonTilt = currentTilt) }
+                _tiltState.value = currentTilt
             } else {
-                _uiState.update { it.copy(horizonTilt = 0f) }
+                _tiltState.value = 0f
             }
         }
     }
@@ -574,14 +593,11 @@ class CameraViewModel(
             else -> 180
         }
         
-        // Disable automatic leveler in landscape for a cleaner UI matching reference
         val shouldAutoShowLeveler = false 
         
-        if (newOrientation != _uiState.value.orientation || shouldAutoShowLeveler != _uiState.value.autoShowLeveler) {
-            _uiState.update { it.copy(
-                orientation = newOrientation,
-                autoShowLeveler = shouldAutoShowLeveler
-            ) }
+        if (newOrientation != _orientationState.value || shouldAutoShowLeveler != _autoShowLeveler.value) {
+            _orientationState.value = newOrientation
+            _autoShowLeveler.value = shouldAutoShowLeveler
         }
     }
 

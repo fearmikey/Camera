@@ -10,13 +10,14 @@ import androidx.camera.core.ImageAnalysis
 import androidx.camera.core.ImageProxy
 import androidx.compose.ui.geometry.Rect
 import com.google.mediapipe.framework.image.BitmapImageBuilder
+import com.google.mediapipe.framework.image.MediaImageBuilder
 import com.google.mediapipe.tasks.core.BaseOptions
 import com.google.mediapipe.tasks.core.Delegate
+import com.google.mediapipe.tasks.vision.core.ImageProcessingOptions
 import com.google.mediapipe.tasks.vision.core.RunningMode
 import com.google.mediapipe.tasks.vision.facedetector.FaceDetector
 import com.google.mediapipe.tasks.vision.handlandmarker.HandLandmarker
 import com.google.mediapipe.tasks.vision.handlandmarker.HandLandmarkerResult
-import java.io.ByteArrayOutputStream
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
 
@@ -107,19 +108,8 @@ class GestureAnalyzer(
                     .setRunningMode(RunningMode.IMAGE)
                     .build()
                 
-                val detector = FaceDetector.createFromOptions(context, faceOptions)
-                
-                // CRITICAL: Test the face detector to see if it crashes (tensor mismatch check)
-                try {
-                    val dummyBitmap = Bitmap.createBitmap(100, 100, Bitmap.Config.ARGB_8888)
-                    val dummyImage = BitmapImageBuilder(dummyBitmap).build()
-                    detector.detect(dummyImage)
-                    faceDetector = detector
-                    Log.i(TAG, "SUCCESS: FaceDetector initialized and verified")
-                } catch (e: Exception) {
-                    Log.e(TAG, "FaceDetector validation failed (likely wrong model type): ${e.message}")
-                    detector.close()
-                }
+                faceDetector = FaceDetector.createFromOptions(context, faceOptions)
+                Log.i(TAG, "SUCCESS: FaceDetector initialized")
             } else {
                 Log.w(TAG, "Face model not found. Gated detection disabled.")
             }
@@ -133,6 +123,7 @@ class GestureAnalyzer(
         }
     }
 
+    @androidx.annotation.OptIn(androidx.camera.core.ExperimentalGetImage::class)
     override fun analyze(image: ImageProxy) {
         if (handLandmarker == null || faceDetector == null) {
             if (!isInitializing) {
@@ -157,7 +148,6 @@ class GestureAnalyzer(
             return
         }
 
-        // Convert ImageProxy to MPImage
         val rawBitmap = imageToBitmap(image)
         if (rawBitmap == null) {
             image.close()
@@ -191,18 +181,16 @@ class GestureAnalyzer(
                     isFaceRecentlySeen = (System.currentTimeMillis() - lastFaceTimestamp) < faceTimeout
                 } catch (e: Exception) {
                     if (frameCounter % 100 == 0) Log.w(TAG, "Face detection failed: ${e.message}")
-                    // Don't disable isFaceRecentlySeen, let it stay true as fallback
                 }
             }
 
-            // 2. Only run Hand Detection if a face is recently seen (or detector is disabled)
+            // 2. Only run Hand Detection if a face is recently seen
             if (isFaceRecentlySeen) {
                 val handResult = handLandmarker?.detect(mpImage)
                 if (handResult != null) {
                     processResult(handResult, faceBoundingBox)
                 }
             } else {
-                // Clear tracking boxes if no face
                 onGestureTriggered(GestureResult(null, null, false))
             }
         } catch (error: Exception) {
@@ -220,7 +208,6 @@ class GestureAnalyzer(
                 buffer.get(bytes)
                 BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
             } else {
-                // Efficient YUV_420_888 to Bitmap conversion
                 val yBuffer = image.planes[0].buffer
                 val uBuffer = image.planes[1].buffer
                 val vBuffer = image.planes[2].buffer
@@ -231,13 +218,12 @@ class GestureAnalyzer(
 
                 val nv21 = ByteArray(ySize + uSize + vSize)
 
-                // U and V are swapped
                 yBuffer.get(nv21, 0, ySize)
                 vBuffer.get(nv21, ySize, vSize)
                 uBuffer.get(nv21, ySize + vSize, uSize)
 
                 val yuvImage = YuvImage(nv21, android.graphics.ImageFormat.NV21, image.width, image.height, null)
-                val out = ByteArrayOutputStream()
+                val out = java.io.ByteArrayOutputStream()
                 yuvImage.compressToJpeg(android.graphics.Rect(0, 0, image.width, image.height), 100, out)
                 val imageBytes = out.toByteArray()
                 BitmapFactory.decodeByteArray(imageBytes, 0, imageBytes.size)
@@ -247,14 +233,19 @@ class GestureAnalyzer(
         }
     }
 
+    private fun Bitmap.rotate(degrees: Float): Bitmap {
+        if (degrees == 0f) return this
+        val matrix = Matrix().apply { postRotate(degrees) }
+        return Bitmap.createBitmap(this, 0, 0, width, height, matrix, true)
+    }
+
     private fun processResult(result: HandLandmarkerResult, faceBox: Rect?) {
         val landmarks = result.landmarks()
         
         if (landmarks.isNotEmpty()) {
             val hand = landmarks[0]
-            val wrist = hand[0] // Landmark index 0 is the Wrist
+            val wrist = hand[0]
             
-            // Calculate bounding box for UI overlay
             var minX = 1f
             var maxX = 0f
             var minY = 1f
@@ -267,16 +258,13 @@ class GestureAnalyzer(
             }
             val handBoundingBox = Rect(minX, minY, maxX, maxY)
 
-            // Detection Logic (More lenient):
-            // 1. Wrist and palm should be visible and somewhat upright
-            // 2. Hand must occupy enough space
             val middleFingerTip = hand[12]
             val handSize = Math.sqrt(
                 Math.pow((wrist.x() - middleFingerTip.x()).toDouble(), 2.0) +
                 Math.pow((wrist.y() - middleFingerTip.y()).toDouble(), 2.0)
             )
 
-            val isUpright = middleFingerTip.y() < wrist.y() // Fingers above wrist
+            val isUpright = middleFingerTip.y() < wrist.y() 
             val isCloseEnough = handSize > 0.12 
             val isCentered = wrist.x() in 0.1f..0.9f
 
@@ -289,7 +277,6 @@ class GestureAnalyzer(
                 if (consecutiveDetections >= requiredConsecutiveFrames && currentState !is State.Cooldown) {
                     triggerGesture(handBoundingBox, faceBox)
                 } else {
-                    // Report detection without triggering timer (tracking only)
                     onGestureTriggered(GestureResult(handBoundingBox, faceBox, false))
                 }
             } else {
@@ -314,12 +301,6 @@ class GestureAnalyzer(
         }
     }
 
-    private fun Bitmap.rotate(degrees: Float): Bitmap {
-        if (degrees == 0f) return this
-        val matrix = Matrix().apply { postRotate(degrees) }
-        return Bitmap.createBitmap(this, 0, 0, width, height, matrix, true)
-    }
-
     fun close() {
         try {
             backgroundExecutor.execute {
@@ -332,3 +313,4 @@ class GestureAnalyzer(
         } catch (ignored: Exception) {}
     }
 }
+

@@ -12,10 +12,16 @@ android {
         applicationId = "com.fearmikey.camera"
         minSdk = 31
         targetSdk = 35
-        versionCode = 5
-        versionName = "1.0.4"
+        versionCode = 6
+        versionName = "1.0.5"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
+
+        externalNativeBuild {
+            cmake {
+                arguments("-DOpenCV_DIR=${project.rootDir}/opencv/OpenCV-android-sdk/sdk/native/jni")
+            }
+        }
     }
 
     buildTypes {
@@ -37,6 +43,14 @@ android {
     buildFeatures {
         compose = true
     }
+
+    externalNativeBuild {
+        cmake {
+            path = file("src/main/cpp/CMakeLists.txt")
+            version = "3.22.1"
+        }
+    }
+
     packaging {
         resources {
             excludes += "/META-INF/{AL2.0,LGPL2.1}"

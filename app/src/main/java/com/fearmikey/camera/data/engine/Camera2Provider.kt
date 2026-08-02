@@ -226,6 +226,14 @@ class Camera2Provider(
         }
     }
 
+    override fun startPanorama(onSuccess: () -> Unit, onError: (Exception) -> Unit) {
+        onError(UnsupportedOperationException("Panorama not supported in Camera2Provider"))
+    }
+
+    override fun stopPanorama(onSuccess: (String) -> Unit, onError: (Exception) -> Unit) {
+        onError(UnsupportedOperationException("Panorama not supported in Camera2Provider"))
+    }
+
     private fun findCameraId(selector: CameraSelector): String? {
         val lensFacing = when {
             selector == CameraSelector.DEFAULT_BACK_CAMERA -> CameraCharacteristics.LENS_FACING_BACK

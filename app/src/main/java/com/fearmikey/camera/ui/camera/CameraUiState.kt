@@ -27,13 +27,6 @@ data class CameraUiState(
     val capabilities: CameraHardwareCapabilities? = null,
     val userPreferences: UserPreferences = UserPreferences(),
     val showSettingsSheet: Boolean = false,
-    val horizonTilt: Float = 0f,
-    val orientation: Int = 0,
     val isFrontCamera: Boolean = false,
-    val autoShowLeveler: Boolean = false,
-    val focusPoint: androidx.compose.ui.geometry.Offset? = null,
-    val handBoundingBox: androidx.compose.ui.geometry.Rect? = null,
-    val faceBoundingBox: androidx.compose.ui.geometry.Rect? = null,
-    val isHandTimerPending: Boolean = false,
     val flashMode: FlashMode = FlashMode.OFF
 )

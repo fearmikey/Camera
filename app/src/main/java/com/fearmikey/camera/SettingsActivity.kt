@@ -244,10 +244,10 @@ fun SettingsItem(
                 onCheckedChange = onCheckedChange,
                 enabled = enabled,
                 colors = SwitchDefaults.colors(
-                    checkedThumbColor = Color(0xFFDDE4D7),
-                    checkedTrackColor = Color(0xFFDDE4D7).copy(alpha = 0.5f),
-                    uncheckedThumbColor = Color.Gray,
-                    uncheckedTrackColor = Color.Black
+                    checkedThumbColor = MaterialTheme.colorScheme.onPrimary,
+                    checkedTrackColor = MaterialTheme.colorScheme.primary,
+                    uncheckedThumbColor = MaterialTheme.colorScheme.outline,
+                    uncheckedTrackColor = MaterialTheme.colorScheme.surfaceVariant
                 )
             )
         }

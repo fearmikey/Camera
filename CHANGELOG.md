@@ -2,6 +2,18 @@
 
 All notable changes to this project will be documented in this file.
 
+## [1.0.5] - 2026-08-02
+
+### Added
+- Native Panorama Engine: Implemented high-performance C++ panorama stitching using OpenCV via JNI.
+- Panorama Mode: New capture mode with real-time frame alignment and guidance in the HUD.
+- Native Bridge: Introduced NativePanoramaBridge for efficient data transfer between Kotlin and C++.
+
+### Improved
+- Frame Processing: Implemented frameskip optimization in GpuImageProcessor to maintain high preview frame rates during heavy processing.
+- UI Feedback: Added dedicated panorama progress and alignment indicators to HudOverlay.
+- Settings: Expanded user preferences to include panorama quality and stitching options.
+
 ## [1.0.4] - 2026-08-02
 
 ### Added

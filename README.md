@@ -11,6 +11,7 @@ A high-performance Android camera application featuring advanced capture modes a
 - Night Sight: Multi-frame burst stacking for improved low-light performance.
 - HDR: Exposure bracketing and fusion for high dynamic range photography.
 - Portrait Mode: AI-powered background segmentation and bokeh effects.
+- Panorama Mode: Real-time high-resolution panorama stitching powered by a native C++ engine.
 - Pro Mode: Manual control over ISO, Shutter Speed, and Focus using Camera2 interop.
 - GPU Processing: High-performance image processing pipeline using custom GLSL shaders for effects like pixel binning and Night Sight.
 - Gesture Controls: Advanced gesture-based interactions including pinch-to-zoom, double-tap to switch, and long-press to lock AF/AE.

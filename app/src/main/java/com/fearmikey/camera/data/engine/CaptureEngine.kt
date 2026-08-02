@@ -19,6 +19,8 @@ interface CaptureEngine {
     fun setMode(mode: CameraMode)
     fun applySettings(prefs: UserPreferences)
     fun capturePhoto(onSuccess: (String) -> Unit, onError: (Exception) -> Unit)
+    fun startPanorama(onSuccess: () -> Unit, onError: (Exception) -> Unit)
+    fun stopPanorama(onSuccess: (String) -> Unit, onError: (Exception) -> Unit)
     fun startSlowMoVideo(onSuccess: () -> Unit, onError: (Exception) -> Unit)
     fun stopSlowMoVideo(onSuccess: (String) -> Unit)
     fun pauseVideo()

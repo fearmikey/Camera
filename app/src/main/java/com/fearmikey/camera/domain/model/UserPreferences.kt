@@ -27,7 +27,7 @@ data class UserPreferences(
     val resolution: ResolutionMode = ResolutionMode.MP_12,
     val saveMode: ImageSaveMode = ImageSaveMode.JPEG,
     val lensSelection: LensSelectionMode = LensSelectionMode.AUTO,
-    val gestureTrigger: Boolean = false,
+    val gestureTrigger: Boolean = true,
 )
 
 enum class TimerMode(val seconds: Int) {

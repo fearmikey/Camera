@@ -17,40 +17,44 @@ import androidx.compose.ui.graphics.nativeCanvas
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.unit.dp
 import com.fearmikey.camera.domain.model.GridMode
+import kotlinx.coroutines.flow.StateFlow
 import kotlin.math.abs
 
 @Composable
 fun HudOverlay(
     gridMode: GridMode,
     showLeveler: Boolean,
-    autoShowLeveler: Boolean,
-    horizonTilt: Float,
-    focusPoint: androidx.compose.ui.geometry.Offset?,
-    handBoundingBox: androidx.compose.ui.geometry.Rect? = null,
-    faceBoundingBox: androidx.compose.ui.geometry.Rect? = null,
-    isHandTimerPending: Boolean = false,
+    tiltFlow: StateFlow<Float>,
+    autoShowLevelerFlow: StateFlow<Boolean>,
+    focusFlow: StateFlow<androidx.compose.ui.geometry.Offset?>,
+    gestureFlow: StateFlow<GestureOverlayState>,
     isFrontCamera: Boolean = false,
     modifier: Modifier = Modifier
 ) {
+    val tilt by tiltFlow.collectAsState()
+    val autoShowLeveler by autoShowLevelerFlow.collectAsState()
+    val focusPoint by focusFlow.collectAsState()
+    val gestureState by gestureFlow.collectAsState()
+
     Box(modifier = modifier) {
         if (gridMode != GridMode.OFF) {
             CameraGrid(gridMode)
         }
         
         if (showLeveler || autoShowLeveler) {
-            HorizonLeveler(tilt = horizonTilt)
+            HorizonLeveler(tilt = tilt)
         }
         
         focusPoint?.let { point ->
             FocusRing(point = point)
         }
 
-        faceBoundingBox?.let { box ->
+        gestureState.faceBox?.let { box ->
             FaceDetectionIndicator(box = box, isFrontCamera = isFrontCamera)
         }
 
-        handBoundingBox?.let { box ->
-            HandDetectionBox(box = box, isPending = isHandTimerPending, isFrontCamera = isFrontCamera)
+        gestureState.handBox?.let { box ->
+            HandDetectionBox(box = box, isPending = gestureState.isTimerPending, isFrontCamera = isFrontCamera)
         }
     }
 }

@@ -93,7 +93,7 @@ class UserPreferencesRepository(private val context: Context) {
                 lensSelection = LensSelectionMode.valueOf(
                     preferences[PreferencesKeys.LENS_SELECTION] ?: LensSelectionMode.AUTO.name
                 ),
-                gestureTrigger = preferences[PreferencesKeys.GESTURE_TRIGGER] ?: false,
+                gestureTrigger = preferences[PreferencesKeys.GESTURE_TRIGGER] ?: true,
                 cameraSounds = preferences[PreferencesKeys.CAMERA_SOUNDS] ?: true,
                 gridMode = GridMode.valueOf(
                     preferences[PreferencesKeys.GRID_MODE] ?: GridMode.OFF.name,

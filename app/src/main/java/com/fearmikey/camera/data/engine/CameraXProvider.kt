@@ -18,6 +18,8 @@ import androidx.core.content.ContextCompat
 import androidx.core.net.toUri
 import androidx.lifecycle.LifecycleOwner
 import com.fearmikey.camera.data.engine.processing.ImageProcessor
+import com.fearmikey.camera.data.engine.processing.NativePanoramaBridge
+import com.fearmikey.camera.data.engine.processing.PanoramaFrameAnalyzer
 import com.fearmikey.camera.data.engine.gesture.GestureAnalyzer
 import com.fearmikey.camera.data.engine.gesture.GestureResult
 import com.fearmikey.camera.domain.model.CameraMode
@@ -40,6 +42,7 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 
 class CameraXProvider(
     private val context: Context,
@@ -60,6 +63,10 @@ class CameraXProvider(
     private var currentPrefs: UserPreferences = UserPreferences()
     private var currentProConfig: ProConfig = ProConfig()
     private var isProMode: Boolean = false
+    
+    private val panoramaBridge = NativePanoramaBridge()
+    private var panoramaEnginePtr: Long = 0
+    private var isPanoramaActive = false
     
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main)
     
@@ -181,6 +188,29 @@ class CameraXProvider(
                 imageAnalysis = null
             }
 
+            if (currentMode == CameraMode.PANORAMA) {
+                if (panoramaEnginePtr == 0L) {
+                    panoramaEnginePtr = panoramaBridge.nativeInit(100.0, 0.7f)
+                }
+                val analyzer = PanoramaFrameAnalyzer(panoramaBridge, panoramaEnginePtr, { isPanoramaActive }) {
+                    // TODO: Notify UI to slow down
+                    android.util.Log.w("CameraXProvider", "PANORAMA: SLOW DOWN!")
+                }
+                imageAnalysis = ImageAnalysis.Builder()
+                    .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
+                    .setResolutionSelector(ResolutionSelector.Builder()
+                        .setResolutionStrategy(ResolutionStrategy(
+                            android.util.Size(1280, 720),
+                            ResolutionStrategy.FALLBACK_RULE_CLOSEST_HIGHER_THEN_LOWER
+                        ))
+                        .build())
+                    .setOutputImageFormat(ImageAnalysis.OUTPUT_IMAGE_FORMAT_RGBA_8888)
+                    .build()
+                    .also {
+                        it.setAnalyzer(gestureExecutor, analyzer)
+                    }
+            }
+
             val recorder = Recorder.Builder()
                 .setQualitySelector(QualitySelector.from(Quality.HIGHEST))
                 .build()
@@ -274,6 +304,13 @@ class CameraXProvider(
         val isBackCamera = lastCameraSelector == CameraSelector.DEFAULT_BACK_CAMERA
         
         when {
+            currentMode == CameraMode.PANORAMA -> {
+                if (!isPanoramaActive) {
+                    startPanorama({ /* Handle UI start */ }, onError)
+                } else {
+                    stopPanorama(onSuccess, onError)
+                }
+            }
             currentMode == CameraMode.PORTRAIT -> {
                 android.util.Log.i("CameraXProvider", "Calling capturePortrait")
                 capturePortrait(onSuccess, onError)
@@ -300,6 +337,47 @@ class CameraXProvider(
             startRecording(onSuccess, onError)
         } else {
             onError(UnsupportedOperationException("Slow-mo not supported in CameraXProvider"))
+        }
+    }
+
+    override fun startPanorama(onSuccess: () -> Unit, onError: (Exception) -> Unit) {
+        if (currentMode != CameraMode.PANORAMA) {
+            onError(Exception("Not in Panorama mode"))
+            return
+        }
+        isPanoramaActive = true
+        onSuccess()
+    }
+
+    override fun stopPanorama(onSuccess: (String) -> Unit, onError: (Exception) -> Unit) {
+        if (!isPanoramaActive) {
+            onError(Exception("Panorama not active"))
+            return
+        }
+        isPanoramaActive = false
+        
+        scope.launch(Dispatchers.Default) {
+            try {
+                // Stitching can take a few seconds, use a large enough bitmap
+                // In a production app, we'd calculate the canvas size first
+                val outputBitmap = Bitmap.createBitmap(4096, 2048, Bitmap.Config.ARGB_8888)
+                val success = panoramaBridge.nativeFinalizeStitch(panoramaEnginePtr, outputBitmap)
+                
+                if (success) {
+                    val uri = saveBitmapToMediaStore(outputBitmap)
+                    withContext(Dispatchers.Main) {
+                        onSuccess(uri)
+                    }
+                } else {
+                    withContext(Dispatchers.Main) {
+                        onError(Exception("Panorama stitching failed"))
+                    }
+                }
+            } catch (e: Exception) {
+                withContext(Dispatchers.Main) {
+                    onError(e)
+                }
+            }
         }
     }
 
@@ -478,6 +556,10 @@ class CameraXProvider(
     override fun unbind() {
         cameraProvider?.unbindAll()
         camera = null
+        if (panoramaEnginePtr != 0L) {
+            panoramaBridge.nativeRelease(panoramaEnginePtr)
+            panoramaEnginePtr = 0
+        }
     }
 
     private fun captureSinglePhoto(onSuccess: (String) -> Unit, onError: (Exception) -> Unit) {

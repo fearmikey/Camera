@@ -69,6 +69,14 @@ class HybridCaptureEngine(
         }
     }
 
+    override fun startPanorama(onSuccess: () -> Unit, onError: (Exception) -> Unit) {
+        cameraXProvider.startPanorama(onSuccess, onError)
+    }
+
+    override fun stopPanorama(onSuccess: (String) -> Unit, onError: (Exception) -> Unit) {
+        cameraXProvider.stopPanorama(onSuccess, onError)
+    }
+
     override fun unbind() {
         cameraXProvider.unbind()
         camera2Provider.unbind()

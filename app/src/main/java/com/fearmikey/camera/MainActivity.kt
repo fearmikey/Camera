@@ -51,6 +51,7 @@ import com.fearmikey.camera.domain.model.LensSelectionMode
 import com.fearmikey.camera.SettingsActivity
 import androidx.compose.material.icons.filled.CameraAlt
 import androidx.compose.material.icons.filled.Videocam
+import kotlinx.coroutines.flow.StateFlow
 import androidx.compose.material.icons.filled.Tune
 import androidx.compose.material.icons.filled.AutoMode
 import androidx.compose.material.icons.filled.Block
@@ -144,6 +145,7 @@ fun CameraScreen(
 ) {
     val context = LocalContext.current
     val uiState by viewModel.uiState.collectAsState()
+    val orientation by viewModel.orientationState.collectAsState()
     val haptic = LocalHapticFeedback.current
     
     var showFlashOverlay by remember { mutableStateOf(false) }
@@ -180,14 +182,11 @@ fun CameraScreen(
                 isFrontCamera = uiState.isFrontCamera,
                 gridMode = uiState.userPreferences.gridMode,
                 showLeveler = uiState.userPreferences.showLeveler,
-                autoShowLeveler = uiState.autoShowLeveler,
-                horizonTilt = uiState.horizonTilt,
-                focusPoint = uiState.focusPoint,
-                handBoundingBox = uiState.handBoundingBox,
-                faceBoundingBox = uiState.faceBoundingBox,
-                isHandTimerPending = uiState.isHandTimerPending,
+                tiltFlow = viewModel.tiltState,
+                autoShowLevelerFlow = viewModel.autoShowLeveler,
+                focusFlow = viewModel.focusState,
+                gestureFlow = viewModel.gestureState,
                 onZoomChanged = { viewModel.setZoom(it) },
-                zoomPresets = uiState.zoomPresets,
                 onFocusAt = { x, y -> viewModel.focusAt(x, y) },
                 onBindToLifecycle = { owner, provider -> viewModel.bindToLifecycle(owner, provider) },
                 onModeSwiped = { direction ->
@@ -335,7 +334,10 @@ fun CameraScreen(
                 captureProgress = uiState.captureProgress,
                 recordingDuration = uiState.recordingDuration,
                 lastCapturedUri = uiState.lastCapturedUri,
-                orientation = uiState.orientation,
+                orientation = orientation,
+                zoomLevel = uiState.zoomLevel,
+                zoomPresets = uiState.zoomPresets,
+                onZoomChanged = { viewModel.setZoom(it) },
                 onModeSelected = { viewModel.setMode(it) },
                 onCapture = { 
                     viewModel.toggleCapture()
@@ -379,7 +381,6 @@ fun CameraScreen(
                     onLevelerToggle = { viewModel.toggleLeveler() },
                     onLocationTaggingToggle = { viewModel.toggleLocationTagging() },
                     onVolumeKeyShutterToggle = { viewModel.toggleVolumeKeyShutter() },
-                    onGestureTriggerToggle = { viewModel.toggleGestureTrigger() },
                     onFullSettingsClick = { 
                         context.startActivity(Intent(context, SettingsActivity::class.java))
                     }
@@ -431,16 +432,13 @@ fun CameraPreview(
     modifier: Modifier = Modifier,
     aspectRatio: DomainAspectRatio,
     zoomLevel: Float,
-    zoomPresets: List<Float>,
     isFrontCamera: Boolean,
     gridMode: com.fearmikey.camera.domain.model.GridMode,
     showLeveler: Boolean,
-    autoShowLeveler: Boolean,
-    horizonTilt: Float,
-    focusPoint: androidx.compose.ui.geometry.Offset?,
-    handBoundingBox: androidx.compose.ui.geometry.Rect? = null,
-    faceBoundingBox: androidx.compose.ui.geometry.Rect? = null,
-    isHandTimerPending: Boolean = false,
+    tiltFlow: StateFlow<Float>,
+    autoShowLevelerFlow: StateFlow<Boolean>,
+    focusFlow: StateFlow<androidx.compose.ui.geometry.Offset?>,
+    gestureFlow: StateFlow<com.fearmikey.camera.ui.camera.GestureOverlayState>,
     onZoomChanged: (Float) -> Unit,
     onFocusAt: (Float, Float) -> Unit,
     onBindToLifecycle: (androidx.lifecycle.LifecycleOwner, androidx.camera.core.Preview.SurfaceProvider) -> Unit,
@@ -477,7 +475,7 @@ fun CameraPreview(
                     }
                 }
             },
-        contentAlignment = BiasAlignment(0f, -0.7f) // Adjusted bias for better spacing
+        contentAlignment = BiasAlignment(0f, -0.7f) 
     ) {
         val previewWidth: androidx.compose.ui.unit.Dp
         val previewHeight: androidx.compose.ui.unit.Dp
@@ -499,7 +497,6 @@ fun CameraPreview(
         Box(
             modifier = Modifier
                 .size(previewWidth, previewHeight)
-                .clip(RoundedCornerShape(32.dp))
                 .pointerInput(Unit) {
                     detectTapGestures { offset ->
                         onFocusAt(offset.x / size.width, offset.y / size.height)
@@ -515,32 +512,18 @@ fun CameraPreview(
                     }
                 },
                 update = {
-                    // No need to re-bind if nothing changed that affects the binder
-                    // CameraX handles surface updates internally
                 }
             )
             
             HudOverlay(
                 gridMode = gridMode,
                 showLeveler = showLeveler,
-                autoShowLeveler = autoShowLeveler,
-                horizonTilt = horizonTilt,
-                focusPoint = focusPoint,
-                handBoundingBox = handBoundingBox,
-                faceBoundingBox = faceBoundingBox,
-                isHandTimerPending = isHandTimerPending,
+                tiltFlow = tiltFlow,
+                autoShowLevelerFlow = autoShowLevelerFlow,
+                focusFlow = focusFlow,
+                gestureFlow = gestureFlow,
                 isFrontCamera = isFrontCamera,
                 modifier = Modifier.fillMaxSize()
-            )
-
-            // Zoom pill inside preview, matching Google Camera
-            ZoomSwitcher(
-                currentZoom = zoomLevel,
-                zoomPresets = zoomPresets,
-                onZoomSelected = onZoomChanged,
-                modifier = Modifier
-                    .align(Alignment.BottomCenter)
-                    .padding(bottom = 16.dp)
             )
         }
     }
@@ -773,6 +756,9 @@ fun CameraControls(
     recordingDuration: String,
     lastCapturedUri: android.net.Uri?,
     orientation: Int,
+    zoomLevel: Float,
+    zoomPresets: List<Float>,
+    onZoomChanged: (Float) -> Unit,
     onModeSelected: (CameraMode) -> Unit,
     onCapture: () -> Unit,
     onPause: () -> Unit,
@@ -794,13 +780,18 @@ fun CameraControls(
         modifier = modifier.fillMaxWidth(),
         horizontalAlignment = Alignment.CenterHorizontally
     ) {
-        // ZoomSwitcher is now back in CameraPreview
+        ZoomSwitcher(
+            currentZoom = zoomLevel,
+            zoomPresets = zoomPresets,
+            onZoomSelected = onZoomChanged,
+            modifier = Modifier.padding(top = 10.dp, bottom = 10.dp)
+        )
 
         Row(
             modifier = Modifier
                 .fillMaxWidth()
                 .padding(horizontal = 40.dp)
-                .padding(bottom = 32.dp),
+                .padding(bottom = 24.dp),
             horizontalArrangement = Arrangement.SpaceBetween,
             verticalAlignment = Alignment.CenterVertically
         ) {
