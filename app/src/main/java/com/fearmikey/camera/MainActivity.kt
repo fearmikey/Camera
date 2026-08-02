@@ -331,6 +331,7 @@ fun CameraScreen(
                 isRecording = uiState.isRecording,
                 isPaused = uiState.isPaused,
                 isProcessing = uiState.isProcessing,
+                isPanoramaCapturing = uiState.isPanoramaCapturing,
                 captureProgress = uiState.captureProgress,
                 recordingDuration = uiState.recordingDuration,
                 lastCapturedUri = uiState.lastCapturedUri,
@@ -341,7 +342,7 @@ fun CameraScreen(
                 onModeSelected = { viewModel.setMode(it) },
                 onCapture = { 
                     viewModel.toggleCapture()
-                    if (!uiState.isRecording && (uiState.currentMode != CameraMode.VIDEO)) {
+                    if (!uiState.isRecording && uiState.currentMode != CameraMode.VIDEO && uiState.currentMode != CameraMode.PANORAMA) {
                         showFlashOverlay = true
                     }
                 },
@@ -409,6 +410,7 @@ fun CameraScreen(
                         val processingText = when (uiState.currentMode) {
                             CameraMode.HDR -> "HDR Processing..."
                             CameraMode.NIGHT_SIGHT -> "Processing Night Sight..."
+                            CameraMode.PANORAMA -> "Stitching Panorama..."
                             else -> "Processing..."
                         }
                         Text(processingText, color = Color.White)
@@ -418,6 +420,13 @@ fun CameraScreen(
 
             uiState.timerCountdown?.let { countdown ->
                 TimerCountdownOverlay(countdown = countdown)
+            }
+
+            if (uiState.isPanoramaCapturing) {
+                PanoramaGuideOverlay(
+                    message = uiState.panoramaMessage ?: "Move camera slowly...",
+                    modifier = Modifier.fillMaxSize()
+                )
             }
         }
     } else {
@@ -524,6 +533,61 @@ fun CameraPreview(
                 gestureFlow = gestureFlow,
                 isFrontCamera = isFrontCamera,
                 modifier = Modifier.fillMaxSize()
+            )
+        }
+    }
+}
+
+@Composable
+fun PanoramaGuideOverlay(
+    message: String,
+    modifier: Modifier = Modifier
+) {
+    Box(
+        modifier = modifier.fillMaxSize(),
+        contentAlignment = Alignment.Center
+    ) {
+        Column(
+            horizontalAlignment = Alignment.CenterHorizontally,
+            modifier = Modifier.padding(bottom = 200.dp)
+        ) {
+            // Visual guide: A horizontal line with an arrow or indicator
+            Box(
+                modifier = Modifier
+                    .width(300.dp)
+                    .height(2.dp)
+                    .background(Color.White.copy(alpha = 0.5f))
+            ) {
+                // Moving indicator simulation (just static for now)
+                Box(
+                    modifier = Modifier
+                        .size(20.dp)
+                        .align(Alignment.Center)
+                        .background(Color.Yellow, CircleShape)
+                        .border(2.dp, Color.Black, CircleShape)
+                )
+            }
+            
+            Spacer(modifier = Modifier.height(16.dp))
+            
+            Surface(
+                color = Color.Black.copy(alpha = 0.7f),
+                shape = RoundedCornerShape(8.dp)
+            ) {
+                Text(
+                    text = message,
+                    color = Color.White,
+                    modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp),
+                    style = MaterialTheme.typography.bodyLarge,
+                    fontWeight = FontWeight.Bold
+                )
+            }
+
+            Spacer(modifier = Modifier.height(8.dp))
+            Text(
+                "Press shutter again to finish",
+                color = Color.White.copy(alpha = 0.6f),
+                style = MaterialTheme.typography.labelMedium
             )
         }
     }
@@ -752,6 +816,7 @@ fun CameraControls(
     isRecording: Boolean,
     isPaused: Boolean,
     isProcessing: Boolean,
+    isPanoramaCapturing: Boolean,
     captureProgress: Float,
     recordingDuration: String,
     lastCapturedUri: android.net.Uri?,
@@ -857,8 +922,9 @@ fun CameraControls(
                     }
 
                     val isVideoMode = currentMode == CameraMode.VIDEO || currentMode == CameraMode.SLOW_MO
-                    val shutterColor = if (isVideoMode || isRecording) Color.Red else Color.White
-                    val shutterInnerShape = if (isRecording) androidx.compose.foundation.shape.RoundedCornerShape(12.dp) else CircleShape
+                    val isCapturing = isRecording || isPanoramaCapturing
+                    val shutterColor = if (isVideoMode || isCapturing) Color.Red else Color.White
+                    val shutterInnerShape = if (isCapturing) androidx.compose.foundation.shape.RoundedCornerShape(12.dp) else CircleShape
 
                     Box(
                         modifier = Modifier

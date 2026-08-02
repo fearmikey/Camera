@@ -75,6 +75,7 @@ class CameraViewModel(
         refreshThumbnail()
         observePreferences()
         setupGestureTrigger()
+        setupPanoramaListener()
     }
 
     private fun observePreferences() {
@@ -288,6 +289,11 @@ class CameraViewModel(
     }
 
     private fun performCapture() {
+        if (_uiState.value.currentMode == CameraMode.PANORAMA) {
+            handlePanoramaCapture()
+            return
+        }
+
         _uiState.update { it.copy(isProcessing = true) }
         captureEngine.playShutterSound()
         captureEngine.capturePhoto(
@@ -305,6 +311,35 @@ class CameraViewModel(
                 _uiState.update { it.copy(isProcessing = false) }
             }
         )
+    }
+
+    private fun handlePanoramaCapture() {
+        if (!_uiState.value.isPanoramaCapturing) {
+            _uiState.update { it.copy(isPanoramaCapturing = true, panoramaMessage = "Move camera slowly...") }
+            captureEngine.startPanorama(
+                onSuccess = { /* UI already updated */ },
+                onError = { error ->
+                    error.printStackTrace()
+                    _uiState.update { it.copy(isPanoramaCapturing = false, panoramaMessage = null) }
+                }
+            )
+        } else {
+            _uiState.update { it.copy(isProcessing = true, isPanoramaCapturing = false, panoramaMessage = "Stitching...") }
+            captureEngine.stopPanorama(
+                onSuccess = { uriString ->
+                    val uri = uriString.toUri()
+                    _uiState.update { it.copy(lastCapturedUri = uri, isProcessing = false, panoramaMessage = null) }
+                    viewModelScope.launch {
+                        delay(500.milliseconds)
+                        refreshThumbnail()
+                    }
+                },
+                onError = { error ->
+                    error.printStackTrace()
+                    _uiState.update { it.copy(isProcessing = false, panoramaMessage = null) }
+                }
+            )
+        }
     }
 
     fun toggleCapture() {
@@ -473,6 +508,19 @@ class CameraViewModel(
                             gestureTriggerJob = null
                         }
                     }
+                }
+            }
+        }
+    }
+
+    private fun setupPanoramaListener() {
+        captureEngine.setOnPanoramaListener { message ->
+            _uiState.update { it.copy(panoramaMessage = message) }
+            // Clear message after a short delay
+            viewModelScope.launch {
+                delay(2000)
+                if (_uiState.value.panoramaMessage == message) {
+                    _uiState.update { it.copy(panoramaMessage = null) }
                 }
             }
         }

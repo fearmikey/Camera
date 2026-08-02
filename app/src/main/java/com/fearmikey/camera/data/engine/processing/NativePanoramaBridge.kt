@@ -15,6 +15,7 @@ class NativePanoramaBridge {
         timestamp: Long
     ): Boolean
     external fun nativeFinalizeStitch(enginePtr: Long, outputBitmap: Bitmap): Boolean
+    external fun nativeReset(enginePtr: Long)
     external fun nativeRelease(enginePtr: Long)
 
     companion object {

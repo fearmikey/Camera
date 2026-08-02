@@ -58,4 +58,11 @@ Java_com_fearmikey_camera_data_engine_processing_NativePanoramaBridge_nativeRele
     delete engine;
 }
 
+JNIEXPORT void JNICALL
+Java_com_fearmikey_camera_data_engine_processing_NativePanoramaBridge_nativeReset(
+        JNIEnv* env, jobject /* thiz */, jlong enginePtr) {
+    auto* engine = reinterpret_cast<PanoramaEngine*>(enginePtr);
+    if (engine) engine->reset();
+}
+
 }

@@ -57,6 +57,7 @@ class CameraXProvider(
     private var gestureAnalyzer: GestureAnalyzer? = null
     private var gestureTriggerEnabled: Boolean = false
     private var gestureListener: ((GestureResult) -> Unit)? = null
+    private var panoramaListener: ((String) -> Unit)? = null
     private val gestureExecutor: ExecutorService = Executors.newSingleThreadExecutor()
     private var camera: Camera? = null
     private var currentMode: CameraMode = CameraMode.PHOTO
@@ -193,8 +194,7 @@ class CameraXProvider(
                     panoramaEnginePtr = panoramaBridge.nativeInit(100.0, 0.7f)
                 }
                 val analyzer = PanoramaFrameAnalyzer(panoramaBridge, panoramaEnginePtr, { isPanoramaActive }) {
-                    // TODO: Notify UI to slow down
-                    android.util.Log.w("CameraXProvider", "PANORAMA: SLOW DOWN!")
+                    panoramaListener?.invoke("Slow down!")
                 }
                 imageAnalysis = ImageAnalysis.Builder()
                     .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
@@ -273,7 +273,13 @@ class CameraXProvider(
     }
 
     override fun setMode(mode: CameraMode) {
+        val prevMode = currentMode
         currentMode = mode
+        if (prevMode == CameraMode.PANORAMA || mode == CameraMode.PANORAMA ||
+            prevMode == CameraMode.VIDEO || mode == CameraMode.VIDEO ||
+            prevMode == CameraMode.SLOW_MO || mode == CameraMode.SLOW_MO) {
+            rebind()
+        }
     }
 
     override fun applySettings(prefs: UserPreferences) {
@@ -344,6 +350,9 @@ class CameraXProvider(
         if (currentMode != CameraMode.PANORAMA) {
             onError(Exception("Not in Panorama mode"))
             return
+        }
+        if (panoramaEnginePtr != 0L) {
+            panoramaBridge.nativeReset(panoramaEnginePtr)
         }
         isPanoramaActive = true
         onSuccess()
@@ -541,6 +550,10 @@ class CameraXProvider(
 
     override fun setOnGestureListener(listener: (GestureResult) -> Unit) {
         this.gestureListener = listener
+    }
+
+    override fun setOnPanoramaListener(listener: (String) -> Unit) {
+        this.panoramaListener = listener
     }
 
     override fun focusAt(x: Float, y: Float) {

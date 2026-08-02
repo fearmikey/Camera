@@ -19,6 +19,8 @@ data class CameraUiState(
     val recordingDuration: String = "00:00",
     val isProMode: Boolean = false,
     val isProcessing: Boolean = false,
+    val isPanoramaCapturing: Boolean = false,
+    val panoramaMessage: String? = null,
     val timerCountdown: Int? = null,
     val captureProgress: Float = 0f,
     val zoomLevel: Float = 1.0f,

@@ -187,4 +187,9 @@ class HybridCaptureEngine(
         cameraXProvider.setOnGestureListener(listener)
         camera2Provider.setOnGestureListener(listener)
     }
+
+    override fun setOnPanoramaListener(listener: (String) -> Unit) {
+        cameraXProvider.setOnPanoramaListener(listener)
+        camera2Provider.setOnPanoramaListener(listener)
+    }
 }

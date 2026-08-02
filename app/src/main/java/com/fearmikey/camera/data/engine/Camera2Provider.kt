@@ -950,6 +950,10 @@ class Camera2Provider(
         // Hand Gesture trigger not implemented for Camera2 provider yet.
     }
 
+    override fun setOnPanoramaListener(listener: (String) -> Unit) {
+        // Panorama listener not implemented for Camera2 provider yet.
+    }
+
     private fun applyFlashToBuilder(builder: CaptureRequest.Builder, flashMode: FlashMode) {
         when (flashMode) {
             FlashMode.OFF -> {

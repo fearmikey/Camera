@@ -39,5 +39,6 @@ interface CaptureEngine {
     fun playStopRecordingSound()
     fun setGestureTriggerEnabled(enabled: Boolean)
     fun setOnGestureListener(listener: (GestureResult) -> Unit)
+    fun setOnPanoramaListener(listener: (String) -> Unit)
     fun unbind()
 }
