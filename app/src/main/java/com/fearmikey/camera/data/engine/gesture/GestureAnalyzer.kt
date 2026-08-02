@@ -50,7 +50,7 @@ class GestureAnalyzer(
     private val faceTimeout = 2000L // Keep hand detection active for 2s after face is lost
 
     private var frameCounter = 0
-    private val frameSkip = 5 // Increased skip to 5 to process fewer frames (reduces processing overhead)
+    private val frameSkip = 4 // Increased skip to 4 to process fewer frames (reduces processing overhead)
     
     private var consecutiveDetections = 0
     private val requiredConsecutiveFrames = 3 // Balanced sensitivity (was 2)
