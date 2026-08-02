@@ -1,7 +1,9 @@
 package com.fearmikey.camera.domain.model
 
 import android.util.Range
+import androidx.compose.runtime.Immutable
 
+@Immutable
 data class ProConfig(
     val iso: Int? = null,
     val shutterSpeedNs: Long? = null,
@@ -10,6 +12,7 @@ data class ProConfig(
     val isRawEnabled: Boolean = false
 )
 
+@Immutable
 data class CameraHardwareCapabilities(
     val isoRange: Range<Int>,
     val shutterSpeedRange: Range<Long>,

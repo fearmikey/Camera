@@ -12,6 +12,9 @@ A high-performance Android camera application featuring advanced capture modes a
 - HDR: Exposure bracketing and fusion for high dynamic range photography.
 - Portrait Mode: AI-powered background segmentation and bokeh effects.
 - Pro Mode: Manual control over ISO, Shutter Speed, and Focus using Camera2 interop.
+- GPU Processing: High-performance image processing pipeline using custom GLSL shaders for effects like pixel binning and Night Sight.
+- Gesture Controls: Intuitive gesture-based interactions for zoom and mode switching.
+- Persistent Settings: Integrated Jetpack DataStore for a comprehensive and stable settings management system.
 - Real-time HUD: Rule of thirds grid and horizon leveler.
 
 ## Architecture

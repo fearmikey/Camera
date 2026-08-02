@@ -17,6 +17,7 @@ datastore = "1.2.1"
 ksp = "2.0.21-1.0.26"
 appcompat = "1.6.1"
 material = "1.11.0"
+mediapipe-tasks-vision = "0.10.14"
 
 [libraries]
 androidx-core-ktx = { module = "androidx.core:core-ktx", version.ref = "coreKtx" }
@@ -59,6 +60,7 @@ tensorflow-lite-gpu-api = { module = "org.tensorflow:tensorflow-lite-gpu-api", v
 
 # Coil
 coil-compose = { module = "io.coil-kt:coil-compose", version.ref = "coil" }
+mediapipe-tasks-vision = { module = "com.google.mediapipe:tasks-vision", version.ref = "mediapipe-tasks-vision" }
 
 [plugins]
 android-application = { id = "com.android.application", version.ref = "agp" }

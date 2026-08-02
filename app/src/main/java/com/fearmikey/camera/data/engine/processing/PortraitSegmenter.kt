@@ -16,10 +16,11 @@ class PortraitSegmenter(
     private val context: Context
 ) {
     private var interpreter: Interpreter? = null
-    private val gpuDelegate: GpuDelegate by lazy { GpuDelegate() }
+    private var gpuDelegate: GpuDelegate? = null
 
     init {
         try {
+            gpuDelegate = GpuDelegate()
             val options = Interpreter.Options().apply {
                 addDelegate(gpuDelegate)
             }
@@ -87,6 +88,6 @@ class PortraitSegmenter(
 
     fun close() {
         interpreter?.close()
-        gpuDelegate.close()
+        gpuDelegate?.close()
     }
 }

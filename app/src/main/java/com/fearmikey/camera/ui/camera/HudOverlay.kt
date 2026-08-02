@@ -16,48 +16,72 @@ import androidx.compose.ui.graphics.drawscope.withTransform
 import androidx.compose.ui.graphics.nativeCanvas
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.unit.dp
+import com.fearmikey.camera.domain.model.GridMode
 import kotlin.math.abs
 
 @Composable
 fun HudOverlay(
-    uiState: CameraUiState,
+    gridMode: GridMode,
+    showLeveler: Boolean,
+    autoShowLeveler: Boolean,
+    horizonTilt: Float,
+    focusPoint: androidx.compose.ui.geometry.Offset?,
     modifier: Modifier = Modifier
 ) {
     Box(modifier = modifier) {
-        if (uiState.userPreferences.showGridLines) {
-            RuleOfThirdsGrid()
+        if (gridMode != GridMode.OFF) {
+            CameraGrid(gridMode)
         }
         
-        if (uiState.userPreferences.showLeveler || uiState.autoShowLeveler) {
-            HorizonLeveler(tilt = uiState.horizonTilt)
+        if (showLeveler || autoShowLeveler) {
+            HorizonLeveler(tilt = horizonTilt)
         }
         
-        uiState.focusPoint?.let { point ->
+        focusPoint?.let { point ->
             FocusRing(point = point)
         }
     }
 }
 
 @Composable
-fun RuleOfThirdsGrid() {
+fun CameraGrid(mode: GridMode) {
     Canvas(modifier = Modifier.fillMaxSize()) {
         val strokeWidth = 1.dp.toPx()
         val color = Color.White.copy(alpha = 0.3f)
         val shadowColor = Color.Black.copy(alpha = 0.2f)
-        
-        // Helper to draw line with subtle shadow for legibility
+
         fun drawGridLine(start: Offset, end: Offset) {
             drawLine(shadowColor, start + Offset(1f, 1f), end + Offset(1f, 1f), strokeWidth)
             drawLine(color, start, end, strokeWidth)
         }
 
-        // Vertical lines
-        drawGridLine(Offset(size.width / 3, 0f), Offset(size.width / 3, size.height))
-        drawGridLine(Offset(2 * size.width / 3, 0f), Offset(2 * size.width / 3, size.height))
-        
-        // Horizontal lines
-        drawGridLine(Offset(0f, size.height / 3), Offset(size.width, size.height / 3))
-        drawGridLine(Offset(0f, 2 * size.height / 3), Offset(size.width, 2 * size.height / 3))
+        when (mode) {
+            GridMode.GRID_3X3 -> {
+                // Vertical
+                drawGridLine(Offset(size.width / 3, 0f), Offset(size.width / 3, size.height))
+                drawGridLine(Offset(2 * size.width / 3, 0f), Offset(2 * size.width / 3, size.height))
+                // Horizontal
+                drawGridLine(Offset(0f, size.height / 3), Offset(size.width, size.height / 3))
+                drawGridLine(Offset(0f, 2 * size.height / 3), Offset(size.width, 2 * size.height / 3))
+            }
+            GridMode.GRID_4X4 -> {
+                for (i in 1..3) {
+                    drawGridLine(Offset(i * size.width / 4, 0f), Offset(i * size.width / 4, size.height))
+                    drawGridLine(Offset(0f, i * size.height / 4), Offset(size.width, i * size.height / 4))
+                }
+            }
+            GridMode.GOLDEN_RATIO -> {
+                val ratio = 0.618f
+                val invRatio = 1f - ratio
+                // Vertical
+                drawGridLine(Offset(size.width * invRatio, 0f), Offset(size.width * invRatio, size.height))
+                drawGridLine(Offset(size.width * ratio, 0f), Offset(size.width * ratio, size.height))
+                // Horizontal
+                drawGridLine(Offset(0f, size.height * invRatio), Offset(size.width, size.height * invRatio))
+                drawGridLine(Offset(0f, size.height * ratio), Offset(size.width, size.height * ratio))
+            }
+            else -> {}
+        }
     }
 }
 
@@ -129,37 +153,32 @@ fun FocusRing(point: Offset) {
         label = "focusOpacity"
     )
 
-    var startScale by remember { mutableStateOf(1.5f) }
-    LaunchedEffect(point) {
-        startScale = 1.5f
-        // Small delay to trigger the scale down animation
-    }
-
     val animatedScale by animateFloatAsState(
         targetValue = 1.0f,
-        animationSpec = tween(300, easing = FastOutSlowInEasing),
+        animationSpec = tween(400, easing = FastOutSlowInEasing),
         label = "focusEntryScale"
     )
 
     Canvas(modifier = Modifier.fillMaxSize()) {
-        val sizePx = 70.dp.toPx()
+        val radiusPx = 40.dp.toPx()
         val color = Color.Yellow.copy(alpha = opacity)
         
         withTransform({
-            translate(left = point.x * size.width - sizePx / 2, top = point.y * size.height - sizePx / 2)
-            scale(animatedScale, animatedScale, pivot = Offset(sizePx / 2, sizePx / 2))
+            translate(left = point.x * size.width, top = point.y * size.height)
+            scale(animatedScale, animatedScale, pivot = Offset.Zero)
         }) {
-            drawRect(
+            drawCircle(
                 color = color,
-                size = Size(sizePx, sizePx),
+                radius = radiusPx,
                 style = Stroke(width = 2.dp.toPx())
             )
             
-            // Small crosshair lines
-            drawLine(color, Offset(sizePx / 2, 0f), Offset(sizePx / 2, 10f), 2.dp.toPx())
-            drawLine(color, Offset(sizePx / 2, sizePx), Offset(sizePx / 2, sizePx - 10f), 2.dp.toPx())
-            drawLine(color, Offset(0f, sizePx / 2), Offset(10f, sizePx / 2), 2.dp.toPx())
-            drawLine(color, Offset(sizePx, sizePx / 2), Offset(sizePx - 10f, sizePx / 2), 2.dp.toPx())
+            // Subtle inner circle
+            drawCircle(
+                color = color.copy(alpha = opacity * 0.5f),
+                radius = radiusPx * 0.8f,
+                style = Stroke(width = 1.dp.toPx())
+            )
         }
     }
 }

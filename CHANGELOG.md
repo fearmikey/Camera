@@ -2,6 +2,20 @@
 
 All notable changes to this project will be documented in this file.
 
+## [1.0.3] - 2026-08-02
+
+### Added
+- GPU Image Processing: Implemented a high-performance GLSL-based processing pipeline including pixel binning and multi-frame alignment.
+- Advanced Shaders: Added custom shaders for night sight merging and passthrough rendering.
+- Settings Infrastructure: Introduced SettingsActivity and integrated Jetpack DataStore for persistent user preferences.
+- Gesture Analysis: Added dedicated gesture analyzer for intuitive camera control interactions.
+- Streaming Frame Buffer: Implemented a new buffer management system for continuous frame processing.
+
+### Improved
+- Hybrid Capture Engine: Refined engine switching logic for better stability and performance.
+- UI/UX: Updated HudOverlay and SettingsSheet for better accessibility and visual clarity.
+- Portrait Mode: Enhanced AI-powered background segmentation and bokeh processing.
+
 ## [1.0.2] - 2026-08-01
 
 ### Added

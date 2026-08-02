@@ -1,6 +1,5 @@
 package com.fearmikey.camera.ui.camera
 
-import android.net.Uri
 import android.hardware.Sensor
 import android.hardware.SensorEvent
 import android.hardware.SensorEventListener
@@ -10,6 +9,7 @@ import androidx.camera.core.Preview
 import androidx.lifecycle.LifecycleOwner
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
+import androidx.core.net.toUri
 import com.fearmikey.camera.data.engine.CaptureEngine
 import com.fearmikey.camera.data.repository.MediaRepository
 import com.fearmikey.camera.data.repository.UserPreferencesRepository
@@ -19,11 +19,14 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.*
 import kotlinx.coroutines.launch
 import kotlin.math.abs
+import kotlin.math.atan2
+import kotlin.math.sqrt
+import kotlin.time.Duration.Companion.milliseconds
 
 class CameraViewModel(
     private val captureEngine: CaptureEngine,
     private val mediaRepository: MediaRepository,
-    private val userPreferencesRepository: UserPreferencesRepository
+    private val userPreferencesRepository: UserPreferencesRepository,
 ) : ViewModel(), SensorEventListener {
 
     private val _uiState = MutableStateFlow(CameraUiState())
@@ -37,18 +40,27 @@ class CameraViewModel(
     private val alpha = 0.3f // Increased for more responsiveness
     
     private var focusJob: Job? = null
+    private var recordingTimerJob: Job? = null
+    private var timerJob: Job? = null
+    private var secondsRecorded = 0L
 
     init {
         refreshThumbnail()
         observePreferences()
+        setupGestureTrigger()
     }
 
     private fun observePreferences() {
         viewModelScope.launch {
             userPreferencesRepository.userPreferencesFlow.collect { prefs ->
                 val prevShowLeveler = _uiState.value.userPreferences.showLeveler
-                _uiState.update { it.copy(userPreferences = prefs) }
+                _uiState.update { it.copy(
+                    userPreferences = prefs,
+                    flashMode = prefs.flashMode
+                ) }
                 captureEngine.applySettings(prefs)
+                captureEngine.setFlashMode(prefs.flashMode)
+                captureEngine.setGestureTriggerEnabled(prefs.gestureTrigger)
                 
                 if (prefs.showLeveler && !prevShowLeveler) {
                     startLeveler()
@@ -63,21 +75,47 @@ class CameraViewModel(
         viewModelScope.launch { userPreferencesRepository.updateAspectRatio(aspectRatio) }
     }
 
-    fun updateVideoResolution(resolution: VideoResolution) {
-        viewModelScope.launch { userPreferencesRepository.updateVideoResolution(resolution) }
+    fun updateTimer(timer: TimerMode) {
+        viewModelScope.launch { userPreferencesRepository.updateTimer(timer) }
     }
 
-    fun updateImageFormat(format: ImageFormat) {
-        viewModelScope.launch { userPreferencesRepository.updateImageFormat(format) }
+    fun updateLightMode(mode: LightMode) {
+        viewModelScope.launch { userPreferencesRepository.updateLightMode(mode) }
     }
 
-    fun updateVideoCodec(codec: VideoCodec) {
-        viewModelScope.launch { userPreferencesRepository.updateVideoCodec(codec) }
+    fun updateMacroFocus(mode: MacroMode) {
+        viewModelScope.launch { userPreferencesRepository.updateMacroFocus(mode) }
+    }
+
+    fun updateTopShot(enabled: Boolean) {
+        viewModelScope.launch { userPreferencesRepository.updateTopShot(enabled) }
+    }
+
+    fun updateMotionPhoto(mode: MotionPhotoMode) {
+        viewModelScope.launch { userPreferencesRepository.updateMotionPhoto(mode) }
+    }
+
+    fun updateResolution(resolution: ResolutionMode) {
+        viewModelScope.launch { userPreferencesRepository.updateResolution(resolution) }
+    }
+
+    fun updateSaveMode(saveMode: ImageSaveMode) {
+        viewModelScope.launch { userPreferencesRepository.updateSaveMode(saveMode) }
+    }
+
+    fun updateLensSelection(mode: LensSelectionMode) {
+        viewModelScope.launch { userPreferencesRepository.updateLensSelection(mode) }
     }
 
     fun toggleGridLines() {
         viewModelScope.launch {
-            userPreferencesRepository.updateShowGridLines(!_uiState.value.userPreferences.showGridLines)
+            val currentMode = _uiState.value.userPreferences.gridMode
+            val nextMode = when (currentMode) {
+                GridMode.OFF -> GridMode.GRID_3X3
+                GridMode.GRID_3X3 -> GridMode.OFF
+                else -> GridMode.OFF
+            }
+            userPreferencesRepository.updateGridMode(nextMode)
         }
     }
 
@@ -87,9 +125,32 @@ class CameraViewModel(
         }
     }
 
+    fun toggleFlashMode() {
+        viewModelScope.launch {
+            val nextMode = when (_uiState.value.flashMode) {
+                FlashMode.OFF -> FlashMode.AUTO
+                FlashMode.AUTO -> FlashMode.ON
+                FlashMode.ON -> FlashMode.OFF
+            }
+            userPreferencesRepository.updateFlashMode(nextMode)
+        }
+    }
+
+    fun toggleVolumeKeyShutter() {
+        viewModelScope.launch {
+            userPreferencesRepository.updateVolumeKeyShutter(!_uiState.value.userPreferences.volumeKeyShutter)
+        }
+    }
+
     fun toggleLocationTagging() {
         viewModelScope.launch {
             userPreferencesRepository.updateLocationTagging(!_uiState.value.userPreferences.locationTagging)
+        }
+    }
+
+    fun toggleGestureTrigger() {
+        viewModelScope.launch {
+            userPreferencesRepository.updateGestureTrigger(!_uiState.value.userPreferences.gestureTrigger)
         }
     }
 
@@ -135,20 +196,73 @@ class CameraViewModel(
         }
     }
 
+    fun setCaptureType(type: CaptureType) {
+        _uiState.update { 
+            val nextMode = if (type == CaptureType.PHOTO) CameraMode.PHOTO else CameraMode.VIDEO
+            it.copy(captureType = type, currentMode = nextMode) 
+        }
+        captureEngine.setMode(if (type == CaptureType.PHOTO) CameraMode.PHOTO else CameraMode.VIDEO)
+    }
+
     fun setMode(mode: CameraMode) {
         _uiState.update { it.copy(currentMode = mode) }
         captureEngine.setMode(mode)
     }
 
     fun takePicture() {
+        if (timerJob != null) {
+            cancelTimer()
+            return
+        }
+
+        val timerMode = _uiState.value.userPreferences.timer
+        if (timerMode != TimerMode.OFF) {
+            startTimer(timerMode.seconds)
+        } else {
+            performCapture()
+        }
+    }
+
+    private fun startTimer(seconds: Int) {
+        timerJob?.cancel()
+        _uiState.update { it.copy(timerCountdown = seconds) }
+        timerJob = viewModelScope.launch {
+            var remaining = seconds
+            val timerLightEnabled = _uiState.value.userPreferences.timerLight
+            while (remaining > 0) {
+                captureEngine.playTimerTickSound()
+                if (timerLightEnabled) {
+                    captureEngine.setTorchEnabled(enabled = true)
+                    delay(100.milliseconds)
+                    captureEngine.setTorchEnabled(enabled = false)
+                    delay(900.milliseconds)
+                } else {
+                    delay(1000.milliseconds)
+                }
+                remaining--
+                _uiState.update { it.copy(timerCountdown = if (remaining > 0) remaining else null) }
+            }
+            timerJob = null
+            performCapture()
+        }
+    }
+
+    private fun cancelTimer() {
+        timerJob?.cancel()
+        timerJob = null
+        _uiState.update { it.copy(timerCountdown = null) }
+    }
+
+    private fun performCapture() {
         _uiState.update { it.copy(isProcessing = true) }
+        captureEngine.playShutterSound()
         captureEngine.capturePhoto(
             onSuccess = { uriString ->
-                val uri = Uri.parse(uriString)
+                val uri = uriString.toUri()
                 _uiState.update { it.copy(lastCapturedUri = uri, isProcessing = false) }
                 // Delay refresh to allow MediaStore to index the new file
                 viewModelScope.launch {
-                    delay(500)
+                    delay(500.milliseconds)
                     refreshThumbnail()
                 }
             },
@@ -173,29 +287,83 @@ class CameraViewModel(
     }
 
     fun startVideo() {
-        _uiState.update { it.copy(isRecording = true) }
+        _uiState.update { it.copy(isRecording = true, isPaused = false, recordingDuration = "00:00") }
+        secondsRecorded = 0
+        startRecordingTimer()
+        captureEngine.playStartRecordingSound()
         captureEngine.startSlowMoVideo(
             onSuccess = {
                 // Recording actually started
             },
             onError = { error ->
                 error.printStackTrace()
+                stopRecordingTimer()
                 _uiState.update { it.copy(isRecording = false) }
             }
         )
     }
 
     fun stopVideo() {
-        captureEngine.stopSlowMoVideo(
-            onSuccess = { uriString ->
-                val uri = Uri.parse(uriString)
-                _uiState.update { it.copy(lastCapturedUri = uri, isRecording = false) }
-                viewModelScope.launch {
-                    delay(800) // Slightly longer delay for video indexing
-                    refreshThumbnail()
-                }
+        stopRecordingTimer()
+        captureEngine.playStopRecordingSound()
+        captureEngine.stopSlowMoVideo { uriString ->
+            val uri = uriString.toUri()
+            _uiState.update { it.copy(lastCapturedUri = uri, isRecording = false, isPaused = false) }
+            viewModelScope.launch {
+                delay(800.milliseconds) // Slightly longer delay for video indexing
+                refreshThumbnail()
             }
+        }
+    }
+
+    fun pauseVideo() {
+        if (_uiState.value.isRecording && !_uiState.value.isPaused) {
+            _uiState.update { it.copy(isPaused = true) }
+            captureEngine.pauseVideo()
+            pauseRecordingTimer()
+        }
+    }
+
+    fun resumeVideo() {
+        if (_uiState.value.isRecording && _uiState.value.isPaused) {
+            _uiState.update { it.copy(isPaused = false) }
+            captureEngine.resumeVideo()
+            startRecordingTimer()
+        }
+    }
+
+    fun takePhotoDuringVideo() {
+        captureEngine.captureVideoSnapshot(
+            onSuccess = { _ ->
+                // Maybe play a sound or show a flash
+            },
+            onError = { it.printStackTrace() },
         )
+    }
+
+    private fun startRecordingTimer() {
+        recordingTimerJob?.cancel()
+        recordingTimerJob = viewModelScope.launch {
+            while (true) {
+                delay(1000)
+                secondsRecorded++
+                val minutes = secondsRecorded / 60
+                val seconds = secondsRecorded % 60
+                val duration = String.format(java.util.Locale.US, "%02d:%02d", minutes, seconds)
+                _uiState.update { it.copy(recordingDuration = duration) }
+            }
+        }
+    }
+
+    private fun pauseRecordingTimer() {
+        recordingTimerJob?.cancel()
+        recordingTimerJob = null
+    }
+
+    private fun stopRecordingTimer() {
+        recordingTimerJob?.cancel()
+        recordingTimerJob = null
+        secondsRecorded = 0
     }
 
     fun quickTakeStart() {
@@ -209,10 +377,27 @@ class CameraViewModel(
         stopVideo()
     }
 
+    private fun setupGestureTrigger() {
+        captureEngine.setOnGestureListener {
+            viewModelScope.launch {
+                // If a timer is already running or we're recording, don't trigger
+                if (timerJob == null && !_uiState.value.isRecording && _uiState.value.captureType == CaptureType.PHOTO) {
+                    startTimer(3)
+                }
+            }
+        }
+    }
+
     fun setZoom(ratio: Float) {
-        val clampedRatio = ratio.coerceIn(0.5f, 10.0f)
-        _uiState.update { it.copy(zoomLevel = clampedRatio) }
-        captureEngine.setZoom(clampedRatio)
+        val capabilities = _uiState.value.capabilities
+        val minZoom = capabilities?.zoomRange?.lower ?: 0.5f
+        val maxZoom = capabilities?.zoomRange?.upper ?: 10.0f
+        val clampedRatio = ratio.coerceIn(minZoom, maxZoom)
+        
+        if (abs(clampedRatio - _uiState.value.zoomLevel) > 0.001f) {
+            _uiState.update { it.copy(zoomLevel = clampedRatio) }
+            captureEngine.setZoom(clampedRatio)
+        }
     }
 
     fun refreshThumbnail() {
@@ -284,19 +469,31 @@ class CameraViewModel(
             
             updateOrientationFromRoll(roll)
 
-            if (abs(pitch) < 75) {
-                currentTilt = currentTilt + alpha * (roll - currentTilt)
+            // Auto leveler fix: if pitch is too steep, it's hard to define a "horizon"
+            // Instead of sticking, we should clear the tilt or use a wider threshold
+            if (abs(pitch) < 60) {
+                currentTilt += alpha * (roll - currentTilt)
                 _uiState.update { it.copy(horizonTilt = currentTilt) }
+            } else {
+                // Fade out leveler if device is too vertical/horizontal
+                _uiState.update { it.copy(horizonTilt = 0f) }
             }
         } else if (event?.sensor?.type == Sensor.TYPE_ACCELEROMETER) {
             val ax = event.values[0]
             val ay = event.values[1]
-            val roll = Math.toDegrees(Math.atan2(-ax.toDouble(), ay.toDouble())).toFloat()
+            val az = event.values[2]
+            
+            val roll = Math.toDegrees(atan2(-ax.toDouble(), ay.toDouble())).toFloat()
+            val pitch = Math.toDegrees(atan2(az.toDouble(), sqrt((ax * ax + ay * ay).toDouble()))).toFloat()
             
             updateOrientationFromRoll(roll)
 
-            currentTilt = currentTilt + alpha * (roll - currentTilt)
-            _uiState.update { it.copy(horizonTilt = currentTilt) }
+            if (abs(pitch) < 60) {
+                currentTilt += alpha * (roll - currentTilt)
+                _uiState.update { it.copy(horizonTilt = currentTilt) }
+            } else {
+                _uiState.update { it.copy(horizonTilt = 0f) }
+            }
         }
     }
 
@@ -308,12 +505,13 @@ class CameraViewModel(
             else -> 180
         }
         
-        val isLandscape = newOrientation == 90 || newOrientation == 270
+        // Disable automatic leveler in landscape for a cleaner UI matching reference
+        val shouldAutoShowLeveler = false 
         
-        if (newOrientation != _uiState.value.orientation || isLandscape != _uiState.value.autoShowLeveler) {
+        if (newOrientation != _uiState.value.orientation || shouldAutoShowLeveler != _uiState.value.autoShowLeveler) {
             _uiState.update { it.copy(
                 orientation = newOrientation,
-                autoShowLeveler = isLandscape
+                autoShowLeveler = shouldAutoShowLeveler
             ) }
         }
     }

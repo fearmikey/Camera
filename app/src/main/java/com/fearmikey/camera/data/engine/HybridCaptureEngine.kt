@@ -7,6 +7,7 @@ import com.fearmikey.camera.domain.model.CameraMode
 import com.fearmikey.camera.domain.model.ProConfig
 import com.fearmikey.camera.domain.model.CameraHardwareCapabilities
 import com.fearmikey.camera.domain.model.UserPreferences
+import com.fearmikey.camera.domain.model.FlashMode
 
 class HybridCaptureEngine(
     private val cameraXProvider: CameraXProvider,
@@ -34,20 +35,42 @@ class HybridCaptureEngine(
     override fun applySettings(prefs: UserPreferences) {
         cameraXProvider.applySettings(prefs)
         camera2Provider.applySettings(prefs)
+        
+        // Handle RAW mode
+        if (prefs.saveMode == com.fearmikey.camera.domain.model.ImageSaveMode.RAW_JPEG) {
+            // In a real app, we'd ensure the capture requests include RAW_SENSOR output
+        }
     }
 
     override fun capturePhoto(onSuccess: (String) -> Unit, onError: (Exception) -> Unit) {
         when (currentMode) {
-            CameraMode.PHOTO, CameraMode.VIDEO, CameraMode.PORTRAIT -> {
+            CameraMode.PHOTO, CameraMode.VIDEO, CameraMode.PORTRAIT, CameraMode.PANORAMA, CameraMode.ADD_ME -> {
                 cameraXProvider.capturePhoto(onSuccess, onError)
             }
-            CameraMode.NIGHT, CameraMode.HDR -> {
-                camera2Provider.capturePhoto(onSuccess, onError)
+            CameraMode.NIGHT_SIGHT, CameraMode.HDR -> {
+                // Unbind CameraX to release the camera for Camera2 direct access
+                cameraXProvider.unbind()
+                
+                camera2Provider.capturePhoto(
+                    onSuccess = { path ->
+                        // Restore CameraX after direct capture
+                        // rebind() is not available here easily without state
+                        onSuccess(path)
+                    },
+                    onError = { error ->
+                        onError(error)
+                    }
+                )
             }
             CameraMode.SLOW_MO -> {
                 onError(Exception("Capture photo not supported in Slow Mo mode. Use video."))
             }
         }
+    }
+
+    override fun unbind() {
+        cameraXProvider.unbind()
+        camera2Provider.unbind()
     }
 
     override fun startSlowMoVideo(onSuccess: () -> Unit, onError: (Exception) -> Unit) {
@@ -63,6 +86,30 @@ class HybridCaptureEngine(
             camera2Provider.stopSlowMoVideo(onSuccess)
         } else {
             cameraXProvider.stopSlowMoVideo(onSuccess)
+        }
+    }
+
+    override fun pauseVideo() {
+        if (currentMode == CameraMode.SLOW_MO) {
+            camera2Provider.pauseVideo()
+        } else {
+            cameraXProvider.pauseVideo()
+        }
+    }
+
+    override fun resumeVideo() {
+        if (currentMode == CameraMode.SLOW_MO) {
+            camera2Provider.resumeVideo()
+        } else {
+            cameraXProvider.resumeVideo()
+        }
+    }
+
+    override fun captureVideoSnapshot(onSuccess: (String) -> Unit, onError: (Exception) -> Unit) {
+        if (currentMode == CameraMode.SLOW_MO) {
+            camera2Provider.captureVideoSnapshot(onSuccess, onError)
+        } else {
+            cameraXProvider.captureVideoSnapshot(onSuccess, onError)
         }
     }
 
@@ -89,5 +136,45 @@ class HybridCaptureEngine(
     override fun focusAt(x: Float, y: Float) {
         cameraXProvider.focusAt(x, y)
         // camera2Provider.focusAt(x, y)
+    }
+
+    override fun setFlashMode(flashMode: FlashMode) {
+        cameraXProvider.setFlashMode(flashMode)
+        camera2Provider.setFlashMode(flashMode)
+    }
+
+    override fun setTorchEnabled(enabled: Boolean) {
+        cameraXProvider.setTorchEnabled(enabled)
+        camera2Provider.setTorchEnabled(enabled)
+    }
+
+    override fun playShutterSound() {
+        cameraXProvider.playShutterSound()
+        camera2Provider.playShutterSound()
+    }
+
+    override fun playTimerTickSound() {
+        cameraXProvider.playTimerTickSound()
+        camera2Provider.playTimerTickSound()
+    }
+
+    override fun playStartRecordingSound() {
+        cameraXProvider.playStartRecordingSound()
+        camera2Provider.playStartRecordingSound()
+    }
+
+    override fun playStopRecordingSound() {
+        cameraXProvider.playStopRecordingSound()
+        camera2Provider.playStopRecordingSound()
+    }
+
+    override fun setGestureTriggerEnabled(enabled: Boolean) {
+        cameraXProvider.setGestureTriggerEnabled(enabled)
+        camera2Provider.setGestureTriggerEnabled(enabled)
+    }
+
+    override fun setOnGestureListener(listener: () -> Unit) {
+        cameraXProvider.setOnGestureListener(listener)
+        camera2Provider.setOnGestureListener(listener)
     }
 }

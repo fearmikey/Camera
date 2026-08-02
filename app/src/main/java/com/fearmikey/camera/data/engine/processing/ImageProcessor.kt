@@ -1,15 +1,69 @@
 package com.fearmikey.camera.data.engine.processing
 
+import android.content.Context
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.graphics.Canvas
 import android.graphics.Paint
 import android.graphics.PorterDuff
 import android.graphics.PorterDuffXfermode
+import android.media.Image
+import androidx.camera.core.ImageProxy
+import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.collectIndexed
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
+import java.io.InputStreamReader
 
 class ImageProcessor(
-    private val portraitSegmenter: PortraitSegmenter
+    private val context: Context,
+    private val portraitSegmenter: PortraitSegmenter,
+    private val aligner: FrameAligner = OpenCVFrameAligner(),
+    private val gpuProcessor: GpuImageProcessor = GpuImageProcessor()
 ) {
+
+    init {
+        loadShaders()
+    }
+
+    private fun loadShaders() {
+        val vertexShader = readAsset("shaders/passthrough.glsl")
+        val binningOESShader = readAsset("shaders/pixel_binning.glsl")
+        val binning2DShader = readAsset("shaders/pixel_binning_2d.glsl")
+        gpuProcessor.loadBinningShader(vertexShader, binningOESShader, binning2DShader)
+    }
+
+    private fun readAsset(path: String): String {
+        return context.assets.open(path).use { inputStream ->
+            InputStreamReader(inputStream).readText()
+        }
+    }
+
+    /**
+     * Performs software-based 4x4 Pixel Binning for high SNR 12MP output.
+     */
+    suspend fun processPixelBinning(imageProxy: ImageProxy): Bitmap? = withContext(Dispatchers.Default) {
+        return@withContext gpuProcessor.performPixelBinning(imageProxy, imageProxy.imageInfo.rotationDegrees)
+    }
+
+    /**
+     * High-performance Night Sight Pipeline using Coroutines and GPU.
+     */
+    suspend fun processNightSight(images: Flow<Image>, burstSize: Int): Bitmap = withContext(Dispatchers.Default) {
+        val buffer = StreamingFrameBuffer(0, 0, burstSize, aligner, gpuProcessor)
+        
+        images.collectIndexed { index, image ->
+            buffer.addFrame(image) { count ->
+                // Progress could be reported here
+            }
+        }
+        
+        return@withContext buffer.finalize()
+    }
+
+    fun createNightSightBuffer(width: Int, height: Int, burstSize: Int): StreamingFrameBuffer {
+        return StreamingFrameBuffer(width, height, burstSize, aligner, gpuProcessor)
+    }
 
     fun stackFrames(bitmaps: List<Bitmap>): Bitmap {
         if (bitmaps.isEmpty()) throw IllegalArgumentException("No frames to stack")

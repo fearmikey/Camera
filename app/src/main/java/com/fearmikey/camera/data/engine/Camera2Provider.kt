@@ -8,6 +8,7 @@ import android.hardware.camera2.params.RggbChannelVector
 import android.hardware.camera2.params.OutputConfiguration
 import android.hardware.camera2.params.SessionConfiguration
 import android.media.MediaRecorder
+import android.os.Build
 import android.os.Handler
 import android.os.HandlerThread
 import android.provider.MediaStore
@@ -34,10 +35,15 @@ import com.fearmikey.camera.data.engine.processing.ImageProcessor
 import com.fearmikey.camera.domain.model.ProConfig
 import com.fearmikey.camera.domain.model.CameraHardwareCapabilities
 import com.fearmikey.camera.domain.model.UserPreferences
+import com.fearmikey.camera.domain.model.FlashMode
 import com.fearmikey.camera.domain.model.AspectRatio as DomainAspectRatio
 import com.fearmikey.camera.domain.model.VideoResolution as DomainVideoResolution
 import com.fearmikey.camera.domain.model.VideoCodec as DomainVideoCodec
 import java.io.FileOutputStream
+import com.fearmikey.camera.data.engine.processing.StreamingFrameBuffer
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
 import java.util.concurrent.atomic.AtomicInteger
 
 class Camera2Provider(
@@ -50,8 +56,9 @@ class Camera2Provider(
     private var captureSession: CameraCaptureSession? = null
     
     private var imageReader: ImageReader? = null
+    private var streamingBuffer: StreamingFrameBuffer? = null
     private val capturedBitmaps = mutableListOf<Bitmap>()
-    private val burstSize = 10
+    private val burstSize = 15 // Increased for Night Sight
     private var captureCounter = AtomicInteger(0)
 
     private var mediaRecorder: MediaRecorder? = null
@@ -59,6 +66,7 @@ class Camera2Provider(
     
     private var backgroundThread: HandlerThread? = null
     private var backgroundHandler: Handler? = null
+    private val providerScope = CoroutineScope(Dispatchers.Default)
 
     private var currentMode: CameraMode = CameraMode.PHOTO
     private var previewSurface: Surface? = null
@@ -196,8 +204,9 @@ class Camera2Provider(
         }
 
         when (currentMode) {
-            CameraMode.NIGHT -> openCameraAndCaptureNightBurst(cameraId, onSuccess, onError)
+            CameraMode.NIGHT_SIGHT -> openCameraAndCaptureNightBurst(cameraId, onSuccess, onError)
             CameraMode.HDR -> openCameraAndCaptureHDRBurst(cameraId, onSuccess, onError)
+            CameraMode.SLOW_MO -> onError(Exception("Capture photo not supported in Slow Mo mode."))
             else -> openCameraAndCapturePro(cameraId, onSuccess, onError)
         }
     }
@@ -279,7 +288,7 @@ class Camera2Provider(
         val largestRaw = configs?.getOutputSizes(ImageFormat.RAW_SENSOR)?.maxByOrNull { it.width * it.height } ?: Size(1920, 1080)
 
         imageReader = ImageReader.newInstance(largestJpeg.width, largestJpeg.height, ImageFormat.JPEG, 2)
-        rawImageReader = if (currentProConfig.isRawEnabled) {
+        rawImageReader = if (currentPrefs.saveMode == com.fearmikey.camera.domain.model.ImageSaveMode.RAW_JPEG) {
             ImageReader.newInstance(largestRaw.width, largestRaw.height, ImageFormat.RAW_SENSOR, 2)
         } else null
 
@@ -313,7 +322,7 @@ class Camera2Provider(
 
         // Callback for JPEG
         imageReader!!.setOnImageAvailableListener({ reader ->
-            val image = reader.acquireLatestImage()
+            val image = reader.acquireLatestImage() ?: return@setOnImageAvailableListener
             val buffer = image.planes[0].buffer
             val bytes = ByteArray(buffer.remaining())
             buffer[bytes]
@@ -327,7 +336,7 @@ class Camera2Provider(
 
         // Callback for RAW
         rawImageReader?.setOnImageAvailableListener({ reader ->
-            val image = reader.acquireLatestImage()
+            val image = reader.acquireLatestImage() ?: return@setOnImageAvailableListener
             val result = latestCaptureResult
             if (result != null) {
                 saveRawImage(image, result)
@@ -372,43 +381,38 @@ class Camera2Provider(
     ) {
         val characteristics = cameraManager.getCameraCharacteristics(camera.id)
         val configs = characteristics[CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP]
-        val largestSize = configs?.getOutputSizes(ImageReader::class.java)?.maxByOrNull { it.width * it.height } ?: Size(1920, 1080)
+        
+        // Use YUV_420_888 for high-quality raw-ish processing
+        val largestSize = configs?.getOutputSizes(ImageFormat.YUV_420_888)?.maxByOrNull { it.width * it.height } ?: Size(1920, 1080)
 
-        imageReader = ImageReader.newInstance(largestSize.width, largestSize.height, ImageFormat.JPEG, burstSize).apply {
+        streamingBuffer = processor.createNightSightBuffer(largestSize.width, largestSize.height, burstSize)
+
+        imageReader = ImageReader.newInstance(largestSize.width, largestSize.height, ImageFormat.YUV_420_888, burstSize).apply {
             setOnImageAvailableListener({ reader ->
                 val image = reader.acquireNextImage() ?: return@setOnImageAvailableListener
-                val buffer = image.planes[0].buffer
-                val bytes = ByteArray(buffer.remaining())
-                buffer.get(bytes)
-                val bitmap = BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
-                image.close()
-
-                if (bitmap != null) {
-                    synchronized(capturedBitmaps) {
-                        capturedBitmaps.add(bitmap)
-                        if (capturedBitmaps.size >= burstSize) {
-                            // All frames captured, process them
-                            val bitmapsToProcess = capturedBitmaps.toList()
-                            capturedBitmaps.clear()
-                            captureCounter.set(0)
-                            
-                            // Close session and camera as we have the frames
-                            captureSession?.close()
-                            captureSession = null
-                            cameraDevice?.close()
-                            cameraDevice = null
-                            
-                            backgroundHandler?.post {
-                                try {
-                                    val stackedBitmap = processor.stackFrames(bitmapsToProcess)
-                                    val path = saveBitmapToMediaStore(stackedBitmap, "NIGHT")
+                
+                streamingBuffer?.addFrame(image) { count ->
+                    if (count >= burstSize) {
+                        // Processing done
+                        providerScope.launch {
+                            try {
+                                val resultBitmap = streamingBuffer?.finalize()
+                                if (resultBitmap != null) {
+                                    val path = saveBitmapToMediaStore(resultBitmap, "NIGHT")
                                     onSuccess(path)
-                                    // Clean up
-                                    stackedBitmap.recycle()
-                                    bitmapsToProcess.forEach { it.recycle() }
-                                } catch (e: Exception) {
-                                    onError(e)
+                                    resultBitmap.recycle()
                                 }
+                                streamingBuffer = null
+                                
+                                // Cleanup session
+                                backgroundHandler?.post {
+                                    captureSession?.close()
+                                    captureSession = null
+                                    cameraDevice?.close()
+                                    cameraDevice = null
+                                }
+                            } catch (e: Exception) {
+                                onError(e)
                             }
                         }
                     }
@@ -416,35 +420,31 @@ class Camera2Provider(
             }, backgroundHandler)
         }
 
-        val surfaces = listOf(imageReader!!.surface)
+        val surfaces = mutableListOf(imageReader!!.surface)
+        previewSurface?.let { surfaces.add(it) }
+
         createCaptureSession(camera, surfaces, object : CameraCaptureSession.StateCallback() {
             override fun onConfigured(session: CameraCaptureSession) {
                 captureSession = session
                 
-                // Create burst request list with Exposure Bracketing
                 val requests = mutableListOf<CaptureRequest>()
                 for (i in 0 until burstSize) {
                     val builder = camera.createCaptureRequest(CameraDevice.TEMPLATE_STILL_CAPTURE)
                     builder.addTarget(imageReader!!.surface)
                     
-                    // Bracketing: alternate between short and long exposure
-                    // Note: In real app, we would use CONTROL_AE_MODE = OFF for full manual control
-                    // For this demo, we'll use AE compensation for bracketing
-                    val exposureValue = if (i % 2 == 0) -2 else 2 // Ev -2 and Ev +2
-                    builder[CaptureRequest.CONTROL_AE_EXPOSURE_COMPENSATION] = exposureValue
-                    
-                    // Hardware Sync: Ensure high quality
-                    builder[CaptureRequest.CONTROL_AF_MODE] = CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_PICTURE
+                    // Night Sight specific AE: 
+                    // We want longer exposures. We can use AE_EXPOSURE_COMPENSATION or manual shutter
                     builder[CaptureRequest.CONTROL_AE_MODE] = CaptureRequest.CONTROL_AE_MODE_ON
+                    builder[CaptureRequest.CONTROL_AE_EXPOSURE_COMPENSATION] = 2 // Boost exposure
+                    
+                    // Ensure high quality
+                    builder[CaptureRequest.EDGE_MODE] = CaptureRequest.EDGE_MODE_HIGH_QUALITY
+                    builder[CaptureRequest.NOISE_REDUCTION_MODE] = CaptureRequest.NOISE_REDUCTION_MODE_HIGH_QUALITY
                     
                     requests.add(builder.build())
                 }
                 
-                session.captureBurst(requests, object : CameraCaptureSession.CaptureCallback() {
-                    override fun onCaptureCompleted(session: CameraCaptureSession, request: CaptureRequest, result: TotalCaptureResult) {
-                        // Optional: Filter frames based on TotalCaptureResult (e.g. lens state, focus)
-                    }
-                }, backgroundHandler)
+                session.captureBurst(requests, null, backgroundHandler)
             }
 
             override fun onConfigureFailed(session: CameraCaptureSession) {
@@ -492,7 +492,7 @@ class Camera2Provider(
 
         imageReader = ImageReader.newInstance(largestSize.width, largestSize.height, ImageFormat.JPEG, hdrBurstSize).apply {
             setOnImageAvailableListener({ reader ->
-                val image = reader.acquireLatestImage()
+                val image = reader.acquireLatestImage() ?: return@setOnImageAvailableListener
                 val buffer = image.planes[0].buffer
                 val bytes = ByteArray(buffer.remaining())
                 buffer.get(bytes)
@@ -618,6 +618,23 @@ class Camera2Provider(
                 }
             }, 500)
         }
+    }
+
+    override fun pauseVideo() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
+            mediaRecorder?.pause()
+        }
+    }
+
+    override fun resumeVideo() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
+            mediaRecorder?.resume()
+        }
+    }
+
+    override fun captureVideoSnapshot(onSuccess: (String) -> Unit, onError: (Exception) -> Unit) {
+        // Requires ImageReader in session. Not implemented for Camera2 provider yet.
+        onError(UnsupportedOperationException("Video snapshot not supported in Camera2Provider"))
     }
 
     private fun findHighSpeedCamera(): String? {
@@ -845,6 +862,80 @@ class Camera2Provider(
         }
     }
 
+    override fun setFlashMode(flashMode: FlashMode) {
+        val session = captureSession ?: return
+        val camera = cameraDevice ?: return
+        val handler = backgroundHandler ?: return
+
+        try {
+            val builder = camera.createCaptureRequest(
+                if (currentMode == CameraMode.VIDEO || currentMode == CameraMode.SLOW_MO)
+                    CameraDevice.TEMPLATE_RECORD
+                else
+                    CameraDevice.TEMPLATE_PREVIEW
+            )
+            previewSurface?.let { builder.addTarget(it) }
+            
+            applyFlashToBuilder(builder, flashMode)
+            
+            session.setRepeatingRequest(builder.build(), null, handler)
+        } catch (e: Exception) {
+            e.printStackTrace()
+        }
+    }
+
+    override fun setTorchEnabled(enabled: Boolean) {
+        val session = captureSession ?: return
+        val camera = cameraDevice ?: return
+        val handler = backgroundHandler ?: return
+
+        try {
+            val builder = camera.createCaptureRequest(
+                if (currentMode == CameraMode.VIDEO || currentMode == CameraMode.SLOW_MO)
+                    CameraDevice.TEMPLATE_RECORD
+                else
+                    CameraDevice.TEMPLATE_PREVIEW
+            )
+            previewSurface?.let { builder.addTarget(it) }
+            
+            builder[CaptureRequest.FLASH_MODE] = if (enabled) CaptureRequest.FLASH_MODE_TORCH else CaptureRequest.FLASH_MODE_OFF
+            
+            session.setRepeatingRequest(builder.build(), null, handler)
+        } catch (e: Exception) {
+            e.printStackTrace()
+        }
+    }
+
+    override fun playShutterSound() {}
+    override fun playTimerTickSound() {}
+    override fun playStartRecordingSound() {}
+    override fun playStopRecordingSound() {}
+
+    override fun setGestureTriggerEnabled(enabled: Boolean) {
+        // Hand Gesture trigger not implemented for Camera2 provider yet.
+    }
+
+    override fun setOnGestureListener(listener: () -> Unit) {
+        // Hand Gesture trigger not implemented for Camera2 provider yet.
+    }
+
+    private fun applyFlashToBuilder(builder: CaptureRequest.Builder, flashMode: FlashMode) {
+        when (flashMode) {
+            FlashMode.OFF -> {
+                builder[CaptureRequest.CONTROL_AE_MODE] = CaptureRequest.CONTROL_AE_MODE_ON
+                builder[CaptureRequest.FLASH_MODE] = CaptureRequest.FLASH_MODE_OFF
+            }
+            FlashMode.ON -> {
+                builder[CaptureRequest.CONTROL_AE_MODE] = CaptureRequest.CONTROL_AE_MODE_ON_ALWAYS_FLASH
+                builder[CaptureRequest.FLASH_MODE] = CaptureRequest.FLASH_MODE_OFF // Controlled by AE
+            }
+            FlashMode.AUTO -> {
+                builder[CaptureRequest.CONTROL_AE_MODE] = CaptureRequest.CONTROL_AE_MODE_ON_AUTO_FLASH
+                builder[CaptureRequest.FLASH_MODE] = CaptureRequest.FLASH_MODE_OFF // Controlled by AE
+            }
+        }
+    }
+
     private fun startProPreview() {
         // Simplified surface handling
         // In a real app, we would use provider.onSurfaceRequested(...)
@@ -907,5 +998,13 @@ class Camera2Provider(
             SimpleDateFormat("yyyy-MM-dd-HH-mm-ss-SSS", Locale.US)
                 .format(System.currentTimeMillis()) + ".mp4"
         )
+    }
+
+    override fun unbind() {
+        captureSession?.close()
+        captureSession = null
+        cameraDevice?.close()
+        cameraDevice = null
+        stopBackgroundThread()
     }
 }
