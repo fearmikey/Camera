@@ -133,9 +133,18 @@ bool PanoramaEngine::finalizeStitch(cv::Mat& outputPanorama) {
     std::lock_guard<std::mutex> lock(mPipelineMutex);
     if (mFrames.size() < 2) return false;
 
+    LOGI("Finalizing stitch with %zu frames.", mFrames.size());
+
     cv::Rect canvasBounds;
     cv::Mat T;
     calculateCanvasBounds(canvasBounds, T);
+
+    LOGI("Canvas size: %dx%d", canvasBounds.width, canvasBounds.height);
+
+    if (canvasBounds.width > 20000 || canvasBounds.height > 10000 || canvasBounds.area() <= 0) {
+        LOGE("Canvas size too large or invalid!");
+        return false;
+    }
 
     std::vector<cv::Mat> warpedFrames;
     std::vector<cv::Point> corners;
@@ -143,41 +152,87 @@ bool PanoramaEngine::finalizeStitch(cv::Mat& outputPanorama) {
 
     for (auto& frame : mFrames) {
         cv::Mat H_adjusted = T * frame.H_global;
+
+        std::vector<cv::Point2f> corners_in = {
+            {0, 0},
+            {static_cast<float>(frame.fullResMat.cols), 0},
+            {static_cast<float>(frame.fullResMat.cols), static_cast<float>(frame.fullResMat.rows)},
+            {0, static_cast<float>(frame.fullResMat.rows)}
+        };
+        std::vector<cv::Point2f> corners_out;
+        cv::perspectiveTransform(corners_in, corners_out, H_adjusted);
+        cv::Rect bbox = cv::boundingRect(corners_out);
+
+        bbox = bbox & cv::Rect(0, 0, canvasBounds.width, canvasBounds.height);
+        if (bbox.area() <= 0) continue;
+
+        cv::Mat T_shift = (cv::Mat_<double>(3, 3) << 1.0, 0.0, -bbox.x, 0.0, 1.0, -bbox.y, 0.0, 0.0, 1.0);
+        cv::Mat H_bbox = T_shift * H_adjusted;
+
         cv::Mat warpedFrame, warpedMask;
         cv::Mat mask = cv::Mat::ones(frame.fullResMat.size(), CV_8UC1) * 255;
 
-        cv::warpPerspective(frame.fullResMat, warpedFrame, H_adjusted, canvasBounds.size());
-        cv::warpPerspective(mask, warpedMask, H_adjusted, canvasBounds.size());
+        cv::Mat frameBgr;
+        cv::cvtColor(frame.fullResMat, frameBgr, cv::COLOR_RGBA2BGR);
+        frame.fullResMat.release(); // Free high-res frame immediately
+
+        cv::warpPerspective(frameBgr, warpedFrame, H_bbox, bbox.size());
+        cv::warpPerspective(mask, warpedMask, H_bbox, bbox.size(), cv::INTER_NEAREST);
 
         warpedFrames.push_back(warpedFrame);
         masks.push_back(warpedMask);
-        corners.push_back(cv::Point(0, 0));
+        corners.push_back(bbox.tl());
     }
 
-    cv::Ptr<cv::detail::SeamFinder> seamFinder = cv::makePtr<cv::detail::GraphCutSeamFinder>(cv::detail::GraphCutSeamFinderBase::COST_COLOR);
-    std::vector<cv::UMat> warpedUMats(warpedFrames.size()), masksUMats(masks.size());
-    for (size_t i = 0; i < warpedFrames.size(); ++i) {
-        warpedFrames[i].copyTo(warpedUMats[i]);
-        masks[i].copyTo(masksUMats[i]);
-    }
-    seamFinder->find(warpedUMats, corners, masksUMats);
+    LOGI("Warping complete. Finding seams...");
 
-    blendFramesMultiBand(warpedFrames, corners, masks, outputPanorama);
-    return true;
+    try {
+        cv::Ptr<cv::detail::SeamFinder> seamFinder = cv::makePtr<cv::detail::DpSeamFinder>(cv::detail::DpSeamFinder::COLOR);
+
+        // SeamFinder requires std::vector<cv::UMat>
+        std::vector<cv::UMat> warpedUMats(warpedFrames.size()), masksUMats(masks.size());
+        for (size_t i = 0; i < warpedFrames.size(); ++i) {
+            warpedFrames[i].copyTo(warpedUMats[i]);
+            masks[i].copyTo(masksUMats[i]);
+        }
+
+        seamFinder->find(warpedUMats, corners, masksUMats);
+
+        for (size_t i = 0; i < masks.size(); ++i) {
+            masksUMats[i].copyTo(masks[i]);
+        }
+    } catch (const std::exception& e) {
+        LOGE("Seam finding failed: %s", e.what());
+    }
+
+    LOGI("Blending frames...");
+    blendFramesMultiBand(warpedFrames, corners, masks, canvasBounds, outputPanorama);
+
+    bool success = !outputPanorama.empty();
+    mFrames.clear();
+    return success;
 }
 
 void PanoramaEngine::blendFramesMultiBand(const std::vector<cv::Mat>& warpedFrames,
                                         const std::vector<cv::Point>& corners,
                                         const std::vector<cv::Mat>& masks,
+                                        const cv::Rect& canvasBounds,
                                         cv::Mat& result) {
-    cv::detail::MultiBandBlender blender(false, 5);
-    blender.prepare(cv::Rect(0, 0, warpedFrames[0].cols, warpedFrames[0].rows));
+    try {
+        cv::detail::MultiBandBlender blender(false, 2);
+        blender.prepare(canvasBounds);
 
-    for (size_t i = 0; i < warpedFrames.size(); ++i) {
-        blender.feed(warpedFrames[i], masks[i], corners[i]);
+        for (size_t i = 0; i < warpedFrames.size(); ++i) {
+            blender.feed(warpedFrames[i], masks[i], corners[i]);
+        }
+
+        cv::Mat resultS16, resultMask;
+        blender.blend(resultS16, resultMask);
+
+        cv::Mat resultBgr;
+        resultS16.convertTo(resultBgr, CV_8UC3);
+        cv::cvtColor(resultBgr, result, cv::COLOR_BGR2RGBA);
+    } catch (const cv::Exception& e) {
+        LOGE("Blending failed: %s", e.what());
     }
-
-    cv::Mat resultS16, resultMask;
-    blender.blend(resultS16, resultMask);
-    resultS16.convertTo(result, CV_8UC4);
 }

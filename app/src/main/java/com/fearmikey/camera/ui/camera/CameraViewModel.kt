@@ -60,12 +60,20 @@ class CameraViewModel(
     private var currentTilt = 0f
     private val alpha = 0.3f // Increased for more responsiveness
     
+    private var currentYaw = 0f
+    private var currentPitch = 0f
+    
     private var focusJob: Job? = null
     private var recordingTimerJob: Job? = null
     private var timerJob: Job? = null
     private var gestureTriggerJob: Job? = null
     private var boxClearJob: Job? = null
     private var secondsRecorded = 0L
+
+    private var panoramaInitialYaw = 0f
+    private var panoramaInitialPitch = 0f
+    private val panoramaTargets = listOf(-45f, -30f, -15f, 0f, 15f, 30f, 45f)
+    private var lastAutoCaptureTime = 0L
 
     private var smoothedHandBox: androidx.compose.ui.geometry.Rect? = null
     private var smoothedFaceBox: androidx.compose.ui.geometry.Rect? = null
@@ -315,7 +323,20 @@ class CameraViewModel(
 
     private fun handlePanoramaCapture() {
         if (!_uiState.value.isPanoramaCapturing) {
-            _uiState.update { it.copy(isPanoramaCapturing = true, panoramaMessage = "Move camera slowly...") }
+            _uiState.update { it.copy(
+                isPanoramaCapturing = true, 
+                panoramaMessage = "Move camera to the dots",
+                panoramaYaw = 0f,
+                panoramaPitch = 0f,
+                panoramaTargets = panoramaTargets,
+                panoramaCapturedIndices = setOf(panoramaTargets.indexOf(0f)).filter { it >= 0 }.toSet()
+            ) }
+            
+            // Set current sensor angles as 0,0 reference
+            panoramaInitialYaw = currentYaw
+            panoramaInitialPitch = currentPitch
+            lastAutoCaptureTime = System.currentTimeMillis()
+
             captureEngine.startPanorama(
                 onSuccess = { /* UI already updated */ },
                 onError = { error ->
@@ -526,6 +547,59 @@ class CameraViewModel(
         }
     }
 
+    private fun updatePanoramaState(yaw: Float, pitch: Float) {
+        val deltaYaw = yaw - panoramaInitialYaw
+        val deltaPitch = pitch - panoramaInitialPitch
+
+        // Normalize deltaYaw to -180..180
+        var normYaw = deltaYaw
+        while (normYaw > 180) normYaw -= 360f
+        while (normYaw < -180) normYaw += 360f
+
+        _uiState.update { it.copy(panoramaYaw = normYaw, panoramaPitch = deltaPitch) }
+
+        // Check for auto-capture alignment
+        val state = _uiState.value
+        val targets = state.panoramaTargets
+        val captured = state.panoramaCapturedIndices
+        
+        for (i in targets.indices) {
+            if (i !in captured) {
+                val targetYaw = targets[i]
+                if (abs(normYaw - targetYaw) < 1.5f && abs(deltaPitch) < 2.0f) {
+                    // Align!
+                    if (System.currentTimeMillis() - lastAutoCaptureTime > 1500) {
+                        autoCapturePanorama(i)
+                    }
+                }
+            }
+        }
+    }
+
+    private fun autoCapturePanorama(index: Int) {
+        lastAutoCaptureTime = System.currentTimeMillis()
+        _uiState.update { it.copy(
+            panoramaCapturedIndices = it.panoramaCapturedIndices + index,
+            panoramaMessage = "Don't move!"
+        ) }
+        
+        captureEngine.playShutterSound()
+        // Here we could also signal the engine to prioritize this frame
+        
+        viewModelScope.launch {
+            delay(800)
+            if (_uiState.value.isPanoramaCapturing) {
+                val captured = _uiState.value.panoramaCapturedIndices.size
+                val total = _uiState.value.panoramaTargets.size
+                if (captured < total) {
+                    _uiState.update { it.copy(panoramaMessage = "Move to the next dot") }
+                } else {
+                    _uiState.update { it.copy(panoramaMessage = "Perfect! Press stop to finish") }
+                }
+            }
+        }
+    }
+
     fun setZoom(ratio: Float) {
         val capabilities = _uiState.value.capabilities
         val minZoom = capabilities?.zoomRange?.lower ?: 0.5f
@@ -602,10 +676,18 @@ class CameraViewModel(
             val orientation = FloatArray(3)
             SensorManager.getOrientation(rotationMatrix, orientation)
             
-            val roll = Math.toDegrees(orientation[2].toDouble()).toFloat()
+            val azimuth = Math.toDegrees(orientation[0].toDouble()).toFloat()
             val pitch = Math.toDegrees(orientation[1].toDouble()).toFloat()
+            val roll = Math.toDegrees(orientation[2].toDouble()).toFloat()
+
+            currentYaw = azimuth
+            currentPitch = pitch
             
             updateOrientationFromRoll(roll)
+
+            if (_uiState.value.isPanoramaCapturing) {
+                updatePanoramaState(azimuth, pitch)
+            }
 
             // Auto leveler fix: if pitch is too steep, it's hard to define a "horizon"
             if (abs(pitch) < 60) {

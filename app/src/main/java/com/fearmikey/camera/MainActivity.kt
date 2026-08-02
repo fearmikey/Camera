@@ -61,6 +61,7 @@ import androidx.compose.material.icons.filled.FlipCameraAndroid
 import androidx.compose.material.icons.filled.MoreHoriz
 import androidx.compose.ui.unit.sp
 import com.fearmikey.camera.ui.camera.CameraViewModel
+import com.fearmikey.camera.ui.camera.CameraUiState
 import com.fearmikey.camera.ui.camera.ProControlOverlay
 import com.fearmikey.camera.ui.camera.HudOverlay
 import com.fearmikey.camera.data.engine.CameraXProvider
@@ -424,7 +425,7 @@ fun CameraScreen(
 
             if (uiState.isPanoramaCapturing) {
                 PanoramaGuideOverlay(
-                    message = uiState.panoramaMessage ?: "Move camera slowly...",
+                    state = uiState,
                     modifier = Modifier.fillMaxSize()
                 )
             }
@@ -540,36 +541,82 @@ fun CameraPreview(
 
 @Composable
 fun PanoramaGuideOverlay(
-    message: String,
+    state: CameraUiState,
     modifier: Modifier = Modifier
 ) {
+    val message = state.panoramaMessage ?: "Move camera to the dots"
+    val yaw = state.panoramaYaw
+    val pitch = state.panoramaPitch
+    val targets = state.panoramaTargets
+    val captured = state.panoramaCapturedIndices
+
     Box(
         modifier = modifier.fillMaxSize(),
         contentAlignment = Alignment.Center
     ) {
-        Column(
-            horizontalAlignment = Alignment.CenterHorizontally,
-            modifier = Modifier.padding(bottom = 200.dp)
+        // Horizontal Track
+        Box(
+            modifier = Modifier
+                .fillMaxWidth(0.8f)
+                .height(80.dp),
+            contentAlignment = Alignment.Center
         ) {
-            // Visual guide: A horizontal line with an arrow or indicator
+            // The Track line
+            HorizontalDivider(
+                color = Color.White.copy(alpha = 0.3f),
+                thickness = 2.dp,
+                modifier = Modifier.fillMaxWidth()
+            )
+
+            // Center Ring (Static)
             Box(
                 modifier = Modifier
-                    .width(300.dp)
-                    .height(2.dp)
-                    .background(Color.White.copy(alpha = 0.5f))
-            ) {
-                // Moving indicator simulation (just static for now)
-                Box(
-                    modifier = Modifier
-                        .size(20.dp)
-                        .align(Alignment.Center)
-                        .background(Color.Yellow, CircleShape)
-                        .border(2.dp, Color.Black, CircleShape)
-                )
+                    .size(40.dp)
+                    .border(2.dp, Color.White, CircleShape)
+            )
+
+            // Pitch indicator (Vertical line to help level)
+            Box(
+                modifier = Modifier
+                    .width(2.dp)
+                    .height(20.dp)
+                    .offset(y = (pitch * 5f).dp.coerceIn((-30).dp, 30.dp))
+                    .background(if (abs(pitch) < 2f) Color.Green else Color.Red)
+            )
+
+            // Targets (Dots moving along the track)
+            val pixelsPerDegree = 8f 
+
+            targets.forEachIndexed { index, targetYaw ->
+                if (index !in captured) {
+                    val relativeX = (targetYaw - yaw) * pixelsPerDegree
+                    
+                    // Only draw if within visible track range
+                    if (abs(relativeX) < 150f) {
+                        Box(
+                            modifier = Modifier
+                                .size(24.dp)
+                                .offset(x = relativeX.dp)
+                                .background(Color.Yellow.copy(alpha = 0.8f), CircleShape)
+                                .border(1.dp, Color.Black, CircleShape),
+                            contentAlignment = Alignment.Center
+                        ) {
+                            if (abs(relativeX) < 10f) {
+                                // Close to center!
+                                Box(modifier = Modifier.size(12.dp).background(Color.White, CircleShape))
+                            }
+                        }
+                    }
+                }
             }
-            
-            Spacer(modifier = Modifier.height(16.dp))
-            
+        }
+
+        Column(
+            horizontalAlignment = Alignment.CenterHorizontally,
+            modifier = Modifier
+                .align(Alignment.BottomCenter)
+                .padding(bottom = 180.dp)
+        ) {
             Surface(
                 color = Color.Black.copy(alpha = 0.7f),
                 shape = RoundedCornerShape(8.dp)
@@ -585,7 +632,7 @@ fun PanoramaGuideOverlay(
 
             Spacer(modifier = Modifier.height(8.dp))
             Text(
-                "Press shutter again to finish",
+                "Captured ${captured.size} / ${targets.size} points",
                 color = Color.White.copy(alpha = 0.6f),
                 style = MaterialTheme.typography.labelMedium
             )

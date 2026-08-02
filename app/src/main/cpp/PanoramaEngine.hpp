@@ -43,5 +43,6 @@ private:
     void blendFramesMultiBand(const std::vector<cv::Mat>& warpedFrames,
                              const std::vector<cv::Point>& corners,
                              const std::vector<cv::Mat>& masks,
+                             const cv::Rect& canvasBounds,
                              cv::Mat& result);
 };

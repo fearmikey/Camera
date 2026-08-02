@@ -1,5 +1,6 @@
 #include <jni.h>
 #include <android/bitmap.h>
+#include <android/log.h>
 #include "PanoramaEngine.hpp"
 
 extern "C" {
@@ -7,6 +8,7 @@ extern "C" {
 JNIEXPORT jlong JNICALL
 Java_com_fearmikey_camera_data_engine_processing_NativePanoramaBridge_nativeInit(
         JNIEnv* env, jobject /* thiz */, jdouble blurThreshold, jfloat matchRatio) {
+    __android_log_print(ANDROID_LOG_INFO, "PanoramaEngineNDK", "nativeInit called: blur=%.1f, ratio=%.2f", blurThreshold, matchRatio);
     auto* engine = new PanoramaEngine(blurThreshold, matchRatio);
     return reinterpret_cast<jlong>(engine);
 }
