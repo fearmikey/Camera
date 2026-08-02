@@ -4,6 +4,8 @@ import android.content.Context
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.graphics.Canvas
+import android.graphics.ColorMatrix
+import android.graphics.ColorMatrixColorFilter
 import android.graphics.Paint
 import android.graphics.PorterDuff
 import android.graphics.PorterDuffXfermode
@@ -164,44 +166,73 @@ class ImageProcessor(
 
     fun processPortrait(baseBitmap: Bitmap): Bitmap {
         val mask = portraitSegmenter.segment(baseBitmap)
-        return applyBokeh(baseBitmap, mask)
+        val bokehBitmap = applyBokeh(baseBitmap, mask)
+        return applyPortraitLighting(bokehBitmap, mask)
+    }
+
+    private fun applyPortraitLighting(baseBitmap: Bitmap, mask: Bitmap): Bitmap {
+        val result = Bitmap.createBitmap(baseBitmap.width, baseBitmap.height, baseBitmap.config ?: Bitmap.Config.ARGB_8888)
+        val canvas = Canvas(result)
+        val paint = Paint(Paint.ANTI_ALIAS_FLAG)
+
+        // 1. Draw the base bokeh image
+        canvas.drawBitmap(baseBitmap, 0f, 0f, paint)
+
+        // 2. Apply "Studio Light" to the subject
+        // We use the mask to target the lighting effect
+        val lightingPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            // Increase brightness and slightly boost contrast
+            val cm = ColorMatrix().apply {
+                setScale(1.15f, 1.15f, 1.15f, 1f)
+            }
+            colorFilter = ColorMatrixColorFilter(cm)
+        }
+
+        val scaledMask = Bitmap.createScaledBitmap(mask, baseBitmap.width, baseBitmap.height, true)
+        
+        // Use SRC_IN to only draw where the mask is white
+        // We need a temporary layer to apply the color filter through the mask
+        canvas.saveLayer(0f, 0f, baseBitmap.width.toFloat(), baseBitmap.height.toFloat(), null)
+        canvas.drawBitmap(scaledMask, 0f, 0f, paint)
+        lightingPaint.xfermode = PorterDuffXfermode(PorterDuff.Mode.SRC_IN)
+        canvas.drawBitmap(baseBitmap, 0f, 0f, lightingPaint)
+        canvas.restore()
+
+        return result
     }
 
     private fun applyBokeh(baseBitmap: Bitmap, mask: Bitmap): Bitmap {
-        // 1. Create a blurred version of the original image
-        val blurredBitmap = blurBitmap(baseBitmap, radius = 25)
+        // 1. Create a blurred version of the original image (Stronger blur for background)
+        val blurredBitmap = blurBitmap(baseBitmap, radius = 60)
 
         // 2. Combine using the mask
         val result = Bitmap.createBitmap(baseBitmap.width, baseBitmap.height, baseBitmap.config ?: Bitmap.Config.ARGB_8888)
         val canvas = Canvas(result)
         val paint = Paint(Paint.ANTI_ALIAS_FLAG)
 
-        // Draw the sharp subject first
-        canvas.drawBitmap(baseBitmap, 0f, 0f, paint)
-
-        // Use the mask to "punch out" the background and draw the blurred version
-        // Mask: White = Subject, Black = Background
-        // We want to draw blurred where mask is black.
-        
-        // This is a simplified blending logic
-        val scaledMask = Bitmap.createScaledBitmap(mask, baseBitmap.width, baseBitmap.height, true)
-        
-        // Use Xfermode to blend
-        paint.xfermode = PorterDuffXfermode(PorterDuff.Mode.DST_OUT)
-        canvas.drawBitmap(scaledMask, 0f, 0f, paint)
-        
-        paint.xfermode = PorterDuffXfermode(PorterDuff.Mode.DST_OVER)
+        // Draw the blurred background first
         canvas.drawBitmap(blurredBitmap, 0f, 0f, paint)
+
+        // 3. Smooth the mask to create a soft transition
+        // Use a smaller radius for mask smoothing to keep the subject edges relatively defined
+        val scaledMask = Bitmap.createScaledBitmap(mask, baseBitmap.width, baseBitmap.height, true)
+        val smoothedMask = blurBitmap(scaledMask, radius = 5)
+
+        // 4. Draw the sharp subject on top using the smoothed mask
+        // Mask: White = Subject, Black = Background
+        canvas.saveLayer(0f, 0f, baseBitmap.width.toFloat(), baseBitmap.height.toFloat(), null)
+        canvas.drawBitmap(smoothedMask, 0f, 0f, paint)
+        paint.xfermode = PorterDuffXfermode(PorterDuff.Mode.SRC_IN)
+        canvas.drawBitmap(baseBitmap, 0f, 0f, paint)
+        canvas.restore()
 
         return result
     }
 
     private fun blurBitmap(bitmap: Bitmap, radius: Int): Bitmap {
-        // In a real production app, use a fast blur algorithm like StackBlur 
-        // or a GPU-accelerated shader (Vulkan/RenderScript).
-        // Scaling down and back up is a "poor man's" blur for this architecture demo.
-        // Use radius to influence the scale for a rudimentary blur effect
-        val scale = (1.0f / (radius.coerceAtLeast(1) / 5f)).coerceIn(0.05f, 0.5f)
+        // More aggressive downscaling for a more noticeable blur.
+        // We allow the scale to go down to 0.05f (20x downscale) for strong background bokeh.
+        val scale = (1.0f / (radius.coerceAtLeast(1) / 2f)).coerceIn(0.05f, 0.5f)
         val width = (bitmap.width * scale).toInt().coerceAtLeast(1)
         val height = (bitmap.height * scale).toInt().coerceAtLeast(1)
         

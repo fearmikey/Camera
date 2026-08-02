@@ -3,6 +3,7 @@ package com.fearmikey.camera.data.engine
 import androidx.camera.core.CameraSelector
 import androidx.camera.core.Preview
 import androidx.lifecycle.LifecycleOwner
+import com.fearmikey.camera.data.engine.gesture.GestureResult
 import com.fearmikey.camera.domain.model.CameraMode
 import com.fearmikey.camera.domain.model.ProConfig
 import com.fearmikey.camera.domain.model.CameraHardwareCapabilities
@@ -119,7 +120,8 @@ class HybridCaptureEngine(
     }
 
     override fun getCapabilities(): CameraHardwareCapabilities? {
-        return camera2Provider.getCapabilities()
+        // Prefer CameraX capabilities if available as they provide live zoom state
+        return cameraXProvider.getCapabilities() ?: camera2Provider.getCapabilities()
     }
 
     override fun setProMode(enabled: Boolean) {
@@ -173,7 +175,7 @@ class HybridCaptureEngine(
         camera2Provider.setGestureTriggerEnabled(enabled)
     }
 
-    override fun setOnGestureListener(listener: () -> Unit) {
+    override fun setOnGestureListener(listener: (GestureResult) -> Unit) {
         cameraXProvider.setOnGestureListener(listener)
         camera2Provider.setOnGestureListener(listener)
     }

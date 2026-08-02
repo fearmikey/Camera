@@ -33,6 +33,7 @@ import com.fearmikey.camera.domain.model.CaptureType
 fun SettingsSheet(
     userPreferences: UserPreferences,
     captureType: CaptureType,
+    isFrontCamera: Boolean,
     onDismiss: () -> Unit,
     onAspectRatioChange: (AspectRatio) -> Unit,
     onTimerChange: (TimerMode) -> Unit,
@@ -141,7 +142,7 @@ fun SettingsSheet(
             Spacer(modifier = Modifier.height(24.dp))
 
             if (selectedTab == 0) {
-                GeneralSettings(userPreferences, onAspectRatioChange, onTimerChange, onLightModeChange, onMacroFocusChange, onTopShotToggle, onMotionPhotoChange, onGestureTriggerToggle)
+                GeneralSettings(userPreferences, isFrontCamera, onAspectRatioChange, onTimerChange, onLightModeChange, onMacroFocusChange, onTopShotToggle, onMotionPhotoChange, onGestureTriggerToggle)
             } else {
                 ProSettings(userPreferences, onResolutionChange, onSaveModeChange, onLensSelectionChange, onGridLinesToggle, onLevelerToggle, onLocationTaggingToggle, onVolumeKeyShutterToggle)
             }
@@ -152,6 +153,7 @@ fun SettingsSheet(
 @Composable
 fun GeneralSettings(
     userPreferences: UserPreferences,
+    isFrontCamera: Boolean,
     onAspectRatioChange: (AspectRatio) -> Unit,
     onTimerChange: (TimerMode) -> Unit,
     onLightModeChange: (LightMode) -> Unit,
@@ -223,20 +225,22 @@ fun GeneralSettings(
                 }
             )
         }
-        item {
-            SettingRowWithIcons(
-                label = "Macro Focus",
-                currentValue = userPreferences.macroFocus,
-                options = MacroMode.entries,
-                onOptionSelected = onMacroFocusChange,
-                iconProvider = { mode, tint ->
-                    when (mode) {
-                        MacroMode.OFF -> Icon(Icons.Default.Block, null, tint = tint, modifier = Modifier.size(20.dp))
-                        MacroMode.AUTO -> Icon(Icons.Default.AutoMode, null, tint = tint, modifier = Modifier.size(20.dp))
-                        MacroMode.ON -> Icon(Icons.Default.FilterVintage, null, tint = tint, modifier = Modifier.size(20.dp))
+        if (!isFrontCamera) {
+            item {
+                SettingRowWithIcons(
+                    label = "Macro Focus",
+                    currentValue = userPreferences.macroFocus,
+                    options = MacroMode.entries,
+                    onOptionSelected = onMacroFocusChange,
+                    iconProvider = { mode, tint ->
+                        when (mode) {
+                            MacroMode.OFF -> Icon(Icons.Default.Block, null, tint = tint, modifier = Modifier.size(20.dp))
+                            MacroMode.AUTO -> Icon(Icons.Default.AutoMode, null, tint = tint, modifier = Modifier.size(20.dp))
+                            MacroMode.ON -> Icon(Icons.Default.FilterVintage, null, tint = tint, modifier = Modifier.size(20.dp))
+                        }
                     }
-                }
-            )
+                )
+            }
         }
         item {
             SettingRowWithIcons(

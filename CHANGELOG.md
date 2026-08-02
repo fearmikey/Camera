@@ -2,6 +2,21 @@
 
 All notable changes to this project will be documented in this file.
 
+## [1.0.4] - 2026-08-02
+
+### Added
+- Gesture Result Model: Introduced GestureResult to standardize interaction reporting between the analyzer and ViewModel.
+- Modern Icon Set: Added a new modern camera icon and updated launcher assets for a fresher visual identity.
+
+### Improved
+- Advanced Gesture Support: GestureAnalyzer now handles double-taps for camera switching and long-presses for AF/AE locking.
+- Portrait Segmentation: Optimized the PortraitSegmenter pipeline for reduced latency and better edge detection.
+- HUD Feedback: HudOverlay now includes dynamic visual indicators for gesture interactions and lock states.
+- Engine Stability: Refined CameraX and Camera2 providers to ensure consistent state transitions and error recovery.
+
+### Fixed
+- Asset Handling: Updated build configuration to prevent compression of TFLite and task models, ensuring faster loading.
+
 ## [1.0.3] - 2026-08-02
 
 ### Added

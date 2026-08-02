@@ -100,6 +100,19 @@ class GpuImageProcessor {
     fun performPixelBinning(imageProxy: ImageProxy, rotationDegrees: Int): Bitmap? {
         android.util.Log.i("GpuImageProcessor", "performPixelBinning START: rotation=$rotationDegrees")
         
+        val inputWidth = imageProxy.width
+        val inputHeight = imageProxy.height
+        
+        // Scalable Binning: Calculate appropriate factor to reach ~12.5MP super-pixels
+        val targetPixels = 12_500_000.0
+        val currentPixels = inputWidth.toDouble() * inputHeight.toDouble()
+        val binFactor = Math.sqrt(currentPixels / targetPixels).coerceAtLeast(1.0)
+        
+        val outputWidth = (inputWidth / binFactor).toInt()
+        val outputHeight = (inputHeight / binFactor).toInt()
+        
+        android.util.Log.i("GpuImageProcessor", "Scalable Binning: factor=${String.format("%.2f", binFactor)}, output=${outputWidth}x${outputHeight}")
+
         val inputBitmap = imageProxyToBitmap(imageProxy)
         if (inputBitmap == null) {
             android.util.Log.e("GpuImageProcessor", "Failed to convert imageProxy to Bitmap")
@@ -107,11 +120,6 @@ class GpuImageProcessor {
         }
 
         makeCurrent()
-        
-        val inputWidth = inputBitmap.width
-        val inputHeight = inputBitmap.height
-        val outputWidth = inputWidth / 4
-        val outputHeight = inputHeight / 4
 
         val inputTexId = IntArray(1)
         GLES30.glGenTextures(1, inputTexId, 0)

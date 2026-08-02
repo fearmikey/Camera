@@ -42,7 +42,13 @@ class CameraViewModel(
     private var focusJob: Job? = null
     private var recordingTimerJob: Job? = null
     private var timerJob: Job? = null
+    private var gestureTriggerJob: Job? = null
+    private var boxClearJob: Job? = null
     private var secondsRecorded = 0L
+
+    private var smoothedHandBox: androidx.compose.ui.geometry.Rect? = null
+    private var smoothedFaceBox: androidx.compose.ui.geometry.Rect? = null
+    private val boxSmoothing = 0.5f 
 
     init {
         refreshThumbnail()
@@ -193,6 +199,13 @@ class CameraViewModel(
                 CameraSelector.DEFAULT_BACK_CAMERA
             }
             captureEngine.bindToLifecycle(lifecycleOwner, surfaceProvider, selector)
+            
+            // Update capabilities for the new camera
+            val capabilities = captureEngine.getCapabilities()
+            _uiState.update { it.copy(
+                capabilities = capabilities,
+                zoomPresets = capabilities?.zoomPresets ?: listOf(1.0f)
+            ) }
         }
     }
 
@@ -378,11 +391,67 @@ class CameraViewModel(
     }
 
     private fun setupGestureTrigger() {
-        captureEngine.setOnGestureListener {
+        captureEngine.setOnGestureListener { result ->
             viewModelScope.launch {
-                // If a timer is already running or we're recording, don't trigger
-                if (timerJob == null && !_uiState.value.isRecording && _uiState.value.captureType == CaptureType.PHOTO) {
-                    startTimer(3)
+                val currentHandBox = result.handBoundingBox
+                val currentFaceBox = result.faceBoundingBox
+                
+                // 1. Smooth the face bounding box
+                if (currentFaceBox != null) {
+                    smoothedFaceBox = if (smoothedFaceBox == null) {
+                        currentFaceBox
+                    } else {
+                        androidx.compose.ui.geometry.Rect(
+                            left = smoothedFaceBox!!.left + boxSmoothing * (currentFaceBox.left - smoothedFaceBox!!.left),
+                            top = smoothedFaceBox!!.top + boxSmoothing * (currentFaceBox.top - smoothedFaceBox!!.top),
+                            right = smoothedFaceBox!!.right + boxSmoothing * (currentFaceBox.right - smoothedFaceBox!!.right),
+                            bottom = smoothedFaceBox!!.bottom + boxSmoothing * (currentFaceBox.bottom - smoothedFaceBox!!.bottom)
+                        )
+                    }
+                } else {
+                    smoothedFaceBox = null
+                }
+                _uiState.update { it.copy(faceBoundingBox = smoothedFaceBox) }
+                
+                if (currentHandBox != null) {
+                    // 2. Smooth the hand bounding box
+                    smoothedHandBox = if (smoothedHandBox == null) {
+                        currentHandBox
+                    } else {
+                        androidx.compose.ui.geometry.Rect(
+                            left = smoothedHandBox!!.left + boxSmoothing * (currentHandBox.left - smoothedHandBox!!.left),
+                            top = smoothedHandBox!!.top + boxSmoothing * (currentHandBox.top - smoothedHandBox!!.top),
+                            right = smoothedHandBox!!.right + boxSmoothing * (currentHandBox.right - smoothedHandBox!!.right),
+                            bottom = smoothedHandBox!!.bottom + boxSmoothing * (currentHandBox.bottom - smoothedHandBox!!.bottom)
+                        )
+                    }
+                    _uiState.update { it.copy(handBoundingBox = smoothedHandBox) }
+                    
+                    // 3. Manage the "ghosting" timeout
+                    boxClearJob?.cancel()
+                    boxClearJob = launch {
+                        delay(600) // Bridge detection gaps
+                        smoothedHandBox = null
+                        _uiState.update { it.copy(
+                            handBoundingBox = null,
+                            isHandTimerPending = false
+                        ) }
+                        gestureTriggerJob?.cancel()
+                        gestureTriggerJob = null
+                    }
+
+                    // 4. Trigger timer with a 1s delay
+                    if (result.isTriggered && timerJob == null && gestureTriggerJob == null &&
+                        !_uiState.value.isRecording && _uiState.value.captureType == CaptureType.PHOTO) {
+                        
+                        gestureTriggerJob = launch {
+                            _uiState.update { it.copy(isHandTimerPending = true) }
+                            delay(1000) // 1s lock-on delay
+                            _uiState.update { it.copy(isHandTimerPending = false) }
+                            startTimer(3)
+                            gestureTriggerJob = null
+                        }
+                    }
                 }
             }
         }

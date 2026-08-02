@@ -26,6 +26,10 @@ fun HudOverlay(
     autoShowLeveler: Boolean,
     horizonTilt: Float,
     focusPoint: androidx.compose.ui.geometry.Offset?,
+    handBoundingBox: androidx.compose.ui.geometry.Rect? = null,
+    faceBoundingBox: androidx.compose.ui.geometry.Rect? = null,
+    isHandTimerPending: Boolean = false,
+    isFrontCamera: Boolean = false,
     modifier: Modifier = Modifier
 ) {
     Box(modifier = modifier) {
@@ -40,6 +44,39 @@ fun HudOverlay(
         focusPoint?.let { point ->
             FocusRing(point = point)
         }
+
+        faceBoundingBox?.let { box ->
+            FaceDetectionIndicator(box = box, isFrontCamera = isFrontCamera)
+        }
+
+        handBoundingBox?.let { box ->
+            HandDetectionBox(box = box, isPending = isHandTimerPending, isFrontCamera = isFrontCamera)
+        }
+    }
+}
+
+@Composable
+fun FaceDetectionIndicator(
+    box: androidx.compose.ui.geometry.Rect,
+    isFrontCamera: Boolean
+) {
+    Canvas(modifier = Modifier.fillMaxSize()) {
+        val color = Color.White.copy(alpha = 0.3f)
+        
+        // Map normalized coordinates to pixel coordinates
+        // Flip X if front camera
+        val left = if (isFrontCamera) (1f - box.right) * size.width else box.left * size.width
+        val top = box.top * size.height
+        val right = if (isFrontCamera) (1f - box.left) * size.width else box.right * size.width
+        val bottom = box.bottom * size.height
+        
+        // Draw a subtle rounded rect around the face
+        drawRect(
+            color = color,
+            topLeft = Offset(left, top),
+            size = Size(right - left, bottom - top),
+            style = Stroke(width = 1.dp.toPx())
+        )
     }
 }
 
@@ -180,5 +217,59 @@ fun FocusRing(point: Offset) {
                 style = Stroke(width = 1.dp.toPx())
             )
         }
+    }
+}
+
+@Composable
+fun HandDetectionBox(
+    box: androidx.compose.ui.geometry.Rect,
+    isPending: Boolean = false,
+    isFrontCamera: Boolean = false
+) {
+    val infiniteTransition = rememberInfiniteTransition(label = "boxPulse")
+    val cornerPulse by infiniteTransition.animateFloat(
+        initialValue = 1.0f,
+        targetValue = if (isPending) 1.4f else 1.2f, // Stronger pulse when pending
+        animationSpec = infiniteRepeatable(
+            animation = tween(if (isPending) 300 else 500, easing = LinearEasing), // Faster pulse when pending
+            repeatMode = RepeatMode.Reverse
+        ),
+        label = "cornerPulse"
+    )
+
+    Canvas(modifier = Modifier.fillMaxSize()) {
+        val strokeWidth = if (isPending) 3.dp.toPx() else 2.dp.toPx()
+        val color = if (isPending) Color.Yellow else Color.White.copy(alpha = 0.8f) // White until locked on
+        
+        // Map normalized coordinates to pixel coordinates
+        // Flip X if front camera
+        val left = if (isFrontCamera) (1f - box.right) * size.width else box.left * size.width
+        val top = box.top * size.height
+        val right = if (isFrontCamera) (1f - box.left) * size.width else box.right * size.width
+        val bottom = box.bottom * size.height
+        
+        drawRect(
+            color = color.copy(alpha = 0.4f),
+            topLeft = Offset(left, top),
+            size = Size(right - left, bottom - top),
+            style = Stroke(width = 1.dp.toPx())
+        )
+        
+        // Add small corners for a "tracking" look
+        val baseCornerLen = 20.dp.toPx()
+        val cornerLen = baseCornerLen * cornerPulse
+        
+        // Top Left
+        drawLine(color, Offset(left, top), Offset(left + cornerLen, top), strokeWidth * 2)
+        drawLine(color, Offset(left, top), Offset(left, top + cornerLen), strokeWidth * 2)
+        // Top Right
+        drawLine(color, Offset(right, top), Offset(right - cornerLen, top), strokeWidth * 2)
+        drawLine(color, Offset(right, top), Offset(right, top + cornerLen), strokeWidth * 2)
+        // Bottom Left
+        drawLine(color, Offset(left, bottom), Offset(left + cornerLen, bottom), strokeWidth * 2)
+        drawLine(color, Offset(left, bottom), Offset(left, bottom - cornerLen), strokeWidth * 2)
+        // Bottom Right
+        drawLine(color, Offset(right, bottom), Offset(right - cornerLen, bottom), strokeWidth * 2)
+        drawLine(color, Offset(right, bottom), Offset(right, bottom - cornerLen), strokeWidth * 2)
     }
 }

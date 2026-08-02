@@ -183,9 +183,11 @@ fun CameraScreen(
                 autoShowLeveler = uiState.autoShowLeveler,
                 horizonTilt = uiState.horizonTilt,
                 focusPoint = uiState.focusPoint,
+                handBoundingBox = uiState.handBoundingBox,
+                faceBoundingBox = uiState.faceBoundingBox,
+                isHandTimerPending = uiState.isHandTimerPending,
                 onZoomChanged = { viewModel.setZoom(it) },
                 zoomPresets = uiState.zoomPresets,
-                isManualLens = uiState.userPreferences.lensSelection == LensSelectionMode.MANUAL,
                 onFocusAt = { x, y -> viewModel.focusAt(x, y) },
                 onBindToLifecycle = { owner, provider -> viewModel.bindToLifecycle(owner, provider) },
                 onModeSwiped = { direction ->
@@ -217,58 +219,65 @@ fun CameraScreen(
                     modifier = Modifier.align(Alignment.CenterStart),
                     verticalAlignment = Alignment.CenterVertically
                 ) {
-                    // Resolution indicator
-                    Box(
-                        modifier = Modifier
-                            .size(34.dp)
-                            .clip(androidx.compose.foundation.shape.RoundedCornerShape(8.dp))
-                            .background(Color.Black.copy(alpha = 0.2f))
-                            .border(1.dp, Color.White.copy(alpha = 0.8f), androidx.compose.foundation.shape.RoundedCornerShape(8.dp))
-                            .clickable { 
-                                val nextRes = if (uiState.userPreferences.resolution == ResolutionMode.MP_12) 
-                                    ResolutionMode.MP_50 else ResolutionMode.MP_12
-                                viewModel.updateResolution(nextRes)
-                                haptic.performHapticFeedback(HapticFeedbackType.LongPress)
-                            },
-                        contentAlignment = Alignment.Center
-                    ) {
-                        Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                            Text(
-                                text = if (uiState.userPreferences.resolution == ResolutionMode.MP_12) "12" else "50",
-                                color = Color.White,
-                                style = MaterialTheme.typography.labelSmall.copy(fontSize = 11.sp),
-                                fontWeight = FontWeight.Bold,
-                                lineHeight = 11.sp
-                            )
-                            Text(
-                                "MP",
-                                color = Color.White,
-                                style = MaterialTheme.typography.labelSmall.copy(fontSize = 8.sp),
-                                fontWeight = FontWeight.Bold,
-                                lineHeight = 8.sp
-                            )
+                    // Resolution indicator (Hidden for Front Camera)
+                    if (!uiState.isFrontCamera) {
+                        Box(
+                            modifier = Modifier
+                                .size(34.dp)
+                                .clip(androidx.compose.foundation.shape.RoundedCornerShape(8.dp))
+                                .background(Color.Black.copy(alpha = 0.2f))
+                                .border(1.dp, Color.White.copy(alpha = 0.8f), androidx.compose.foundation.shape.RoundedCornerShape(8.dp))
+                                .clickable { 
+                                    val nextRes = if (uiState.userPreferences.resolution == ResolutionMode.MP_12) 
+                                        ResolutionMode.MP_50 else ResolutionMode.MP_12
+                                    viewModel.updateResolution(nextRes)
+                                    haptic.performHapticFeedback(HapticFeedbackType.LongPress)
+                                },
+                            contentAlignment = Alignment.Center
+                        ) {
+                            Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                                Text(
+                                    text = if (uiState.userPreferences.resolution == ResolutionMode.MP_12) "12" else "50",
+                                    color = Color.White,
+                                    style = MaterialTheme.typography.labelSmall.copy(fontSize = 11.sp),
+                                    fontWeight = FontWeight.Bold,
+                                    lineHeight = 11.sp
+                                )
+                                Text(
+                                    "MP",
+                                    color = Color.White,
+                                    style = MaterialTheme.typography.labelSmall.copy(fontSize = 8.sp),
+                                    fontWeight = FontWeight.Bold,
+                                    lineHeight = 8.sp
+                                )
+                            }
                         }
-                    }
 
-                    Spacer(modifier = Modifier.width(16.dp))
+                        Spacer(modifier = Modifier.width(16.dp))
+                    }
 
                     // Macro Indicator
-                    Box(contentAlignment = Alignment.Center) {
-                        Icon(
-                            imageVector = Icons.Default.LocalFlorist,
-                            contentDescription = "Macro",
-                            tint = Color.White,
-                            modifier = Modifier.size(22.dp)
-                        )
-                        Text(
-                            "A",
-                            color = Color.White,
-                            style = MaterialTheme.typography.labelSmall.copy(fontSize = 7.sp, fontWeight = FontWeight.Black),
-                            modifier = Modifier.padding(top = 1.dp)
-                        )
-                    }
+                    if (!uiState.isFrontCamera) {
+                        Box(contentAlignment = Alignment.Center) {
+                            Icon(
+                                imageVector = Icons.Default.LocalFlorist,
+                                contentDescription = "Macro",
+                                tint = Color.White,
+                                modifier = Modifier.size(22.dp)
+                            )
+                            Text(
+                                "A",
+                                color = Color.White,
+                                style = MaterialTheme.typography.labelSmall.copy(
+                                    fontSize = 7.sp,
+                                    fontWeight = FontWeight.Black
+                                ),
+                                modifier = Modifier.padding(top = 1.dp)
+                            )
+                        }
 
-                    Spacer(modifier = Modifier.width(16.dp))
+                        Spacer(modifier = Modifier.width(16.dp))
+                    }
 
                     // Light Mode Indicator
                     if (uiState.userPreferences.lightMode != LightMode.NONE) {
@@ -355,6 +364,7 @@ fun CameraScreen(
                 SettingsSheet(
                     userPreferences = uiState.userPreferences,
                     captureType = uiState.captureType,
+                    isFrontCamera = uiState.isFrontCamera,
                     onDismiss = { viewModel.setShowSettingsSheet(false) },
                     onAspectRatioChange = { viewModel.updateAspectRatio(it) },
                     onTimerChange = { viewModel.updateTimer(it) },
@@ -422,13 +432,15 @@ fun CameraPreview(
     aspectRatio: DomainAspectRatio,
     zoomLevel: Float,
     zoomPresets: List<Float>,
-    isManualLens: Boolean,
     isFrontCamera: Boolean,
     gridMode: com.fearmikey.camera.domain.model.GridMode,
     showLeveler: Boolean,
     autoShowLeveler: Boolean,
     horizonTilt: Float,
     focusPoint: androidx.compose.ui.geometry.Offset?,
+    handBoundingBox: androidx.compose.ui.geometry.Rect? = null,
+    faceBoundingBox: androidx.compose.ui.geometry.Rect? = null,
+    isHandTimerPending: Boolean = false,
     onZoomChanged: (Float) -> Unit,
     onFocusAt: (Float, Float) -> Unit,
     onBindToLifecycle: (androidx.lifecycle.LifecycleOwner, androidx.camera.core.Preview.SurfaceProvider) -> Unit,
@@ -514,6 +526,10 @@ fun CameraPreview(
                 autoShowLeveler = autoShowLeveler,
                 horizonTilt = horizonTilt,
                 focusPoint = focusPoint,
+                handBoundingBox = handBoundingBox,
+                faceBoundingBox = faceBoundingBox,
+                isHandTimerPending = isHandTimerPending,
+                isFrontCamera = isFrontCamera,
                 modifier = Modifier.fillMaxSize()
             )
 
@@ -522,7 +538,6 @@ fun CameraPreview(
                 currentZoom = zoomLevel,
                 zoomPresets = zoomPresets,
                 onZoomSelected = onZoomChanged,
-                isManualLens = isManualLens,
                 modifier = Modifier
                     .align(Alignment.BottomCenter)
                     .padding(bottom = 16.dp)
@@ -705,7 +720,6 @@ fun ZoomSwitcher(
     zoomPresets: List<Float>,
     onZoomSelected: (Float) -> Unit,
     modifier: Modifier = Modifier,
-    isManualLens: Boolean = false
 ) {
     Surface(
         color = Color.Black.copy(alpha = 0.5f),
@@ -716,8 +730,7 @@ fun ZoomSwitcher(
             modifier = Modifier.padding(horizontal = 4.dp, vertical = 4.dp),
             verticalAlignment = Alignment.CenterVertically
         ) {
-            val displayPresets = if (isManualLens) listOf(0.6f, 1.0f, 2.0f) else listOf(0.5f, 1.0f, 2.0f, 5.0f, 10.0f)
-            displayPresets.forEach { zoom ->
+            zoomPresets.forEach { zoom ->
                 val isSelected = abs(currentZoom - zoom) < 0.05f
                 Box(
                     modifier = Modifier
@@ -728,12 +741,13 @@ fun ZoomSwitcher(
                     contentAlignment = Alignment.Center
                 ) {
                     val label = when {
-                        isManualLens && zoom == 0.6f -> "UW"
-                        isManualLens && zoom == 1.0f -> "W"
-                        isManualLens && zoom == 2.0f -> "T"
-                        zoom == 0.5f || zoom == 0.6f -> ".5"
                         zoom == 1.0f -> "1x"
-                        else -> "${zoom.toInt()}"
+                        zoom < 1.0f -> {
+                            val valStr = (Math.round(zoom * 10) / 10.0).toString()
+                            if (valStr.startsWith("0.")) valStr.substring(1) else valStr
+                        }
+                        zoom == zoom.toInt().toFloat() -> "${zoom.toInt()}x"
+                        else -> "${(Math.round(zoom * 10) / 10.0)}x"
                     }
                     Text(
                         text = label,

@@ -32,6 +32,7 @@ import android.graphics.ImageFormat
 import android.graphics.Rect
 import android.media.ImageReader
 import com.fearmikey.camera.data.engine.processing.ImageProcessor
+import com.fearmikey.camera.data.engine.gesture.GestureResult
 import com.fearmikey.camera.domain.model.ProConfig
 import com.fearmikey.camera.domain.model.CameraHardwareCapabilities
 import com.fearmikey.camera.domain.model.UserPreferences
@@ -74,6 +75,7 @@ class Camera2Provider(
     private var surfaceProvider: Preview.SurfaceProvider? = null
     private var currentProConfig: ProConfig = ProConfig()
     private var currentPrefs: UserPreferences = UserPreferences()
+    private var currentCameraSelector: CameraSelector = CameraSelector.DEFAULT_BACK_CAMERA
     private var rawImageReader: ImageReader? = null
     private var latestCaptureResult: TotalCaptureResult? = null
     private var currentZoomRatio: Float = 1.0f
@@ -140,6 +142,7 @@ class Camera2Provider(
     ) {
         this.lifecycleOwner = lifecycleOwner
         this.surfaceProvider = surfaceProvider
+        this.currentCameraSelector = cameraSelector
         startBackgroundThread()
     }
 
@@ -169,7 +172,7 @@ class Camera2Provider(
     }
 
     override fun getCapabilities(): CameraHardwareCapabilities? {
-        val cameraId = findBackCamera() ?: return null
+        val cameraId = findCameraId(currentCameraSelector) ?: return null
         val characteristics = cameraManager.getCameraCharacteristics(cameraId)
         
         val isoRange = characteristics[CameraCharacteristics.SENSOR_INFO_SENSITIVITY_RANGE] ?: Range(100, 3200)
@@ -177,15 +180,27 @@ class Camera2Provider(
         val minFocusDistance = characteristics[CameraCharacteristics.LENS_INFO_MINIMUM_FOCUS_DISTANCE] ?: 0.0f
         
         val zoomRange = characteristics[CameraCharacteristics.CONTROL_ZOOM_RATIO_RANGE] ?: Range(1.0f, 10.0f)
+        val isFront = characteristics[CameraCharacteristics.LENS_FACING] == CameraCharacteristics.LENS_FACING_FRONT
 
         // Determine presets within the supported range
         val presets = mutableListOf<Float>()
         
-        // Fallback/Standard presets
-        if (zoomRange.lower <= 0.6f) presets.add(0.6f)
+        // Add minimum zoom if it's less than 1.0 (typically wide angle)
+        if (zoomRange.lower < 0.95f) {
+            // Round to one decimal place for clean UI
+            val roundedMin = (Math.round(zoomRange.lower * 10) / 10.0).toFloat()
+            presets.add(roundedMin)
+        }
+        
         presets.add(1.0f)
-        if (zoomRange.upper >= 2.0f) presets.add(2.0f)
-        if (zoomRange.upper >= 5.0f) presets.add(5.0f)
+
+        // For front camera, we usually only want wide and 1x
+        // For back camera, we add telephoto presets
+        if (!isFront) {
+            if (zoomRange.upper >= 2.0f) presets.add(2.0f)
+            if (zoomRange.upper >= 5.0f) presets.add(5.0f)
+            if (zoomRange.upper >= 10.0f) presets.add(10.0f)
+        }
 
         return CameraHardwareCapabilities(
             isoRange = isoRange,
@@ -211,13 +226,21 @@ class Camera2Provider(
         }
     }
 
-    private fun findBackCamera(): String? {
+    private fun findCameraId(selector: CameraSelector): String? {
+        val lensFacing = when {
+            selector == CameraSelector.DEFAULT_BACK_CAMERA -> CameraCharacteristics.LENS_FACING_BACK
+            selector == CameraSelector.DEFAULT_FRONT_CAMERA -> CameraCharacteristics.LENS_FACING_FRONT
+            else -> CameraCharacteristics.LENS_FACING_BACK
+        }
         for (id in cameraManager.cameraIdList) {
             val characteristics = cameraManager.getCameraCharacteristics(id)
-            val facing = characteristics[CameraCharacteristics.LENS_FACING]
-            if (facing == CameraCharacteristics.LENS_FACING_BACK) return id
+            if (characteristics[CameraCharacteristics.LENS_FACING] == lensFacing) return id
         }
         return null
+    }
+
+    private fun findBackCamera(): String? {
+        return findCameraId(CameraSelector.DEFAULT_BACK_CAMERA)
     }
 
     @SuppressLint("MissingPermission")
@@ -915,7 +938,7 @@ class Camera2Provider(
         // Hand Gesture trigger not implemented for Camera2 provider yet.
     }
 
-    override fun setOnGestureListener(listener: () -> Unit) {
+    override fun setOnGestureListener(listener: (GestureResult) -> Unit) {
         // Hand Gesture trigger not implemented for Camera2 provider yet.
     }
 

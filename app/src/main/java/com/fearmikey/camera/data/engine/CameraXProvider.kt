@@ -3,6 +3,8 @@ package com.fearmikey.camera.data.engine
 import android.content.Context
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
+import android.graphics.Matrix
+import android.media.ExifInterface
 import android.os.Build
 import androidx.camera.core.*
 import androidx.camera.core.resolutionselector.AspectRatioStrategy
@@ -13,9 +15,11 @@ import androidx.camera.video.*
 import androidx.camera.camera2.interop.Camera2Interop
 import androidx.camera.camera2.interop.ExperimentalCamera2Interop
 import androidx.core.content.ContextCompat
+import androidx.core.net.toUri
 import androidx.lifecycle.LifecycleOwner
 import com.fearmikey.camera.data.engine.processing.ImageProcessor
 import com.fearmikey.camera.data.engine.gesture.GestureAnalyzer
+import com.fearmikey.camera.data.engine.gesture.GestureResult
 import com.fearmikey.camera.domain.model.CameraMode
 import com.fearmikey.camera.domain.model.ProConfig
 import com.fearmikey.camera.domain.model.CameraHardwareCapabilities
@@ -23,7 +27,6 @@ import com.fearmikey.camera.domain.model.UserPreferences
 import com.fearmikey.camera.domain.model.FlashMode
 import com.fearmikey.camera.domain.model.ResolutionMode
 import com.fearmikey.camera.domain.model.AspectRatio as DomainAspectRatio
-import java.io.File
 import java.text.SimpleDateFormat
 import java.util.Locale
 import java.util.concurrent.TimeUnit
@@ -50,7 +53,7 @@ class CameraXProvider(
     private var imageAnalysis: ImageAnalysis? = null
     private var gestureAnalyzer: GestureAnalyzer? = null
     private var gestureTriggerEnabled: Boolean = false
-    private var gestureListener: (() -> Unit)? = null
+    private var gestureListener: ((GestureResult) -> Unit)? = null
     private val gestureExecutor: ExecutorService = Executors.newSingleThreadExecutor()
     private var camera: Camera? = null
     private var currentMode: CameraMode = CameraMode.PHOTO
@@ -84,6 +87,9 @@ class CameraXProvider(
         lastLifecycleOwner = lifecycleOwner
         lastSurfaceProvider = surfaceProvider
         lastCameraSelector = cameraSelector
+        
+        // Null out current camera to avoid stale capabilities during rebind
+        camera = null
 
         val cameraProviderFuture = ProcessCameraProvider.getInstance(context)
         cameraProviderFuture.addListener(
@@ -151,17 +157,25 @@ class CameraXProvider(
             }
 
             if (gestureTriggerEnabled) {
-                gestureAnalyzer = GestureAnalyzer(context) {
-                    gestureListener?.invoke()
+                android.util.Log.i("CameraXProvider", "Palm Timer ENABLED - binding GestureAnalyzer")
+                gestureAnalyzer?.close() // Ensure previous instance is cleaned up
+                gestureAnalyzer = GestureAnalyzer(context) { result ->
+                    gestureListener?.invoke(result)
                 }
                 imageAnalysis = ImageAnalysis.Builder()
                     .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
-                    .setResolutionSelector(previewResolutionSelector)
+                    .setResolutionSelector(ResolutionSelector.Builder()
+                        .setResolutionStrategy(ResolutionStrategy(
+                            android.util.Size(640, 480),
+                            ResolutionStrategy.FALLBACK_RULE_CLOSEST_HIGHER_THEN_LOWER
+                        ))
+                        .build())
                     .build()
                     .also {
                         it.setAnalyzer(gestureExecutor, gestureAnalyzer!!)
                     }
             } else {
+                android.util.Log.i("CameraXProvider", "Palm Timer DISABLED")
                 gestureAnalyzer?.close()
                 gestureAnalyzer = null
                 imageAnalysis = null
@@ -255,6 +269,10 @@ class CameraXProvider(
 
     override fun capturePhoto(onSuccess: (String) -> Unit, onError: (Exception) -> Unit) {
         android.util.Log.i("CameraXProvider", "capturePhoto called: mode=$currentMode, resolution=${currentPrefs.resolution}")
+        
+        // Detect if we are on the back camera (Binning only allowed on back sensor)
+        val isBackCamera = lastCameraSelector == CameraSelector.DEFAULT_BACK_CAMERA
+        
         when {
             currentMode == CameraMode.PORTRAIT -> {
                 android.util.Log.i("CameraXProvider", "Calling capturePortrait")
@@ -264,7 +282,7 @@ class CameraXProvider(
                 android.util.Log.e("CameraXProvider", "Capture photo not supported in Slow Mo mode")
                 onError(Exception("Capture photo not supported in Slow Mo mode."))
             }
-            currentPrefs.resolution == ResolutionMode.MP_12 -> {
+            currentPrefs.resolution == ResolutionMode.MP_12 && isBackCamera -> {
                 android.util.Log.i("CameraXProvider", "Calling captureBinnedPhoto")
                 captureBinnedPhoto(onSuccess, onError)
             }
@@ -359,13 +377,25 @@ class CameraXProvider(
         
         val minZoom = zoomState.minZoomRatio
         val maxZoom = zoomState.maxZoomRatio
+        val isFront = info.lensFacing == CameraSelector.LENS_FACING_FRONT
         
         val presets = mutableListOf<Float>()
-        if (minZoom <= 0.6f) presets.add(0.6f)
+        
+        // Add minimum zoom if it's less than 1.0 (typically wide angle)
+        if (minZoom < 0.95f) {
+            val roundedMin = (Math.round(minZoom * 10) / 10.0).toFloat()
+            presets.add(roundedMin)
+        }
+        
         presets.add(1.0f)
-        if (maxZoom >= 2.0f) presets.add(2.0f)
-        if (maxZoom >= 5.0f) presets.add(5.0f)
-        if (maxZoom >= 10.0f) presets.add(10.0f)
+
+        // For front camera, we usually only want wide and 1x
+        // For back camera, we add telephoto presets
+        if (!isFront) {
+            if (maxZoom >= 2.0f) presets.add(2.0f)
+            if (maxZoom >= 5.0f) presets.add(5.0f)
+            if (maxZoom >= 10.0f) presets.add(10.0f)
+        }
 
         return CameraHardwareCapabilities(
             isoRange = isoRange,
@@ -431,7 +461,7 @@ class CameraXProvider(
         }
     }
 
-    override fun setOnGestureListener(listener: () -> Unit) {
+    override fun setOnGestureListener(listener: (GestureResult) -> Unit) {
         this.gestureListener = listener
     }
 
@@ -447,6 +477,7 @@ class CameraXProvider(
 
     override fun unbind() {
         cameraProvider?.unbindAll()
+        camera = null
     }
 
     private fun captureSinglePhoto(onSuccess: (String) -> Unit, onError: (Exception) -> Unit) {
@@ -490,20 +521,32 @@ class CameraXProvider(
 
     private fun capturePortrait(onSuccess: (String) -> Unit, onError: (Exception) -> Unit) {
         captureSinglePhoto(
-            onSuccess = { path ->
+            onSuccess = { uriString ->
                 Thread {
                     try {
-                        val originalBitmap = BitmapFactory.decodeFile(path)
-                        val portraitBitmap = processor.processPortrait(originalBitmap)
+                        val uri = uriString.toUri()
+                        val inputStream = context.contentResolver.openInputStream(uri)
+                        val originalBitmap = BitmapFactory.decodeStream(inputStream)
+                        inputStream?.close()
+
+                        if (originalBitmap == null) {
+                            throw Exception("Failed to decode bitmap from URI")
+                        }
+
+                        // Fix rotation before processing
+                        val rotatedBitmap = fixRotation(uri, originalBitmap)
+
+                        val portraitBitmap = processor.processPortrait(rotatedBitmap)
                         
-                        val out = File(path).outputStream()
-                        portraitBitmap.compress(Bitmap.CompressFormat.JPEG, 95, out)
-                        out.close()
+                        context.contentResolver.openOutputStream(uri)?.use { out ->
+                            portraitBitmap.compress(Bitmap.CompressFormat.JPEG, 95, out)
+                        }
                         
                         ContextCompat.getMainExecutor(context).execute {
-                            onSuccess(path)
+                            onSuccess(uriString)
                         }
                     } catch (e: Exception) {
+                        android.util.Log.e("CameraXProvider", "Portrait processing failed", e)
                         ContextCompat.getMainExecutor(context).execute {
                             onError(e)
                         }
@@ -512,6 +555,27 @@ class CameraXProvider(
             },
             onError = onError
         )
+    }
+
+    private fun fixRotation(uri: Uri, bitmap: Bitmap): Bitmap {
+        val inputStream = context.contentResolver.openInputStream(uri) ?: return bitmap
+        val exif = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
+            ExifInterface(inputStream)
+        } else {
+            return bitmap
+        }
+        inputStream.close()
+
+        val orientation = exif.getAttributeInt(ExifInterface.TAG_ORIENTATION, ExifInterface.ORIENTATION_NORMAL)
+        val matrix = Matrix()
+        when (orientation) {
+            ExifInterface.ORIENTATION_ROTATE_90 -> matrix.postRotate(90f)
+            ExifInterface.ORIENTATION_ROTATE_180 -> matrix.postRotate(180f)
+            ExifInterface.ORIENTATION_ROTATE_270 -> matrix.postRotate(270f)
+            else -> return bitmap
+        }
+
+        return Bitmap.createBitmap(bitmap, 0, 0, bitmap.width, bitmap.height, matrix, true)
     }
 
     private fun captureBinnedPhoto(onSuccess: (String) -> Unit, onError: (Exception) -> Unit) {

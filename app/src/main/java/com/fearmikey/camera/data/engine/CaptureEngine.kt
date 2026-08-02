@@ -3,6 +3,7 @@ package com.fearmikey.camera.data.engine
 import androidx.camera.core.CameraSelector
 import androidx.camera.core.Preview
 import androidx.lifecycle.LifecycleOwner
+import com.fearmikey.camera.data.engine.gesture.GestureResult
 import com.fearmikey.camera.domain.model.CameraMode
 import com.fearmikey.camera.domain.model.ProConfig
 import com.fearmikey.camera.domain.model.CameraHardwareCapabilities
@@ -35,6 +36,6 @@ interface CaptureEngine {
     fun playStartRecordingSound()
     fun playStopRecordingSound()
     fun setGestureTriggerEnabled(enabled: Boolean)
-    fun setOnGestureListener(listener: () -> Unit)
+    fun setOnGestureListener(listener: (GestureResult) -> Unit)
     fun unbind()
 }
