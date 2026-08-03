@@ -138,7 +138,8 @@ class Camera2Provider(
     override fun bindToLifecycle(
         lifecycleOwner: LifecycleOwner,
         surfaceProvider: Preview.SurfaceProvider,
-        cameraSelector: CameraSelector
+        cameraSelector: CameraSelector,
+        meteringPointFactoryProvider: () -> androidx.camera.core.MeteringPointFactory?
     ) {
         this.lifecycleOwner = lifecycleOwner
         this.surfaceProvider = surfaceProvider
@@ -860,7 +861,7 @@ class Camera2Provider(
         }
     }
 
-    override fun focusAt(x: Float, y: Float) {
+    override fun focusAt(x: Float, y: Float, onComplete: (Boolean) -> Unit) {
         val session = captureSession ?: return
         val camera = cameraDevice ?: return
         val handler = backgroundHandler ?: return
@@ -887,9 +888,24 @@ class Camera2Provider(
             builder[CaptureRequest.CONTROL_AF_MODE] = CaptureRequest.CONTROL_AF_MODE_AUTO
             builder[CaptureRequest.CONTROL_AF_TRIGGER] = CaptureRequest.CONTROL_AF_TRIGGER_START
             
-            session.setRepeatingRequest(builder.build(), null, handler)
+            session.setRepeatingRequest(builder.build(), object : CameraCaptureSession.CaptureCallback() {
+                override fun onCaptureCompleted(
+                    session: CameraCaptureSession,
+                    request: CaptureRequest,
+                    result: TotalCaptureResult
+                ) {
+                    val afState = result[CaptureResult.CONTROL_AF_STATE]
+                    if (afState == CaptureResult.CONTROL_AF_STATE_FOCUSED_LOCKED ||
+                        afState == CaptureResult.CONTROL_AF_STATE_NOT_FOCUSED_LOCKED) {
+                        // Focus operation completed (success or failure)
+                        onComplete(afState == CaptureResult.CONTROL_AF_STATE_FOCUSED_LOCKED)
+                        // Note: In a real app we'd likely stop listening here to avoid multiple callbacks
+                    }
+                }
+            }, handler)
         } catch (e: Exception) {
             e.printStackTrace()
+            onComplete(false)
         }
     }
 

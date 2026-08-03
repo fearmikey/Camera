@@ -47,8 +47,8 @@ class CameraViewModel(
     private val _orientationState = MutableStateFlow(0)
     val orientationState: StateFlow<Int> = _orientationState.asStateFlow()
 
-    private val _focusState = MutableStateFlow<androidx.compose.ui.geometry.Offset?>(null)
-    val focusState: StateFlow<androidx.compose.ui.geometry.Offset?> = _focusState.asStateFlow()
+    private val _focusState = MutableStateFlow<FocusState?>(null)
+    val focusState: StateFlow<FocusState?> = _focusState.asStateFlow()
 
     private val _autoShowLeveler = MutableStateFlow(false)
     val autoShowLeveler: StateFlow<Boolean> = _autoShowLeveler.asStateFlow()
@@ -198,7 +198,11 @@ class CameraViewModel(
     private var currentLifecycleOwner: LifecycleOwner? = null
     private var currentSurfaceProvider: Preview.SurfaceProvider? = null
 
-    fun bindToLifecycle(lifecycleOwner: LifecycleOwner, surfaceProvider: Preview.SurfaceProvider) {
+    fun bindToLifecycle(
+        lifecycleOwner: LifecycleOwner, 
+        surfaceProvider: Preview.SurfaceProvider,
+        meteringPointFactoryProvider: () -> androidx.camera.core.MeteringPointFactory? = { null }
+    ) {
         currentLifecycleOwner = lifecycleOwner
         currentSurfaceProvider = surfaceProvider
         
@@ -208,7 +212,7 @@ class CameraViewModel(
             CameraSelector.DEFAULT_BACK_CAMERA
         }
         
-        captureEngine.bindToLifecycle(lifecycleOwner, surfaceProvider, selector)
+        captureEngine.bindToLifecycle(lifecycleOwner, surfaceProvider, selector, meteringPointFactoryProvider)
         val capabilities = captureEngine.getCapabilities()
         _uiState.update { it.copy(
             capabilities = capabilities,
@@ -658,12 +662,20 @@ class CameraViewModel(
     }
 
     fun focusAt(x: Float, y: Float) {
-        captureEngine.focusAt(x, y)
-        _focusState.value = androidx.compose.ui.geometry.Offset(x, y)
+        val offset = androidx.compose.ui.geometry.Offset(x, y)
+        _focusState.value = FocusState(offset, isLocked = false)
+        
+        captureEngine.focusAt(x, y) { success ->
+            if (success) {
+                _focusState.update { 
+                    it?.copy(isLocked = true)
+                }
+            }
+        }
         
         focusJob?.cancel()
         focusJob = viewModelScope.launch {
-            delay(2000)
+            delay(4000)
             _focusState.value = null
         }
     }

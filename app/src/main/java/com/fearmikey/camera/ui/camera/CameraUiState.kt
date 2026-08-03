@@ -8,6 +8,13 @@ import com.fearmikey.camera.domain.model.CameraHardwareCapabilities
 import com.fearmikey.camera.domain.model.UserPreferences
 import com.fearmikey.camera.domain.model.FlashMode
 import androidx.compose.runtime.Stable
+import androidx.compose.ui.geometry.Offset
+
+@Stable
+data class FocusState(
+    val point: Offset,
+    val isLocked: Boolean
+)
 
 @Stable
 data class CameraUiState(

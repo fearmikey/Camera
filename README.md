@@ -17,6 +17,7 @@ A high-performance Android camera application featuring advanced capture modes a
 - Gesture Controls: Advanced gesture-based interactions including pinch-to-zoom, double-tap to switch, and long-press to lock AF/AE.
 - Modern Aesthetic: Updated iconography and launcher assets designed for high-density displays.
 - Persistent Settings: Integrated Jetpack DataStore for a comprehensive and stable settings management system.
+- Engine Stability: Highly optimized lifecycle management and resource cleanup for reliable hybrid API switching.
 - Real-time HUD: Rule of thirds grid and horizon leveler.
 
 ## Architecture

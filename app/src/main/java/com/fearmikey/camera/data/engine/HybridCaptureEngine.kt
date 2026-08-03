@@ -20,11 +20,12 @@ class HybridCaptureEngine(
     override fun bindToLifecycle(
         lifecycleOwner: LifecycleOwner,
         surfaceProvider: Preview.SurfaceProvider,
-        cameraSelector: CameraSelector
+        cameraSelector: CameraSelector,
+        meteringPointFactoryProvider: () -> androidx.camera.core.MeteringPointFactory?
     ) {
         // Bind both but only one will be active for the surface at a time
-        cameraXProvider.bindToLifecycle(lifecycleOwner, surfaceProvider, cameraSelector)
-        camera2Provider.bindToLifecycle(lifecycleOwner, surfaceProvider, cameraSelector)
+        cameraXProvider.bindToLifecycle(lifecycleOwner, surfaceProvider, cameraSelector, meteringPointFactoryProvider)
+        camera2Provider.bindToLifecycle(lifecycleOwner, surfaceProvider, cameraSelector, meteringPointFactoryProvider)
     }
 
     override fun setMode(mode: CameraMode) {
@@ -143,9 +144,9 @@ class HybridCaptureEngine(
         // camera2Provider.setZoom(ratio)
     }
 
-    override fun focusAt(x: Float, y: Float) {
-        cameraXProvider.focusAt(x, y)
-        // camera2Provider.focusAt(x, y)
+    override fun focusAt(x: Float, y: Float, onComplete: (Boolean) -> Unit) {
+        cameraXProvider.focusAt(x, y, onComplete)
+        // camera2Provider.focusAt(x, y, onComplete)
     }
 
     override fun setFlashMode(flashMode: FlashMode) {

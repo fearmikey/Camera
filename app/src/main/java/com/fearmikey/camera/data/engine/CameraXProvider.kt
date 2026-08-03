@@ -10,6 +10,9 @@ import androidx.camera.core.*
 import androidx.camera.core.resolutionselector.AspectRatioStrategy
 import androidx.camera.core.resolutionselector.ResolutionSelector
 import androidx.camera.core.resolutionselector.ResolutionStrategy
+import androidx.camera.core.MeteringPointFactory
+import androidx.camera.core.SurfaceOrientedMeteringPointFactory
+import androidx.camera.core.SurfaceRequest
 import androidx.camera.lifecycle.ProcessCameraProvider
 import androidx.camera.video.*
 import androidx.camera.camera2.interop.Camera2Interop
@@ -75,6 +78,7 @@ class CameraXProvider(
     private var lastLifecycleOwner: LifecycleOwner? = null
     private var lastSurfaceProvider: Preview.SurfaceProvider? = null
     private var lastCameraSelector: CameraSelector? = null
+    private var meteringPointFactoryProvider: (() -> MeteringPointFactory?)? = null
     
     private val actionSound = MediaActionSound()
 
@@ -91,11 +95,13 @@ class CameraXProvider(
     override fun bindToLifecycle(
         lifecycleOwner: LifecycleOwner,
         surfaceProvider: Preview.SurfaceProvider,
-        cameraSelector: CameraSelector
+        cameraSelector: CameraSelector,
+        meteringPointFactoryProvider: () -> MeteringPointFactory?
     ) {
         lastLifecycleOwner = lifecycleOwner
         lastSurfaceProvider = surfaceProvider
         lastCameraSelector = cameraSelector
+        this.meteringPointFactoryProvider = meteringPointFactoryProvider
         
         // Null out current camera to avoid stale capabilities during rebind
         camera = null
@@ -589,14 +595,28 @@ class CameraXProvider(
         this.panoramaYawProvider = provider
     }
 
-    override fun focusAt(x: Float, y: Float) {
+    override fun focusAt(x: Float, y: Float, onComplete: (Boolean) -> Unit) {
         val camera = camera ?: return
-        val factory = SurfaceOrientedMeteringPointFactory(1f, 1f)
-        val point = factory.createPoint(x, y, 0.1f) 
-        val action = FocusMeteringAction.Builder(point, FocusMeteringAction.FLAG_AF or FocusMeteringAction.FLAG_AE)
-            .setAutoCancelDuration(4, TimeUnit.SECONDS)
+        
+        // Cancel existing lock to force a fresh search on the new subject
+        camera.cameraControl.cancelFocusAndMetering()
+        
+        val factory = meteringPointFactoryProvider?.invoke() ?: SurfaceOrientedMeteringPointFactory(1f, 1f)
+        val point = factory.createPoint(x, y, 0.15f) // Standard area for better contrast detection
+        
+        val action = FocusMeteringAction.Builder(point, FocusMeteringAction.FLAG_AF or FocusMeteringAction.FLAG_AE or FocusMeteringAction.FLAG_AWB)
+            .disableAutoCancel()
             .build()
-        camera.cameraControl.startFocusAndMetering(action)
+        
+        val future = camera.cameraControl.startFocusAndMetering(action)
+        future.addListener({
+            try {
+                val result = future.get()
+                onComplete(result.isFocusSuccessful)
+            } catch (e: Exception) {
+                onComplete(false)
+            }
+        }, ContextCompat.getMainExecutor(context))
     }
 
     override fun unbind() {

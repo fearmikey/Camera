@@ -26,7 +26,7 @@ fun HudOverlay(
     showLeveler: Boolean,
     tiltFlow: StateFlow<Float>,
     autoShowLevelerFlow: StateFlow<Boolean>,
-    focusFlow: StateFlow<androidx.compose.ui.geometry.Offset?>,
+    focusFlow: StateFlow<FocusState?>,
     gestureFlow: StateFlow<GestureOverlayState>,
     isFrontCamera: Boolean = false,
     modifier: Modifier = Modifier
@@ -45,8 +45,8 @@ fun HudOverlay(
             HorizonLeveler(tilt = tilt)
         }
         
-        focusPoint?.let { point ->
-            FocusRing(point = point)
+        focusPoint?.let { state ->
+            FocusRing(state = state)
         }
 
         gestureState.faceBox?.let { box ->
@@ -181,17 +181,18 @@ fun HorizonLeveler(tilt: Float) {
 }
 
 @Composable
-fun FocusRing(point: Offset) {
+fun FocusRing(state: FocusState) {
+    val point = state.point
     val infiniteTransition = rememberInfiniteTransition(label = "focusPulse")
     
-    val opacity by infiniteTransition.animateFloat(
+    val pulseOpacity by infiniteTransition.animateFloat(
         initialValue = 1.0f,
         targetValue = 0.4f,
         animationSpec = infiniteRepeatable(
             animation = tween(600, easing = LinearEasing),
             repeatMode = RepeatMode.Reverse
         ),
-        label = "focusOpacity"
+        label = "focusPulseOpacity"
     )
 
     val animatedScale by animateFloatAsState(
@@ -202,22 +203,26 @@ fun FocusRing(point: Offset) {
 
     Canvas(modifier = Modifier.fillMaxSize()) {
         val radiusPx = 40.dp.toPx()
-        val color = Color.Yellow.copy(alpha = opacity)
+        val color = if (state.isLocked) Color.Yellow else Color.White
+        val opacity = if (state.isLocked) 1.0f else pulseOpacity
+        val animatedColor = color.copy(alpha = opacity)
         
         withTransform({
             translate(left = point.x * size.width, top = point.y * size.height)
             scale(animatedScale, animatedScale, pivot = Offset.Zero)
         }) {
             drawCircle(
-                color = color,
+                color = animatedColor,
                 radius = radiusPx,
+                center = Offset.Zero,
                 style = Stroke(width = 2.dp.toPx())
             )
             
             // Subtle inner circle
             drawCircle(
-                color = color.copy(alpha = opacity * 0.5f),
+                color = animatedColor.copy(alpha = opacity * 0.5f),
                 radius = radiusPx * 0.8f,
+                center = Offset.Zero,
                 style = Stroke(width = 1.dp.toPx())
             )
         }

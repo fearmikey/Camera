@@ -2,6 +2,14 @@
 
 All notable changes to this project will be documented in this file.
 
+## [1.0.7] - 2026-08-02
+
+### Improved
+- Lifecycle Management: Refined CameraX and Camera2 providers for more reliable engine transitions and resource cleanup.
+- Capture Engine: Enhanced the Hybrid Capture Engine logic to better handle edge cases during rapid mode switching and initialization.
+- UI/UX Stability: Updated HudOverlay and CameraViewModel to ensure smoother UI state synchronization and robust error handling.
+- Performance: Optimized resource allocation in the capture pipeline to reduce latency during consecutive photo captures.
+
 ## [1.0.6] - 2026-08-02
 
 ### Improved

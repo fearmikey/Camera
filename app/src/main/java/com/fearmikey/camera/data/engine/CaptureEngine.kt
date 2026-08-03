@@ -4,6 +4,7 @@ import androidx.camera.core.CameraSelector
 import androidx.camera.core.Preview
 import androidx.lifecycle.LifecycleOwner
 import com.fearmikey.camera.data.engine.gesture.GestureResult
+import androidx.camera.core.MeteringPointFactory
 import com.fearmikey.camera.domain.model.CameraMode
 import com.fearmikey.camera.domain.model.ProConfig
 import com.fearmikey.camera.domain.model.CameraHardwareCapabilities
@@ -14,7 +15,8 @@ interface CaptureEngine {
     fun bindToLifecycle(
         lifecycleOwner: LifecycleOwner,
         surfaceProvider: Preview.SurfaceProvider,
-        cameraSelector: CameraSelector = CameraSelector.DEFAULT_BACK_CAMERA
+        cameraSelector: CameraSelector = CameraSelector.DEFAULT_BACK_CAMERA,
+        meteringPointFactoryProvider: () -> MeteringPointFactory? = { null }
     )
     fun setMode(mode: CameraMode)
     fun applySettings(prefs: UserPreferences)
@@ -30,7 +32,7 @@ interface CaptureEngine {
     fun getCapabilities(): CameraHardwareCapabilities?
     fun setProMode(enabled: Boolean)
     fun setZoom(ratio: Float)
-    fun focusAt(x: Float, y: Float)
+    fun focusAt(x: Float, y: Float, onComplete: (Boolean) -> Unit = {})
     fun setFlashMode(flashMode: FlashMode)
     fun setTorchEnabled(enabled: Boolean)
     fun playShutterSound()

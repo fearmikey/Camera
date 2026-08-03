@@ -61,6 +61,7 @@ import androidx.compose.material.icons.filled.MoreHoriz
 import androidx.compose.ui.unit.sp
 import com.fearmikey.camera.ui.camera.CameraViewModel
 import com.fearmikey.camera.ui.camera.CameraUiState
+import com.fearmikey.camera.ui.camera.FocusState
 import com.fearmikey.camera.ui.camera.ProControlOverlay
 import com.fearmikey.camera.ui.camera.HudOverlay
 import com.fearmikey.camera.data.engine.CameraXProvider
@@ -93,6 +94,7 @@ import kotlin.math.abs
 
 class MainActivity : ComponentActivity() {
     private lateinit var viewModel: CameraViewModel
+    private var isSecureCamera = false
 
     override fun onCreate(savedInstanceState: Bundle?) {
         enableEdgeToEdge()
@@ -103,6 +105,7 @@ class MainActivity : ComponentActivity() {
             (intent.action == "android.media.action.IMAGE_CAPTURE_SECURE")) {
             setShowWhenLocked(true)
             setTurnScreenOn(true)
+            isSecureCamera = true
         }
         
         val processor = ImageProcessor(this, PortraitSegmenter(this))
@@ -136,6 +139,13 @@ class MainActivity : ComponentActivity() {
             }
         }
         return super.onKeyDown(keyCode, event)
+    }
+
+    override fun onStop() {
+        super.onStop()
+        if (isSecureCamera) {
+            finish()
+        }
     }
 }
 
@@ -188,7 +198,9 @@ fun CameraScreen(
                 gestureFlow = viewModel.gestureState,
                 onZoomChanged = { viewModel.setZoom(it) },
                 onFocusAt = { x, y -> viewModel.focusAt(x, y) },
-                onBindToLifecycle = { owner, provider -> viewModel.bindToLifecycle(owner, provider) },
+                onBindToLifecycle = { owner, provider, factoryProvider -> 
+                    viewModel.bindToLifecycle(owner, provider, factoryProvider) 
+                },
                 onModeSwiped = { direction ->
                     val photoModes = listOf(CameraMode.PORTRAIT, CameraMode.PHOTO, CameraMode.NIGHT_SIGHT, CameraMode.PANORAMA)
                     val videoModes = listOf(CameraMode.VIDEO, CameraMode.SLOW_MO)
@@ -481,11 +493,11 @@ fun CameraPreview(
     showLeveler: Boolean,
     tiltFlow: StateFlow<Float>,
     autoShowLevelerFlow: StateFlow<Boolean>,
-    focusFlow: StateFlow<androidx.compose.ui.geometry.Offset?>,
+    focusFlow: StateFlow<FocusState?>,
     gestureFlow: StateFlow<com.fearmikey.camera.ui.camera.GestureOverlayState>,
     onZoomChanged: (Float) -> Unit,
     onFocusAt: (Float, Float) -> Unit,
-    onBindToLifecycle: (androidx.lifecycle.LifecycleOwner, androidx.camera.core.Preview.SurfaceProvider) -> Unit,
+    onBindToLifecycle: (androidx.lifecycle.LifecycleOwner, androidx.camera.core.Preview.SurfaceProvider, () -> androidx.camera.core.MeteringPointFactory?) -> Unit,
     onModeSwiped: (Float) -> Unit = {}
 ) {
     val lifecycleOwner = LocalLifecycleOwner.current
@@ -552,7 +564,7 @@ fun CameraPreview(
                 factory = { context ->
                     PreviewView(context).apply {
                         this.scaleType = PreviewView.ScaleType.FILL_CENTER
-                        onBindToLifecycle(lifecycleOwner, this.surfaceProvider)
+                        onBindToLifecycle(lifecycleOwner, this.surfaceProvider) { this.meteringPointFactory }
                     }
                 },
                 update = {
