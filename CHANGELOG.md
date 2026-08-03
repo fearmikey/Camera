@@ -2,6 +2,14 @@
 
 All notable changes to this project will be documented in this file.
 
+## [1.0.6] - 2026-08-02
+
+### Improved
+- Panorama Stitching: Significant optimizations to the native C++ engine for faster processing and better seam blending.
+- Real-time Guidance: Refined HUD feedback for panorama capture, providing more accurate alignment indicators.
+- Memory Management: Enhanced frame buffer handling in the Native Bridge to reduce peak memory usage during large panorama captures.
+- Stability: Improved error recovery and state synchronization between the UI and native engine.
+
 ## [1.0.5] - 2026-08-02
 
 ### Added

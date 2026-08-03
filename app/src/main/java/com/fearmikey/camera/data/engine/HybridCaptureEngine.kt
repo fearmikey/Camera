@@ -45,7 +45,7 @@ class HybridCaptureEngine(
 
     override fun capturePhoto(onSuccess: (String) -> Unit, onError: (Exception) -> Unit) {
         when (currentMode) {
-            CameraMode.PHOTO, CameraMode.VIDEO, CameraMode.PORTRAIT, CameraMode.PANORAMA, CameraMode.ADD_ME -> {
+            CameraMode.PHOTO, CameraMode.VIDEO, CameraMode.PORTRAIT, CameraMode.PANORAMA -> {
                 cameraXProvider.capturePhoto(onSuccess, onError)
             }
             CameraMode.NIGHT_SIGHT, CameraMode.HDR -> {
@@ -191,5 +191,10 @@ class HybridCaptureEngine(
     override fun setOnPanoramaListener(listener: (String) -> Unit) {
         cameraXProvider.setOnPanoramaListener(listener)
         camera2Provider.setOnPanoramaListener(listener)
+    }
+
+    override fun setPanoramaYawProvider(provider: () -> Float) {
+        cameraXProvider.setPanoramaYawProvider(provider)
+        camera2Provider.setPanoramaYawProvider(provider)
     }
 }

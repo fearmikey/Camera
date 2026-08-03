@@ -26,7 +26,7 @@ import kotlin.time.Duration.Companion.milliseconds
 data class GestureOverlayState(
     val handBox: androidx.compose.ui.geometry.Rect? = null,
     val faceBox: androidx.compose.ui.geometry.Rect? = null,
-    val isTimerPending: Boolean = false
+    val isTimerPending: Boolean = false,
 )
 
 class CameraViewModel(
@@ -84,6 +84,7 @@ class CameraViewModel(
         observePreferences()
         setupGestureTrigger()
         setupPanoramaListener()
+        captureEngine.setPanoramaYawProvider { currentYaw }
     }
 
     private fun observePreferences() {
@@ -92,7 +93,7 @@ class CameraViewModel(
                 val prevShowLeveler = _uiState.value.userPreferences.showLeveler
                 _uiState.update { it.copy(
                     userPreferences = prefs,
-                    flashMode = prefs.flashMode
+                    flashMode = prefs.flashMode,
                 ) }
                 captureEngine.applySettings(prefs)
                 captureEngine.setFlashMode(prefs.flashMode)
@@ -222,7 +223,7 @@ class CameraViewModel(
         val lifecycleOwner = currentLifecycleOwner
         val surfaceProvider = currentSurfaceProvider
         
-        if (lifecycleOwner != null && surfaceProvider != null) {
+        if ((lifecycleOwner != null) && (surfaceProvider != null)) {
             val selector = if (nextIsFront) {
                 CameraSelector.DEFAULT_FRONT_CAMERA
             } else {
@@ -325,31 +326,48 @@ class CameraViewModel(
         if (!_uiState.value.isPanoramaCapturing) {
             _uiState.update { it.copy(
                 isPanoramaCapturing = true, 
-                panoramaMessage = "Move camera to the dots",
+                panoramaMessage = "Don't move!",
                 panoramaYaw = 0f,
                 panoramaPitch = 0f,
                 panoramaTargets = panoramaTargets,
-                panoramaCapturedIndices = setOf(panoramaTargets.indexOf(0f)).filter { it >= 0 }.toSet()
+                panoramaCapturedIndices = emptySet()
             ) }
             
             // Set current sensor angles as 0,0 reference
             panoramaInitialYaw = currentYaw
             panoramaInitialPitch = currentPitch
-            lastAutoCaptureTime = System.currentTimeMillis()
+            
+            // Allow the first capture to trigger immediately
+            lastAutoCaptureTime = 0L
 
             captureEngine.startPanorama(
-                onSuccess = { /* UI already updated */ },
+                onSuccess = {
+                    // Manually trigger the first capture for the starting position (0,0)
+                    // This provides the immediate "shutter click" feedback the user expects.
+                    val centerIndex = panoramaTargets.indexOf(0f)
+                    if (centerIndex >= 0) {
+                        autoCapturePanorama(centerIndex)
+                    }
+                },
                 onError = { error ->
                     error.printStackTrace()
                     _uiState.update { it.copy(isPanoramaCapturing = false, panoramaMessage = null) }
                 }
             )
         } else {
-            _uiState.update { it.copy(isProcessing = true, isPanoramaCapturing = false, panoramaMessage = "Stitching...") }
+            _uiState.update { it.copy(isPanoramaCapturing = false, panoramaMessage = null, backgroundTaskMessage = "Stitching Panorama...") }
             captureEngine.stopPanorama(
                 onSuccess = { uriString ->
                     val uri = uriString.toUri()
-                    _uiState.update { it.copy(lastCapturedUri = uri, isProcessing = false, panoramaMessage = null) }
+                    _uiState.update { it.copy(lastCapturedUri = uri, backgroundTaskMessage = "Panorama Saved") }
+                    
+                    // Notify user with thumbnail and clear message
+                    viewModelScope.launch {
+                        delay(2500)
+                        if (_uiState.value.backgroundTaskMessage == "Panorama Saved") {
+                            _uiState.update { it.copy(backgroundTaskMessage = null) }
+                        }
+                    }
                     viewModelScope.launch {
                         delay(500.milliseconds)
                         refreshThumbnail()
@@ -357,7 +375,13 @@ class CameraViewModel(
                 },
                 onError = { error ->
                     error.printStackTrace()
-                    _uiState.update { it.copy(isProcessing = false, panoramaMessage = null) }
+                    _uiState.update { it.copy(backgroundTaskMessage = "Stitching Failed") }
+                    viewModelScope.launch {
+                        delay(3000)
+                        if (_uiState.value.backgroundTaskMessage == "Stitching Failed") {
+                            _uiState.update { it.copy(backgroundTaskMessage = null) }
+                        }
+                    }
                 }
             )
         }
@@ -365,7 +389,7 @@ class CameraViewModel(
 
     fun toggleCapture() {
         val state = _uiState.value
-        if (state.currentMode == CameraMode.VIDEO || state.currentMode == CameraMode.SLOW_MO) {
+        if ((state.currentMode == CameraMode.VIDEO) || (state.currentMode == CameraMode.SLOW_MO)) {
             if (state.isRecording) {
                 stopVideo()
             } else {
@@ -548,15 +572,13 @@ class CameraViewModel(
     }
 
     private fun updatePanoramaState(yaw: Float, pitch: Float) {
-        val deltaYaw = yaw - panoramaInitialYaw
+        var deltaYaw = yaw - panoramaInitialYaw
+        while (deltaYaw > 180) deltaYaw -= 360f
+        while (deltaYaw < -180) deltaYaw += 360f
+        
         val deltaPitch = pitch - panoramaInitialPitch
 
-        // Normalize deltaYaw to -180..180
-        var normYaw = deltaYaw
-        while (normYaw > 180) normYaw -= 360f
-        while (normYaw < -180) normYaw += 360f
-
-        _uiState.update { it.copy(panoramaYaw = normYaw, panoramaPitch = deltaPitch) }
+        _uiState.update { it.copy(panoramaYaw = deltaYaw, panoramaPitch = deltaPitch) }
 
         // Check for auto-capture alignment
         val state = _uiState.value
@@ -566,7 +588,7 @@ class CameraViewModel(
         for (i in targets.indices) {
             if (i !in captured) {
                 val targetYaw = targets[i]
-                if (abs(normYaw - targetYaw) < 1.5f && abs(deltaPitch) < 2.0f) {
+                if (abs(deltaYaw - targetYaw) < 1.0f && abs(deltaPitch) < 1.5f) {
                     // Align!
                     if (System.currentTimeMillis() - lastAutoCaptureTime > 1500) {
                         autoCapturePanorama(i)
@@ -587,7 +609,7 @@ class CameraViewModel(
         // Here we could also signal the engine to prioritize this frame
         
         viewModelScope.launch {
-            delay(800)
+            delay(800.milliseconds)
             if (_uiState.value.isPanoramaCapturing) {
                 val captured = _uiState.value.panoramaCapturedIndices.size
                 val total = _uiState.value.panoramaTargets.size
@@ -648,7 +670,14 @@ class CameraViewModel(
 
     fun initSensors(sensorManager: SensorManager) {
         this.sensorManager = sensorManager
-        this.rotationSensor = sensorManager.getDefaultSensor(Sensor.TYPE_ROTATION_VECTOR)
+        // Try Game Rotation Vector (No Magnetometer = No Drift/Twitching near metal)
+        this.rotationSensor = sensorManager.getDefaultSensor(Sensor.TYPE_GAME_ROTATION_VECTOR)
+        
+        if (this.rotationSensor == null) {
+            // Fallback to absolute Rotation Vector
+            this.rotationSensor = sensorManager.getDefaultSensor(Sensor.TYPE_ROTATION_VECTOR)
+        }
+        
         // Fallback to accelerometer if rotation vector is not available
         if (this.rotationSensor == null) {
             this.rotationSensor = sensorManager.getDefaultSensor(Sensor.TYPE_ACCELEROMETER)
@@ -670,33 +699,61 @@ class CameraViewModel(
     }
 
     override fun onSensorChanged(event: SensorEvent?) {
-        if (event?.sensor?.type == Sensor.TYPE_ROTATION_VECTOR) {
+        val sensorType = event?.sensor?.type ?: return
+        
+        if (sensorType == Sensor.TYPE_ROTATION_VECTOR || sensorType == Sensor.TYPE_GAME_ROTATION_VECTOR) {
             val rotationMatrix = FloatArray(9)
             SensorManager.getRotationMatrixFromVector(rotationMatrix, event.values)
+            
+            // Pro-Level Fix: Remap the coordinate system for Portrait orientation
+            // This ensures that 'Azimuth' (Yaw) is calculated correctly even when the 
+            // phone is tilted (Pitch/Roll), preventing the dots from "drifting" non-linearly.
+            val remappedMatrix = FloatArray(9)
+            SensorManager.remapCoordinateSystem(
+                rotationMatrix, 
+                SensorManager.AXIS_X, 
+                SensorManager.AXIS_Z, 
+                remappedMatrix
+            )
+            
             val orientation = FloatArray(3)
-            SensorManager.getOrientation(rotationMatrix, orientation)
+            SensorManager.getOrientation(remappedMatrix, orientation)
             
             val azimuth = Math.toDegrees(orientation[0].toDouble()).toFloat()
             val pitch = Math.toDegrees(orientation[1].toDouble()).toFloat()
             val roll = Math.toDegrees(orientation[2].toDouble()).toFloat()
 
-            currentYaw = azimuth
-            currentPitch = pitch
+            // Apply Low-Pass Filter (Exponential Smoothing)
+            val smoothFactor = 0.15f // Slightly smoother for higher precision
+            
+            // 1. Smooth Pitch
+            currentPitch += smoothFactor * (pitch - currentPitch)
+            
+            // 2. Smooth Yaw (with wrap-around protection)
+            var yawDiff = azimuth - currentYaw
+            while (yawDiff > 180) yawDiff -= 360f
+            while (yawDiff < -180) yawDiff += 360f
+            
+            currentYaw += smoothFactor * yawDiff
+            
+            // Normalize currentYaw to -180..180
+            while (currentYaw > 180) currentYaw -= 360f
+            while (currentYaw < -180) currentYaw += 360f
             
             updateOrientationFromRoll(roll)
 
             if (_uiState.value.isPanoramaCapturing) {
-                updatePanoramaState(azimuth, pitch)
+                updatePanoramaState(currentYaw, currentPitch)
             }
 
-            // Auto leveler fix: if pitch is too steep, it's hard to define a "horizon"
-            if (abs(pitch) < 60) {
+            // Auto leveler logic
+            if (abs(currentPitch) < 60) {
                 currentTilt += alpha * (roll - currentTilt)
                 _tiltState.value = currentTilt
             } else {
                 _tiltState.value = 0f
             }
-        } else if (event?.sensor?.type == Sensor.TYPE_ACCELEROMETER) {
+        } else if (sensorType == Sensor.TYPE_ACCELEROMETER) {
             val ax = event.values[0]
             val ay = event.values[1]
             val az = event.values[2]

@@ -954,6 +954,10 @@ class Camera2Provider(
         // Panorama listener not implemented for Camera2 provider yet.
     }
 
+    override fun setPanoramaYawProvider(provider: () -> Float) {
+        // Not implemented
+    }
+
     private fun applyFlashToBuilder(builder: CaptureRequest.Builder, flashMode: FlashMode) {
         when (flashMode) {
             FlashMode.OFF -> {

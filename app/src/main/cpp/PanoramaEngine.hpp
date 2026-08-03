@@ -8,7 +8,6 @@
 #include <mutex>
 
 struct FrameData {
-    int64_t frameId;
     cv::Mat fullResMat;
     cv::Mat grayScaleMat;
     std::vector<cv::KeyPoint> keypoints;
@@ -21,8 +20,9 @@ public:
     PanoramaEngine(double blurThreshold = 100.0, float matchRatio = 0.7f);
     ~PanoramaEngine();
 
-    bool processFrame(uint8_t* bufferAddr, int width, int height, int stride, int format, int64_t timestamp);
-    bool finalizeStitch(cv::Mat& outputPanorama);
+    bool processFrame(uint8_t* bufferAddr, int width, int height, int stride, int format, int rotationDegrees, int64_t timestamp);
+    bool finalizeStitch();
+    bool getResult(cv::Mat& output);
     void reset();
 
 private:
@@ -34,15 +34,16 @@ private:
 
     std::vector<FrameData> mFrames;
     cv::Mat mAccumulatedH;
+    cv::Mat mResult;
 
     std::mutex mPipelineMutex;
 
-    double computeLaplacianVariance(const cv::Mat& gray);
+    static double computeLaplacianVariance(const cv::Mat& gray);
     bool estimateHomographyBetween(const FrameData& prevFrame, FrameData& currFrame, cv::Mat& H_out);
-    void calculateCanvasBounds(cv::Rect& canvasBounds, cv::Mat& translationMatrix);
-    void blendFramesMultiBand(const std::vector<cv::Mat>& warpedFrames,
+    static void blendFramesMultiBand(const std::vector<cv::Mat>& warpedFrames,
                              const std::vector<cv::Point>& corners,
                              const std::vector<cv::Mat>& masks,
                              const cv::Rect& canvasBounds,
                              cv::Mat& result);
+    static void autoCrop(cv::Mat& image, const cv::Mat& mask);
 };

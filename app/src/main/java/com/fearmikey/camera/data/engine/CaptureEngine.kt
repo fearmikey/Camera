@@ -40,5 +40,6 @@ interface CaptureEngine {
     fun setGestureTriggerEnabled(enabled: Boolean)
     fun setOnGestureListener(listener: (GestureResult) -> Unit)
     fun setOnPanoramaListener(listener: (String) -> Unit)
+    fun setPanoramaYawProvider(provider: () -> Float)
     fun unbind()
 }

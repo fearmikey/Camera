@@ -12,9 +12,11 @@ class NativePanoramaBridge {
         height: Int,
         stride: Int,
         format: Int,
-        timestamp: Long
+        rotationDegrees: Int,
+        timestamp: Long,
     ): Boolean
     external fun nativeFinalizeStitch(enginePtr: Long, outputBitmap: Bitmap): Boolean
+    external fun nativeGetResultSize(enginePtr: Long): IntArray
     external fun nativeReset(enginePtr: Long)
     external fun nativeRelease(enginePtr: Long)
 

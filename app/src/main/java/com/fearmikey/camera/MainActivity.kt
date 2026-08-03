@@ -13,7 +13,6 @@ import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.camera.view.PreviewView
-import androidx.compose.animation.animateColorAsState
 import androidx.compose.animation.core.*
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
@@ -99,9 +98,9 @@ class MainActivity : ComponentActivity() {
         enableEdgeToEdge()
         super.onCreate(savedInstanceState)
         
-        if (intent.action == MediaStore.INTENT_ACTION_STILL_IMAGE_CAMERA || 
-            intent.action == MediaStore.INTENT_ACTION_STILL_IMAGE_CAMERA_SECURE ||
-            intent.action == "android.media.action.IMAGE_CAPTURE_SECURE") {
+        if ((intent.action == MediaStore.INTENT_ACTION_STILL_IMAGE_CAMERA) ||
+            (intent.action == MediaStore.INTENT_ACTION_STILL_IMAGE_CAMERA_SECURE) ||
+            (intent.action == "android.media.action.IMAGE_CAPTURE_SECURE")) {
             setShowWhenLocked(true)
             setTurnScreenOn(true)
         }
@@ -121,7 +120,7 @@ class MainActivity : ComponentActivity() {
             MaterialTheme(colorScheme = darkColorScheme()) {
                 Surface(
                     modifier = Modifier.fillMaxSize(),
-                    color = Color.Black
+                    color = Color.Black,
                 ) {
                     CameraScreen(viewModel)
                 }
@@ -191,7 +190,7 @@ fun CameraScreen(
                 onFocusAt = { x, y -> viewModel.focusAt(x, y) },
                 onBindToLifecycle = { owner, provider -> viewModel.bindToLifecycle(owner, provider) },
                 onModeSwiped = { direction ->
-                    val photoModes = listOf(CameraMode.ADD_ME, CameraMode.PORTRAIT, CameraMode.PHOTO, CameraMode.NIGHT_SIGHT, CameraMode.PANORAMA)
+                    val photoModes = listOf(CameraMode.PORTRAIT, CameraMode.PHOTO, CameraMode.NIGHT_SIGHT, CameraMode.PANORAMA)
                     val videoModes = listOf(CameraMode.VIDEO, CameraMode.SLOW_MO)
                     val modes = if (uiState.captureType == CaptureType.PHOTO) photoModes else videoModes
                     
@@ -426,8 +425,43 @@ fun CameraScreen(
             if (uiState.isPanoramaCapturing) {
                 PanoramaGuideOverlay(
                     state = uiState,
-                    modifier = Modifier.fillMaxSize()
+                    modifier = Modifier.fillMaxSize(),
                 )
+            }
+
+            // Background Task Indicator (Top Center)
+            uiState.backgroundTaskMessage?.let { message ->
+                Box(
+                    modifier = Modifier
+                        .fillMaxSize()
+                        .padding(top = systemBarsPadding.calculateTopPadding() + 60.dp),
+                    contentAlignment = Alignment.TopCenter
+                ) {
+                    Surface(
+                        color = Color.Black.copy(alpha = 0.7f),
+                        shape = RoundedCornerShape(24.dp),
+                        tonalElevation = 4.dp
+                    ) {
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp)
+                        ) {
+                            if (message.contains("...")) {
+                                CircularProgressIndicator(
+                                    modifier = Modifier.size(18.dp),
+                                    strokeWidth = 2.dp,
+                                    color = Color.Yellow
+                                )
+                                Spacer(modifier = Modifier.width(12.dp))
+                            }
+                            Text(
+                                text = message,
+                                color = Color.White,
+                                style = MaterialTheme.typography.labelLarge
+                            )
+                        }
+                    }
+                }
             }
         }
     } else {
@@ -550,6 +584,13 @@ fun PanoramaGuideOverlay(
     val targets = state.panoramaTargets
     val captured = state.panoramaCapturedIndices
 
+    // Animate the yaw value once at the top level to ensure all dots stay perfectly synced
+    val animatedYaw by animateFloatAsState(
+        targetValue = yaw,
+        animationSpec = spring(stiffness = Spring.StiffnessMediumLow),
+        label = "trackYaw"
+    )
+
     Box(
         modifier = modifier.fillMaxSize(),
         contentAlignment = Alignment.Center
@@ -557,7 +598,7 @@ fun PanoramaGuideOverlay(
         // Horizontal Track
         Box(
             modifier = Modifier
-                .fillMaxWidth(0.8f)
+                .fillMaxWidth(0.9f)
                 .height(80.dp),
             contentAlignment = Alignment.Center
         ) {
@@ -568,42 +609,53 @@ fun PanoramaGuideOverlay(
                 modifier = Modifier.fillMaxWidth()
             )
 
-            // Center Ring (Static)
+            // Center Ring (Static - where the user is aiming)
             Box(
                 modifier = Modifier
-                    .size(40.dp)
-                    .border(2.dp, Color.White, CircleShape)
-            )
-
-            // Pitch indicator (Vertical line to help level)
-            Box(
-                modifier = Modifier
-                    .width(2.dp)
-                    .height(20.dp)
-                    .offset(y = (pitch * 5f).dp.coerceIn((-30).dp, 30.dp))
-                    .background(if (abs(pitch) < 2f) Color.Green else Color.Red)
-            )
+                    .size(44.dp)
+                    .border(2.dp, Color.White.copy(alpha = 0.8f), CircleShape),
+                contentAlignment = Alignment.Center
+            ) {
+                // Pitch indicator (Vertical line to help level)
+                val pitchOffset by animateDpAsState(
+                    targetValue = (pitch * 6f).dp.coerceIn((-30).dp, 30.dp),
+                    animationSpec = spring(stiffness = Spring.StiffnessMediumLow),
+                    label = "pitchMovement"
+                )
+                Box(
+                    modifier = Modifier
+                        .width(2.dp)
+                        .height(24.dp)
+                        .offset(y = pitchOffset)
+                        .background(if (abs(pitch) < 2f) Color.Green else Color.Red)
+                )
+                
+                // Aiming reticle
+                Box(modifier = Modifier.size(4.dp).background(Color.White, CircleShape))
+            }
 
             // Targets (Dots moving along the track)
-            val pixelsPerDegree = 8f 
+            // Increased scale for better precision
+            val pixelsPerDegree = 10f 
 
             targets.forEachIndexed { index, targetYaw ->
                 if (index !in captured) {
-                    val relativeX = (targetYaw - yaw) * pixelsPerDegree
+                    // Use the single animatedYaw for all dots to keep spacing rigid
+                    val relativeX = (targetYaw - animatedYaw) * pixelsPerDegree
                     
-                    // Only draw if within visible track range
-                    if (abs(relativeX) < 150f) {
+                    // Only draw if within visible track range (+ buffer)
+                    if (abs(relativeX) < 200f) {
                         Box(
                             modifier = Modifier
                                 .size(24.dp)
                                 .offset(x = relativeX.dp)
-                                .background(Color.Yellow.copy(alpha = 0.8f), CircleShape)
-                                .border(1.dp, Color.Black, CircleShape),
+                                .background(Color.Yellow.copy(alpha = 0.9f), CircleShape)
+                                .border(1.5.dp, Color.Black, CircleShape),
                             contentAlignment = Alignment.Center
                         ) {
-                            if (abs(relativeX) < 10f) {
-                                // Close to center!
-                                Box(modifier = Modifier.size(12.dp).background(Color.White, CircleShape))
+                            if (abs(relativeX) < 8f) {
+                                // Locked on indicator
+                                Box(modifier = Modifier.size(10.dp).background(Color.White, CircleShape))
                             }
                         }
                     }
@@ -611,31 +663,37 @@ fun PanoramaGuideOverlay(
             }
         }
 
+        // Guidance Message and Stats at Top of Preview
         Column(
             horizontalAlignment = Alignment.CenterHorizontally,
             modifier = Modifier
-                .align(Alignment.BottomCenter)
-                .padding(bottom = 180.dp)
+                .align(Alignment.TopCenter)
+                .padding(top = 100.dp) // Below the top bar icons
         ) {
             Surface(
-                color = Color.Black.copy(alpha = 0.7f),
-                shape = RoundedCornerShape(8.dp)
+                color = Color.Black.copy(alpha = 0.6f),
+                shape = RoundedCornerShape(12.dp)
             ) {
-                Text(
-                    text = message,
-                    color = Color.White,
-                    modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp),
-                    style = MaterialTheme.typography.bodyLarge,
-                    fontWeight = FontWeight.Bold
-                )
+                Column(
+                    horizontalAlignment = Alignment.CenterHorizontally,
+                    modifier = Modifier.padding(horizontal = 20.dp, vertical = 10.dp)
+                ) {
+                    Text(
+                        text = message,
+                        color = Color.White,
+                        style = MaterialTheme.typography.titleMedium,
+                        fontWeight = FontWeight.Bold
+                    )
+                    
+                    Spacer(modifier = Modifier.height(4.dp))
+                    
+                    Text(
+                        "Captured ${captured.size} / ${targets.size} points",
+                        color = Color.White.copy(alpha = 0.8f),
+                        style = MaterialTheme.typography.labelMedium
+                    )
+                }
             }
-
-            Spacer(modifier = Modifier.height(8.dp))
-            Text(
-                "Captured ${captured.size} / ${targets.size} points",
-                color = Color.White.copy(alpha = 0.6f),
-                style = MaterialTheme.typography.labelMedium
-            )
         }
     }
 }
@@ -731,7 +789,7 @@ fun CameraModeSelector(
                 CameraMode.SLOW_MO -> "Slow Motion"
                 CameraMode.PORTRAIT -> "Portrait"
                 CameraMode.PANORAMA -> "Panorama"
-                CameraMode.ADD_ME -> "Add Me"
+
                 CameraMode.HDR -> "HDR"
             }
             
@@ -837,11 +895,11 @@ fun ZoomSwitcher(
                     val label = when {
                         zoom == 1.0f -> "1x"
                         zoom < 1.0f -> {
-                            val valStr = (Math.round(zoom * 10) / 10.0).toString()
+                            val valStr = (kotlin.math.round(zoom * 10f) / 10.0f).toString()
                             if (valStr.startsWith("0.")) valStr.substring(1) else valStr
                         }
                         zoom == zoom.toInt().toFloat() -> "${zoom.toInt()}x"
-                        else -> "${(Math.round(zoom * 10) / 10.0)}x"
+                        else -> "${(kotlin.math.round(zoom * 10f) / 10.0f)}x"
                     }
                     Text(
                         text = label,
@@ -883,7 +941,7 @@ fun CameraControls(
     onTypeSelected: (CaptureType) -> Unit,
     onSettingsClick: () -> Unit
 ) {
-    val photoModes = listOf(CameraMode.ADD_ME, CameraMode.PORTRAIT, CameraMode.PHOTO, CameraMode.NIGHT_SIGHT, CameraMode.PANORAMA)
+    val photoModes = listOf(CameraMode.PORTRAIT, CameraMode.PHOTO, CameraMode.NIGHT_SIGHT, CameraMode.PANORAMA)
     val videoModes = listOf(CameraMode.VIDEO, CameraMode.SLOW_MO)
     val currentModes = if (captureType == CaptureType.PHOTO) photoModes else videoModes
     val darkGray = Color(0xFF202124)

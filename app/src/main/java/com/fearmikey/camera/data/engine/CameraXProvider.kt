@@ -68,6 +68,7 @@ class CameraXProvider(
     private val panoramaBridge = NativePanoramaBridge()
     private var panoramaEnginePtr: Long = 0
     private var isPanoramaActive = false
+    private var panoramaYawProvider: (() -> Float)? = null
     
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main)
     
@@ -193,7 +194,12 @@ class CameraXProvider(
                 if (panoramaEnginePtr == 0L) {
                     panoramaEnginePtr = panoramaBridge.nativeInit(100.0, 0.7f)
                 }
-                val analyzer = PanoramaFrameAnalyzer(panoramaBridge, panoramaEnginePtr, { isPanoramaActive }) {
+                val analyzer = PanoramaFrameAnalyzer(
+                    panoramaBridge, 
+                    panoramaEnginePtr, 
+                    { isPanoramaActive },
+                    { panoramaYawProvider?.invoke() ?: 0f }
+                ) {
                     panoramaListener?.invoke("Slow down!")
                 }
                 imageAnalysis = ImageAnalysis.Builder()
@@ -365,15 +371,35 @@ class CameraXProvider(
         }
         isPanoramaActive = false
         
+        val engineToProcess = panoramaEnginePtr
+        // We set the pointer to 0 so the next panorama session will create a NEW engine
+        // instance, allowing this one to finish stitching in the background.
+        panoramaEnginePtr = 0L
+
         scope.launch(Dispatchers.Default) {
             try {
-                // Stitching can take a few seconds, use a large enough bitmap
-                // In a production app, we'd calculate the canvas size first
-                val outputBitmap = Bitmap.createBitmap(4096, 2048, Bitmap.Config.ARGB_8888)
-                val success = panoramaBridge.nativeFinalizeStitch(panoramaEnginePtr, outputBitmap)
+                // Initial large buffer for ultra-wide shots
+                val initialBitmap = Bitmap.createBitmap(8192, 2048, Bitmap.Config.ARGB_8888)
+                val success = panoramaBridge.nativeFinalizeStitch(engineToProcess, initialBitmap)
                 
                 if (success) {
-                    val uri = saveBitmapToMediaStore(outputBitmap)
+                    val size = panoramaBridge.nativeGetResultSize(engineToProcess)
+                    val actualW = size[0]
+                    val actualH = size[1]
+                    
+                    // Final Crop: Cut the empty padding from the bitmap
+                    val scale = Math.min(8192f / actualW, 2048f / actualH)
+                    val renderedW = (actualW * scale).toInt()
+                    val renderedH = (actualH * scale).toInt()
+                    val offsetX = (8192 - renderedW) / 2
+                    val offsetY = (2048 - renderedH) / 2
+
+                    val finalBitmap = Bitmap.createBitmap(initialBitmap, offsetX, offsetY, renderedW, renderedH)
+                    val uri = saveBitmapToMediaStore(finalBitmap)
+                    
+                    initialBitmap.recycle()
+                    finalBitmap.recycle()
+                    
                     withContext(Dispatchers.Main) {
                         onSuccess(uri)
                     }
@@ -386,6 +412,9 @@ class CameraXProvider(
                 withContext(Dispatchers.Main) {
                     onError(e)
                 }
+            } finally {
+                // IMPORTANT: Release the native engine instance after background processing is complete
+                panoramaBridge.nativeRelease(engineToProcess)
             }
         }
     }
@@ -554,6 +583,10 @@ class CameraXProvider(
 
     override fun setOnPanoramaListener(listener: (String) -> Unit) {
         this.panoramaListener = listener
+    }
+
+    override fun setPanoramaYawProvider(provider: () -> Float) {
+        this.panoramaYawProvider = provider
     }
 
     override fun focusAt(x: Float, y: Float) {

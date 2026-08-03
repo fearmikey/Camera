@@ -7,6 +7,5 @@ enum class CameraMode {
     HDR,
     SLOW_MO,
     PORTRAIT,
-    PANORAMA,
-    ADD_ME
+    PANORAMA
 }
