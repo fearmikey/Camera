@@ -1,55 +1,54 @@
 package com.fearmikey.camera.data.engine
 
+import android.Manifest
+import android.annotation.SuppressLint
 import android.content.Context
+import android.content.pm.PackageManager
 import android.graphics.Bitmap
-import android.graphics.BitmapFactory
 import android.graphics.Matrix
-import android.media.ExifInterface
-import android.os.Build
+import android.location.Location
+import android.media.MediaActionSound
+import android.provider.MediaStore
+import android.util.Log
+import android.view.Surface
+import androidx.camera.camera2.interop.Camera2Interop
+import androidx.camera.camera2.interop.ExperimentalCamera2Interop
 import androidx.camera.core.*
 import androidx.camera.core.resolutionselector.AspectRatioStrategy
 import androidx.camera.core.resolutionselector.ResolutionSelector
 import androidx.camera.core.resolutionselector.ResolutionStrategy
-import androidx.camera.core.MeteringPointFactory
-import androidx.camera.core.SurfaceOrientedMeteringPointFactory
-import androidx.camera.core.SurfaceRequest
 import androidx.camera.lifecycle.ProcessCameraProvider
 import androidx.camera.video.*
-import androidx.camera.camera2.interop.Camera2Interop
-import androidx.camera.camera2.interop.ExperimentalCamera2Interop
 import androidx.core.content.ContextCompat
-import androidx.core.net.toUri
 import androidx.lifecycle.LifecycleOwner
-import com.fearmikey.camera.data.engine.processing.ImageProcessor
-import com.fearmikey.camera.data.engine.processing.NativePanoramaBridge
-import com.fearmikey.camera.data.engine.processing.PanoramaFrameAnalyzer
 import com.fearmikey.camera.data.engine.gesture.GestureAnalyzer
 import com.fearmikey.camera.data.engine.gesture.GestureResult
-import com.fearmikey.camera.domain.model.CameraMode
-import com.fearmikey.camera.domain.model.ProConfig
+import com.fearmikey.camera.data.engine.processing.ImageProcessor
+import com.fearmikey.camera.data.engine.processing.PanoramaFrameAnalyzer
+import com.fearmikey.camera.data.engine.processing.PanoramaSession
+import com.fearmikey.camera.data.engine.processing.PanoramaTooShortException
+import com.fearmikey.camera.data.repository.MediaSaver
 import com.fearmikey.camera.domain.model.CameraHardwareCapabilities
-import com.fearmikey.camera.domain.model.UserPreferences
+import com.fearmikey.camera.domain.model.CameraMode
 import com.fearmikey.camera.domain.model.FlashMode
+import com.fearmikey.camera.domain.model.PanoramaProgress
+import com.fearmikey.camera.domain.model.ProConfig
 import com.fearmikey.camera.domain.model.ResolutionMode
-import com.fearmikey.camera.domain.model.AspectRatio as DomainAspectRatio
-import java.text.SimpleDateFormat
-import java.util.Locale
-import java.util.concurrent.TimeUnit
-import android.net.Uri
-import android.provider.MediaStore
-import android.content.ContentValues
-import java.util.concurrent.ExecutorService
-import java.util.concurrent.Executors
-import android.media.MediaActionSound
+import com.fearmikey.camera.domain.model.UserPreferences
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import java.util.concurrent.ExecutorService
+import java.util.concurrent.Executors
+import com.fearmikey.camera.domain.model.AspectRatio as DomainAspectRatio
 
 class CameraXProvider(
     private val context: Context,
     private val processor: ImageProcessor,
+    private val mediaSaver: MediaSaver,
+    private val locationProvider: () -> Location?,
 ) : CaptureEngine {
 
     private var cameraProvider: ProcessCameraProvider? = null
@@ -60,37 +59,40 @@ class CameraXProvider(
     private var gestureAnalyzer: GestureAnalyzer? = null
     private var gestureTriggerEnabled: Boolean = false
     private var gestureListener: ((GestureResult) -> Unit)? = null
-    private var panoramaListener: ((String) -> Unit)? = null
-    private val gestureExecutor: ExecutorService = Executors.newSingleThreadExecutor()
+    private var panoramaProgressListener: ((PanoramaProgress) -> Unit)? = null
+    private var cameraReadyListener: (() -> Unit)? = null
+    private var lowLightListener: ((Boolean) -> Unit)? = null
+    private var qrListener: ((String?) -> Unit)? = null
+    @Volatile private var isLowLight = false
+    private var lowLightFrameCounter = 0
+    private val analysisExecutor: ExecutorService = Executors.newSingleThreadExecutor()
     private var camera: Camera? = null
     private var currentMode: CameraMode = CameraMode.PHOTO
     private var currentPrefs: UserPreferences = UserPreferences()
     private var currentProConfig: ProConfig = ProConfig()
     private var isProMode: Boolean = false
-    
-    private val panoramaBridge = NativePanoramaBridge()
-    private var panoramaEnginePtr: Long = 0
-    private var isPanoramaActive = false
-    private var panoramaYawProvider: (() -> Float)? = null
-    
+    private var targetRotation: Int = Surface.ROTATION_0
+    private var exposureIndex: Int = 0
+
+    /**
+     * Active sweep. Read by the analyzer on [analysisExecutor]; it is only ever cleared on
+     * that executor too, so a session can be stitched/closed without racing an analyzer.
+     */
+    @Volatile private var panoramaSession: PanoramaSession? = null
+    private val isPanoramaActive: Boolean get() = panoramaSession != null
+
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main)
-    
+
     private var lastLifecycleOwner: LifecycleOwner? = null
     private var lastSurfaceProvider: Preview.SurfaceProvider? = null
     private var lastCameraSelector: CameraSelector? = null
     private var meteringPointFactoryProvider: (() -> MeteringPointFactory?)? = null
-    
-    private val actionSound = MediaActionSound()
 
-    init {
-        val cameraProviderFuture = ProcessCameraProvider.getInstance(context)
-        cameraProviderFuture.addListener(
-            {
-                cameraProvider = cameraProviderFuture.get()
-            },
-            ContextCompat.getMainExecutor(context),
-        )
-    }
+    private val actionSound = MediaActionSound()
+    private val mainExecutor = ContextCompat.getMainExecutor(context)
+
+    private val isFrontCamera: Boolean
+        get() = lastCameraSelector == CameraSelector.DEFAULT_FRONT_CAMERA
 
     override fun bindToLifecycle(
         lifecycleOwner: LifecycleOwner,
@@ -102,249 +104,303 @@ class CameraXProvider(
         lastSurfaceProvider = surfaceProvider
         lastCameraSelector = cameraSelector
         this.meteringPointFactoryProvider = meteringPointFactoryProvider
-        
+
         // Null out current camera to avoid stale capabilities during rebind
         camera = null
 
         val cameraProviderFuture = ProcessCameraProvider.getInstance(context)
-        cameraProviderFuture.addListener(
-            {
-                val provider = cameraProviderFuture.get()
-            
-            val aspectStrategy = when (currentPrefs.aspectRatio) {
-                DomainAspectRatio.RATIO_4_3 -> AspectRatioStrategy.RATIO_4_3_FALLBACK_AUTO_STRATEGY
-                DomainAspectRatio.RATIO_16_9 -> AspectRatioStrategy.RATIO_16_9_FALLBACK_AUTO_STRATEGY
-                DomainAspectRatio.RATIO_FULL -> AspectRatioStrategy.RATIO_4_3_FALLBACK_AUTO_STRATEGY
-            }
-
-            val captureResStrategy = if (currentPrefs.resolution == ResolutionMode.MP_50 || 
-                currentPrefs.resolution == ResolutionMode.MP_12) {
-                // Aim for high-res but allow fallback if binding fails.
-                // 50MP (8192x6144) is the goal.
-                ResolutionStrategy(
-                    android.util.Size(8192, 6144), 
-                    ResolutionStrategy.FALLBACK_RULE_CLOSEST_HIGHER_THEN_LOWER
-                )
-            } else {
-                null
-            }
-
-            val captureResolutionSelectorBuilder = ResolutionSelector.Builder()
-                .setAspectRatioStrategy(aspectStrategy)
-            captureResStrategy?.let {
-                captureResolutionSelectorBuilder.setResolutionStrategy(it)
-            }
-            val captureResolutionSelector = captureResolutionSelectorBuilder.build()
-
-            val previewResolutionSelector = ResolutionSelector.Builder()
-                .setAspectRatioStrategy(aspectStrategy)
-                .setResolutionStrategy(ResolutionStrategy(
-                    android.util.Size(1920, 1080),
-                    ResolutionStrategy.FALLBACK_RULE_CLOSEST_HIGHER_THEN_LOWER
-                ))
-                .build()
-
-            val previewBuilder = Preview.Builder()
-                .setResolutionSelector(previewResolutionSelector)
-            
-            if (isProMode) {
-                applyProConfigToBuilder(previewBuilder)
-            }
-
-            val preview = previewBuilder.build().also {
-                it.setSurfaceProvider(surfaceProvider)
-            }
-
-            val captureBuilder = ImageCapture.Builder()
-                .setCaptureMode(ImageCapture.CAPTURE_MODE_MINIMIZE_LATENCY)
-                .setResolutionSelector(captureResolutionSelector)
-            
-            if (isProMode) {
-                applyProConfigToBuilder(captureBuilder)
-            }
-
-            imageCapture = captureBuilder.build().also {
-                it.flashMode = when (currentPrefs.flashMode) {
-                    FlashMode.OFF -> ImageCapture.FLASH_MODE_OFF
-                    FlashMode.ON -> ImageCapture.FLASH_MODE_ON
-                    FlashMode.AUTO -> ImageCapture.FLASH_MODE_AUTO
-                }
-            }
-
-            if (gestureTriggerEnabled) {
-                android.util.Log.i("CameraXProvider", "Palm Timer ENABLED - binding GestureAnalyzer")
-                gestureAnalyzer?.close() // Ensure previous instance is cleaned up
-                gestureAnalyzer = GestureAnalyzer(context) { result ->
-                    gestureListener?.invoke(result)
-                }
-                imageAnalysis = ImageAnalysis.Builder()
-                    .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
-                    .setResolutionSelector(ResolutionSelector.Builder()
-                        .setResolutionStrategy(ResolutionStrategy(
-                            android.util.Size(640, 480),
-                            ResolutionStrategy.FALLBACK_RULE_CLOSEST_HIGHER_THEN_LOWER
-                        ))
-                        .build())
-                    .build()
-                    .also {
-                        it.setAnalyzer(gestureExecutor, gestureAnalyzer!!)
-                    }
-            } else {
-                android.util.Log.i("CameraXProvider", "Palm Timer DISABLED")
-                gestureAnalyzer?.close()
-                gestureAnalyzer = null
-                imageAnalysis = null
-            }
-
-            if (currentMode == CameraMode.PANORAMA) {
-                if (panoramaEnginePtr == 0L) {
-                    panoramaEnginePtr = panoramaBridge.nativeInit(100.0, 0.7f)
-                }
-                val analyzer = PanoramaFrameAnalyzer(
-                    panoramaBridge, 
-                    panoramaEnginePtr, 
-                    { isPanoramaActive },
-                    { panoramaYawProvider?.invoke() ?: 0f }
-                ) {
-                    panoramaListener?.invoke("Slow down!")
-                }
-                imageAnalysis = ImageAnalysis.Builder()
-                    .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
-                    .setResolutionSelector(ResolutionSelector.Builder()
-                        .setResolutionStrategy(ResolutionStrategy(
-                            android.util.Size(1280, 720),
-                            ResolutionStrategy.FALLBACK_RULE_CLOSEST_HIGHER_THEN_LOWER
-                        ))
-                        .build())
-                    .setOutputImageFormat(ImageAnalysis.OUTPUT_IMAGE_FORMAT_RGBA_8888)
-                    .build()
-                    .also {
-                        it.setAnalyzer(gestureExecutor, analyzer)
-                    }
-            }
-
-            val recorder = Recorder.Builder()
-                .setQualitySelector(QualitySelector.from(Quality.HIGHEST))
-                .build()
-            videoCapture = VideoCapture.withOutput(recorder)
-
-            try {
-                provider.unbindAll()
-                
-                // On some devices, binding too many use cases at high res fails.
-                // We only bind what's necessary for the current mode.
-                val useCases = mutableListOf<UseCase>(preview, imageCapture!!)
-                if (currentMode == CameraMode.VIDEO || currentMode == CameraMode.SLOW_MO) {
-                    useCases.add(videoCapture!!)
-                }
-                imageAnalysis?.let { useCases.add(it) }
-                
-                camera = provider.bindToLifecycle(
-                    lifecycleOwner,
-                    cameraSelector,
-                    *useCases.toTypedArray()
-                )
-                android.util.Log.i("CameraXProvider", "Binding SUCCESS: ${useCases.size} use cases")
-            } catch (e: Exception) {
-                android.util.Log.e("CameraXProvider", "Binding FAILED: ${e.message}")
-                e.printStackTrace()
-                
-                // Emergency Fallback: Bind only Preview and ImageCapture with standard res
-                if (currentMode != CameraMode.VIDEO) {
-                    try {
-                        provider.unbindAll()
-                        camera = provider.bindToLifecycle(
-                            lifecycleOwner,
-                            cameraSelector,
-                            preview,
-                            imageCapture!!
-                        )
-                        android.util.Log.i("CameraXProvider", "Fallback Binding SUCCESS")
-                    } catch (e2: Exception) {
-                        android.util.Log.e("CameraXProvider", "Fallback Binding FAILED: ${e2.message}")
-                    }
-                }
-            }
-        }, ContextCompat.getMainExecutor(context))
+        cameraProviderFuture.addListener({
+            val provider = cameraProviderFuture.get()
+            cameraProvider = provider
+            bindUseCases(provider, lifecycleOwner, surfaceProvider, cameraSelector)
+        }, mainExecutor)
     }
 
-    @androidx.annotation.OptIn(ExperimentalCamera2Interop::class)
-    private fun applyProConfigToBuilder(builder: Any) {
-        when (builder) {
-            is Preview.Builder -> {
-                val extender = Camera2Interop.Extender(builder)
-                currentProConfig.iso?.let { extender.setCaptureRequestOption(android.hardware.camera2.CaptureRequest.SENSOR_SENSITIVITY, it) }
-                currentProConfig.shutterSpeedNs?.let { extender.setCaptureRequestOption(android.hardware.camera2.CaptureRequest.SENSOR_EXPOSURE_TIME, it) }
+    private fun bindUseCases(
+        provider: ProcessCameraProvider,
+        lifecycleOwner: LifecycleOwner,
+        surfaceProvider: Preview.SurfaceProvider,
+        cameraSelector: CameraSelector,
+    ) {
+        val aspectStrategy = when (currentPrefs.aspectRatio) {
+            DomainAspectRatio.RATIO_4_3 -> AspectRatioStrategy.RATIO_4_3_FALLBACK_AUTO_STRATEGY
+            DomainAspectRatio.RATIO_16_9 -> AspectRatioStrategy.RATIO_16_9_FALLBACK_AUTO_STRATEGY
+            DomainAspectRatio.RATIO_FULL -> AspectRatioStrategy.RATIO_4_3_FALLBACK_AUTO_STRATEGY
+        }
+
+        // Aim for the sensor's full resolution (binning reduces it to ~12MP later).
+        val captureResolutionSelector = ResolutionSelector.Builder()
+            .setAspectRatioStrategy(aspectStrategy)
+            .setResolutionStrategy(
+                ResolutionStrategy(
+                    android.util.Size(8192, 6144),
+                    ResolutionStrategy.FALLBACK_RULE_CLOSEST_HIGHER_THEN_LOWER
+                )
+            )
+            .build()
+
+        val previewResolutionSelector = ResolutionSelector.Builder()
+            .setAspectRatioStrategy(aspectStrategy)
+            .setResolutionStrategy(
+                ResolutionStrategy(
+                    android.util.Size(1920, 1080),
+                    ResolutionStrategy.FALLBACK_RULE_CLOSEST_HIGHER_THEN_LOWER
+                )
+            )
+            .build()
+
+        val previewBuilder = Preview.Builder().setResolutionSelector(previewResolutionSelector)
+        applyFocusAndStabilization(previewBuilder, isPreview = true)
+        attachSceneMonitor(previewBuilder, cameraSelector)
+        val preview = previewBuilder.build().also { it.setSurfaceProvider(surfaceProvider) }
+
+        val captureBuilder = ImageCapture.Builder()
+            .setCaptureMode(ImageCapture.CAPTURE_MODE_MINIMIZE_LATENCY)
+            .setResolutionSelector(captureResolutionSelector)
+            .setTargetRotation(targetRotation)
+        applyFocusAndStabilization(captureBuilder, isPreview = false)
+        imageCapture = captureBuilder.build().also {
+            it.flashMode = currentPrefs.effectiveFlashMode.toCameraX()
+        }
+
+        imageAnalysis = null
+        val wantGesture = gestureTriggerEnabled && currentMode != CameraMode.PANORAMA &&
+            !com.fearmikey.camera.domain.model.CameraModes.isVideo(currentMode)
+        val wantQr = currentPrefs.scanQrCodes && currentMode == CameraMode.PHOTO
+        if (wantGesture || wantQr) {
+            gestureAnalyzer?.close()
+            val gesture = if (wantGesture) GestureAnalyzer { result -> gestureListener?.invoke(result) } else null
+            gestureAnalyzer = gesture
+            val qr = if (wantQr) com.fearmikey.camera.data.engine.analysis.QrCodeAnalyzer { text ->
+                mainExecutor.execute { qrListener?.invoke(text) }
+            } else null
+            val analyzer = com.fearmikey.camera.data.engine.analysis.FrameAnalysisRouter(gesture, qr)
+            // QR codes need more pixels than palm detection.
+            val analysisSize = if (wantQr) android.util.Size(1280, 720) else android.util.Size(640, 480)
+            imageAnalysis = ImageAnalysis.Builder()
+                .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
+                .setOutputImageFormat(ImageAnalysis.OUTPUT_IMAGE_FORMAT_RGBA_8888)
+                .setResolutionSelector(
+                    ResolutionSelector.Builder()
+                        .setResolutionStrategy(
+                            ResolutionStrategy(
+                                analysisSize,
+                                ResolutionStrategy.FALLBACK_RULE_CLOSEST_HIGHER_THEN_LOWER
+                            )
+                        )
+                        .build()
+                )
+                .build()
+                .also { it.setAnalyzer(analysisExecutor, analyzer) }
+        } else {
+            gestureAnalyzer?.close()
+            gestureAnalyzer = null
+            qrListener?.let { l -> mainExecutor.execute { l(null) } }
+        }
+
+        if (currentMode == CameraMode.PANORAMA) {
+            val analyzer = PanoramaFrameAnalyzer({ panoramaSession }) { progress ->
+                mainExecutor.execute {
+                    // Idle thumbnails only while idle; sweep progress only while sweeping.
+                    if (progress.isIdlePreview != isPanoramaActive) panoramaProgressListener?.invoke(progress)
+                }
             }
-            is ImageCapture.Builder -> {
-                val extender = Camera2Interop.Extender(builder)
-                currentProConfig.iso?.let { extender.setCaptureRequestOption(android.hardware.camera2.CaptureRequest.SENSOR_SENSITIVITY, it) }
-                currentProConfig.shutterSpeedNs?.let { extender.setCaptureRequestOption(android.hardware.camera2.CaptureRequest.SENSOR_EXPOSURE_TIME, it) }
+            // 4:3 keeps the full sensor field of view; the stitched height equals the
+            // analysis frame's long side, so ask for as much as the stream will give.
+            imageAnalysis = ImageAnalysis.Builder()
+                .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
+                .setResolutionSelector(
+                    ResolutionSelector.Builder()
+                        .setAspectRatioStrategy(AspectRatioStrategy.RATIO_4_3_FALLBACK_AUTO_STRATEGY)
+                        .setResolutionStrategy(
+                            ResolutionStrategy(
+                                android.util.Size(PANO_ANALYSIS_W, PANO_ANALYSIS_H),
+                                ResolutionStrategy.FALLBACK_RULE_CLOSEST_LOWER_THEN_HIGHER
+                            )
+                        )
+                        .build()
+                )
+                .setOutputImageFormat(ImageAnalysis.OUTPUT_IMAGE_FORMAT_RGBA_8888)
+                .build()
+                .also { it.setAnalyzer(analysisExecutor, analyzer) }
+        }
+
+        val qualitySelector = when (currentPrefs.videoResolution) {
+            com.fearmikey.camera.domain.model.VideoResolution.RES_4K ->
+                QualitySelector.from(Quality.UHD, FallbackStrategy.lowerQualityThan(Quality.UHD))
+            com.fearmikey.camera.domain.model.VideoResolution.RES_1080P ->
+                QualitySelector.from(Quality.FHD, FallbackStrategy.lowerQualityOrHigherThan(Quality.FHD))
+        }
+        val recorder = Recorder.Builder()
+            .setQualitySelector(qualitySelector)
+            .build()
+        videoCapture = VideoCapture.withOutput(recorder).also { it.targetRotation = targetRotation }
+
+        try {
+            provider.unbindAll()
+            // Only bind what's necessary for the current mode.
+            val useCases = mutableListOf<UseCase>(preview, imageCapture!!)
+            if (currentMode == CameraMode.VIDEO || currentMode == CameraMode.SLOW_MO) {
+                useCases.add(videoCapture!!)
+            }
+            imageAnalysis?.let { useCases.add(it) }
+
+            camera = provider.bindToLifecycle(lifecycleOwner, cameraSelector, *useCases.toTypedArray())
+            Log.i(TAG, "Binding SUCCESS: ${useCases.size} use cases")
+        } catch (e: Exception) {
+            Log.e(TAG, "Binding FAILED: ${e.message}", e)
+            // Fallback: bind the essentials for the current mode.
+            try {
+                provider.unbindAll()
+                val essential = if (currentMode == CameraMode.VIDEO || currentMode == CameraMode.SLOW_MO) {
+                    arrayOf(preview, videoCapture!!)
+                } else {
+                    arrayOf(preview, imageCapture!!)
+                }
+                camera = provider.bindToLifecycle(lifecycleOwner, cameraSelector, *essential)
+                Log.i(TAG, "Fallback Binding SUCCESS")
+            } catch (e2: Exception) {
+                Log.e(TAG, "Fallback Binding FAILED: ${e2.message}")
             }
         }
+        camera?.let { cam ->
+            if (isProMode) applyProConfigLive()
+            if (exposureIndex != 0) {
+                val range = cam.cameraInfo.exposureState.exposureCompensationRange
+                cam.cameraControl.setExposureCompensationIndex(exposureIndex.coerceIn(range.lower, range.upper))
+            }
+            cameraReadyListener?.invoke()
+        }
+    }
+
+    /** Macro AF and (in video modes) video stabilization via Camera2 interop. */
+    @androidx.annotation.OptIn(ExperimentalCamera2Interop::class)
+    private fun applyFocusAndStabilization(builder: Any, isPreview: Boolean) {
+        val extender = when (builder) {
+            is Preview.Builder -> Camera2Interop.Extender(builder)
+            is ImageCapture.Builder -> Camera2Interop.Extender(builder)
+            else -> return
+        }
+        if (currentPrefs.macroFocus == com.fearmikey.camera.domain.model.MacroMode.ON && !isFrontCamera) {
+            extender.setCaptureRequestOption(
+                android.hardware.camera2.CaptureRequest.CONTROL_AF_MODE,
+                android.hardware.camera2.CaptureRequest.CONTROL_AF_MODE_MACRO
+            )
+        }
+        val videoMode = currentMode == CameraMode.VIDEO || currentMode == CameraMode.SLOW_MO
+        if (isPreview && videoMode) {
+            extender.setCaptureRequestOption(
+                android.hardware.camera2.CaptureRequest.CONTROL_VIDEO_STABILIZATION_MODE,
+                if (currentPrefs.videoStabilization) {
+                    android.hardware.camera2.CaptureRequest.CONTROL_VIDEO_STABILIZATION_MODE_ON
+                } else {
+                    android.hardware.camera2.CaptureRequest.CONTROL_VIDEO_STABILIZATION_MODE_OFF
+                }
+            )
+        }
+    }
+
+    /**
+     * Applies manual controls to the live session without rebinding (so sliders
+     * update the preview smoothly). Options are cleared when pro mode is off.
+     */
+    @androidx.annotation.OptIn(ExperimentalCamera2Interop::class)
+    private fun applyProConfigLive() {
+        val cam = camera ?: return
+        val builder = androidx.camera.camera2.interop.CaptureRequestOptions.Builder()
+        if (isPanoramaActive) {
+            // Constant exposure and colour across the sweep avoids visible bands at seams.
+            builder.setCaptureRequestOption(android.hardware.camera2.CaptureRequest.CONTROL_AE_LOCK, true)
+            builder.setCaptureRequestOption(android.hardware.camera2.CaptureRequest.CONTROL_AWB_LOCK, true)
+        }
+        if (isProMode) {
+            val cfg = currentProConfig
+            if (cfg.iso != null || cfg.shutterSpeedNs != null) {
+                // Manual exposure needs both values; fill the missing one with a sane default.
+                builder.setCaptureRequestOption(
+                    android.hardware.camera2.CaptureRequest.CONTROL_AE_MODE,
+                    android.hardware.camera2.CaptureRequest.CONTROL_AE_MODE_OFF
+                )
+                builder.setCaptureRequestOption(android.hardware.camera2.CaptureRequest.SENSOR_SENSITIVITY, cfg.iso ?: 400)
+                builder.setCaptureRequestOption(
+                    android.hardware.camera2.CaptureRequest.SENSOR_EXPOSURE_TIME,
+                    cfg.shutterSpeedNs ?: 16_666_666L
+                )
+            }
+            cfg.focusDistance?.let {
+                builder.setCaptureRequestOption(
+                    android.hardware.camera2.CaptureRequest.CONTROL_AF_MODE,
+                    android.hardware.camera2.CaptureRequest.CONTROL_AF_MODE_OFF
+                )
+                builder.setCaptureRequestOption(android.hardware.camera2.CaptureRequest.LENS_FOCUS_DISTANCE, it)
+            }
+            cfg.whiteBalanceKelvin?.let { kelvin ->
+                builder.setCaptureRequestOption(
+                    android.hardware.camera2.CaptureRequest.CONTROL_AWB_MODE,
+                    awbPresetFor(kelvin)
+                )
+            }
+        }
+        try {
+            androidx.camera.camera2.interop.Camera2CameraControl.from(cam.cameraControl)
+                .setCaptureRequestOptions(builder.build())
+        } catch (e: Exception) {
+            Log.w(TAG, "Unable to apply manual controls: ${e.message}")
+        }
+    }
+
+    /** Maps a colour temperature to the closest standard AWB preset (supported on all devices). */
+    private fun awbPresetFor(kelvin: Int): Int = when {
+        kelvin < 3300 -> android.hardware.camera2.CaptureRequest.CONTROL_AWB_MODE_INCANDESCENT
+        kelvin < 4600 -> android.hardware.camera2.CaptureRequest.CONTROL_AWB_MODE_FLUORESCENT
+        kelvin < 6000 -> android.hardware.camera2.CaptureRequest.CONTROL_AWB_MODE_DAYLIGHT
+        else -> android.hardware.camera2.CaptureRequest.CONTROL_AWB_MODE_CLOUDY_DAYLIGHT
     }
 
     override fun setMode(mode: CameraMode) {
-        val prevMode = currentMode
+        if (mode == currentMode) return
+        if (currentMode == CameraMode.PANORAMA) cancelPanorama()
         currentMode = mode
-        if (prevMode == CameraMode.PANORAMA || mode == CameraMode.PANORAMA ||
-            prevMode == CameraMode.VIDEO || mode == CameraMode.VIDEO ||
-            prevMode == CameraMode.SLOW_MO || mode == CameraMode.SLOW_MO) {
-            rebind()
-        }
+        // Use cases, analyzers (QR/palm/panorama), scene monitor and fps all depend on the mode.
+        rebind()
     }
 
     override fun applySettings(prefs: UserPreferences) {
         val needsRebind = (prefs.aspectRatio != currentPrefs.aspectRatio) ||
-                (prefs.imageFormat != currentPrefs.imageFormat) ||
-                (prefs.resolution != currentPrefs.resolution)
-        
+            (prefs.imageFormat != currentPrefs.imageFormat) ||
+            (prefs.resolution != currentPrefs.resolution) ||
+            (prefs.videoResolution != currentPrefs.videoResolution) ||
+            (prefs.videoStabilization != currentPrefs.videoStabilization) ||
+            (prefs.macroFocus != currentPrefs.macroFocus) ||
+            (prefs.videoFrameRate != currentPrefs.videoFrameRate) ||
+            (prefs.scanQrCodes != currentPrefs.scanQrCodes) ||
+            (prefs.lowLightSuggestion != currentPrefs.lowLightSuggestion)
         currentPrefs = prefs
-        
-        if (needsRebind) {
-            rebind()
-        }
+        if (needsRebind) rebind()
     }
+
+    /** Re-binds the last configuration, e.g. after Camera2 borrowed the device. */
+    fun restore() = rebind()
 
     private fun rebind() {
         val owner = lastLifecycleOwner
         val surface = lastSurfaceProvider
         val selector = lastCameraSelector
         if (owner != null && surface != null && selector != null) {
-            bindToLifecycle(owner, surface, selector)
+            bindToLifecycle(owner, surface, selector, meteringPointFactoryProvider ?: { null })
         }
     }
 
     override fun capturePhoto(onSuccess: (String) -> Unit, onError: (Exception) -> Unit) {
-        android.util.Log.i("CameraXProvider", "capturePhoto called: mode=$currentMode, resolution=${currentPrefs.resolution}")
-        
-        // Detect if we are on the back camera (Binning only allowed on back sensor)
-        val isBackCamera = lastCameraSelector == CameraSelector.DEFAULT_BACK_CAMERA
-        
+        Log.i(TAG, "capturePhoto: mode=$currentMode, resolution=${currentPrefs.resolution}")
         when {
             currentMode == CameraMode.PANORAMA -> {
-                if (!isPanoramaActive) {
-                    startPanorama({ /* Handle UI start */ }, onError)
-                } else {
-                    stopPanorama(onSuccess, onError)
-                }
+                if (!isPanoramaActive) startPanorama({}, onError) else stopPanorama(onSuccess, onError)
             }
-            currentMode == CameraMode.PORTRAIT -> {
-                android.util.Log.i("CameraXProvider", "Calling capturePortrait")
-                capturePortrait(onSuccess, onError)
-            }
-            currentMode == CameraMode.SLOW_MO -> {
-                android.util.Log.e("CameraXProvider", "Capture photo not supported in Slow Mo mode")
-                onError(Exception("Capture photo not supported in Slow Mo mode."))
-            }
-            currentPrefs.resolution == ResolutionMode.MP_12 && isBackCamera -> {
-                android.util.Log.i("CameraXProvider", "Calling captureBinnedPhoto")
-                captureBinnedPhoto(onSuccess, onError)
-            }
-            else -> {
-                android.util.Log.i("CameraXProvider", "Calling captureSinglePhoto")
-                captureSinglePhoto(onSuccess, onError)
-            }
+            currentMode == CameraMode.PORTRAIT -> capturePortrait(onSuccess, onError)
+            currentMode == CameraMode.SLOW_MO -> onError(Exception("Capture photo not supported in Slow Mo mode."))
+            currentPrefs.resolution == ResolutionMode.MP_12 && !isFrontCamera -> captureBinnedPhoto(onSuccess, onError)
+            else -> captureSinglePhoto(onSuccess, onError)
         }
     }
 
@@ -359,108 +415,132 @@ class CameraXProvider(
     }
 
     override fun startPanorama(onSuccess: () -> Unit, onError: (Exception) -> Unit) {
-        if (currentMode != CameraMode.PANORAMA) {
-            onError(Exception("Not in Panorama mode"))
+        if (currentMode != CameraMode.PANORAMA || imageAnalysis == null) {
+            onError(IllegalStateException("Panorama is not ready"))
             return
         }
-        if (panoramaEnginePtr != 0L) {
-            panoramaBridge.nativeReset(panoramaEnginePtr)
+        if (isPanoramaActive) {
+            onError(IllegalStateException("Panorama already running"))
+            return
         }
-        isPanoramaActive = true
+        panoramaSession = try {
+            PanoramaSession(panoramaTanHalfFov())
+        } catch (e: Throwable) {
+            onError(Exception("Unable to start panorama", e))
+            return
+        }
+        applyProConfigLive() // AE/AWB lock
         onSuccess()
     }
 
     override fun stopPanorama(onSuccess: (String) -> Unit, onError: (Exception) -> Unit) {
         if (!isPanoramaActive) {
-            onError(Exception("Panorama not active"))
+            onError(IllegalStateException("Panorama not active"))
             return
         }
-        isPanoramaActive = false
-        
-        val engineToProcess = panoramaEnginePtr
-        // We set the pointer to 0 so the next panorama session will create a NEW engine
-        // instance, allowing this one to finish stitching in the background.
-        panoramaEnginePtr = 0L
-
-        scope.launch(Dispatchers.Default) {
-            try {
-                // Initial large buffer for ultra-wide shots
-                val initialBitmap = Bitmap.createBitmap(8192, 2048, Bitmap.Config.ARGB_8888)
-                val success = panoramaBridge.nativeFinalizeStitch(engineToProcess, initialBitmap)
-                
-                if (success) {
-                    val size = panoramaBridge.nativeGetResultSize(engineToProcess)
-                    val actualW = size[0]
-                    val actualH = size[1]
-                    
-                    // Final Crop: Cut the empty padding from the bitmap
-                    val scale = Math.min(8192f / actualW, 2048f / actualH)
-                    val renderedW = (actualW * scale).toInt()
-                    val renderedH = (actualH * scale).toInt()
-                    val offsetX = (8192 - renderedW) / 2
-                    val offsetY = (2048 - renderedH) / 2
-
-                    val finalBitmap = Bitmap.createBitmap(initialBitmap, offsetX, offsetY, renderedW, renderedH)
-                    val uri = saveBitmapToMediaStore(finalBitmap)
-                    
-                    initialBitmap.recycle()
-                    finalBitmap.recycle()
-                    
-                    withContext(Dispatchers.Main) {
-                        onSuccess(uri)
+        val location = locationProvider()
+        // Detach on the analysis executor: after this task no analyzer can touch the session.
+        analysisExecutor.execute {
+            val session = panoramaSession ?: return@execute
+            panoramaSession = null
+            mainExecutor.execute { applyProConfigLive() } // release AE/AWB lock
+            scope.launch(Dispatchers.Default) {
+                try {
+                    val bitmap = session.stitch() ?: throw PanoramaTooShortException()
+                    session.close()
+                    val uri = try {
+                        mediaSaver.saveJpeg(bitmap, "PANO", location)
+                    } finally {
+                        bitmap.recycle()
                     }
-                } else {
                     withContext(Dispatchers.Main) {
-                        onError(Exception("Panorama stitching failed"))
+                        if (uri != null) onSuccess(uri.toString()) else onError(Exception("Failed to save panorama"))
                     }
+                } catch (e: Exception) {
+                    Log.e(TAG, "Panorama failed", e)
+                    withContext(Dispatchers.Main) { onError(e) }
+                } finally {
+                    session.close()
                 }
-            } catch (e: Exception) {
-                withContext(Dispatchers.Main) {
-                    onError(e)
-                }
-            } finally {
-                // IMPORTANT: Release the native engine instance after background processing is complete
-                panoramaBridge.nativeRelease(engineToProcess)
             }
         }
     }
 
+    /** Discards a running sweep without stitching (mode change, unbind). */
+    private fun cancelPanorama() {
+        if (!isPanoramaActive) return
+        analysisExecutor.execute {
+            panoramaSession?.close()
+            panoramaSession = null
+        }
+    }
+
+    /**
+     * tan(FOV/2) along the sensor's long side at the current zoom, from the lens focal
+     * length and physical sensor size. The native engine uses it to build the cylinder.
+     */
+    @androidx.annotation.OptIn(ExperimentalCamera2Interop::class)
+    private fun panoramaTanHalfFov(): Float {
+        val cam = camera ?: return DEFAULT_TAN_HALF_FOV
+        return try {
+            val info = androidx.camera.camera2.interop.Camera2CameraInfo.from(cam.cameraInfo)
+            val focal = info.getCameraCharacteristic(
+                android.hardware.camera2.CameraCharacteristics.LENS_INFO_AVAILABLE_FOCAL_LENGTHS
+            )?.firstOrNull()
+            val sensor = info.getCameraCharacteristic(
+                android.hardware.camera2.CameraCharacteristics.SENSOR_INFO_PHYSICAL_SIZE
+            )
+            val zoom = cam.cameraInfo.zoomState.value?.zoomRatio ?: 1f
+            if (focal == null || sensor == null || focal <= 0f) {
+                DEFAULT_TAN_HALF_FOV
+            } else {
+                maxOf(sensor.width, sensor.height) / (2f * focal) / zoom.coerceAtLeast(0.1f)
+            }
+        } catch (e: Exception) {
+            DEFAULT_TAN_HALF_FOV
+        }
+    }
+
+    private fun hasAudioPermission(): Boolean =
+        ContextCompat.checkSelfPermission(context, Manifest.permission.RECORD_AUDIO) ==
+            PackageManager.PERMISSION_GRANTED
+
+    @SuppressLint("MissingPermission")
     private fun startRecording(onSuccess: () -> Unit, onError: (Exception) -> Unit) {
-        val videoCapture = videoCapture ?: return
-        
-        val name = "CAMERA_" + SimpleDateFormat("yyyy-MM-dd-HH-mm-ss-SSS", Locale.US)
-            .format(System.currentTimeMillis())
-        val contentValues = ContentValues().apply {
-            put(MediaStore.MediaColumns.DISPLAY_NAME, name)
-            put(MediaStore.MediaColumns.MIME_TYPE, "video/mp4")
-            put(MediaStore.Video.Media.RELATIVE_PATH, "DCIM/Camera")
+        val videoCapture = videoCapture
+        if (videoCapture == null) {
+            onError(IllegalStateException("Video use case not ready"))
+            return
         }
 
-        val mediaStoreOutputOptions = MediaStoreOutputOptions
+        val outputOptions = MediaStoreOutputOptions
             .Builder(context.contentResolver, MediaStore.Video.Media.EXTERNAL_CONTENT_URI)
-            .setContentValues(contentValues)
+            .setContentValues(mediaSaver.newVideoValues())
+            .apply { locationProvider()?.let { setLocation(it) } }
             .build()
 
-        activeRecording = videoCapture.output
-            .prepareRecording(context, mediaStoreOutputOptions)
-            .start(ContextCompat.getMainExecutor(context)) { recordEvent ->
-                when(recordEvent) {
-                    is VideoRecordEvent.Start -> {
-                        onSuccess()
-                    }
-                    is VideoRecordEvent.Finalize -> {
-                        val callback = videoCompletedCallback
-                        if (!recordEvent.hasError()) {
-                            callback?.invoke(recordEvent.outputResults.outputUri.toString())
-                        } else {
-                            activeRecording?.close()
-                            activeRecording = null
-                            recordEvent.cause?.let { onError(it as Exception) }
-                        }
-                        videoCompletedCallback = null
+        val pending = videoCapture.output.prepareRecording(context, outputOptions)
+        if (currentPrefs.recordAudio && hasAudioPermission()) pending.withAudioEnabled()
+
+        activeRecording = pending.start(mainExecutor) { recordEvent ->
+            when (recordEvent) {
+                is VideoRecordEvent.Start -> onSuccess()
+                is VideoRecordEvent.Finalize -> {
+                    val callback = videoCompletedCallback
+                    videoCompletedCallback = null
+                    if (!recordEvent.hasError() ||
+                        recordEvent.error == VideoRecordEvent.Finalize.ERROR_DURATION_LIMIT_REACHED ||
+                        recordEvent.error == VideoRecordEvent.Finalize.ERROR_FILE_SIZE_LIMIT_REACHED
+                    ) {
+                        callback?.invoke(recordEvent.outputResults.outputUri.toString())
+                    } else {
+                        activeRecording = null
+                        val cause = recordEvent.cause
+                        onError(cause as? Exception ?: Exception("Recording failed (${recordEvent.error})", cause))
                     }
                 }
             }
+        }
     }
 
     override fun stopSlowMoVideo(onSuccess: (String) -> Unit) {
@@ -482,37 +562,35 @@ class CameraXProvider(
     }
 
     override fun updateManualConfig(config: ProConfig) {
-        val changed = config.iso != currentProConfig.iso || config.shutterSpeedNs != currentProConfig.shutterSpeedNs
+        if (config == currentProConfig) return
         currentProConfig = config
-        if (isProMode && changed) {
-            rebind()
-        }
+        if (isProMode) applyProConfigLive()
     }
 
+    @androidx.annotation.OptIn(ExperimentalCamera2Interop::class)
     override fun getCapabilities(): CameraHardwareCapabilities? {
         val camera = camera ?: return null
         val info = camera.cameraInfo
         val zoomState = info.zoomState.value ?: return null
-        
-        val isoRange = android.util.Range(100, 3200)
-        val shutterRange = android.util.Range(1_000_000L, 1_000_000_000L)
-        
+        val c2 = androidx.camera.camera2.interop.Camera2CameraInfo.from(info)
+        val isoRange = c2.getCameraCharacteristic(android.hardware.camera2.CameraCharacteristics.SENSOR_INFO_SENSITIVITY_RANGE)
+            ?: android.util.Range(100, 3200)
+        val shutterRange = c2.getCameraCharacteristic(android.hardware.camera2.CameraCharacteristics.SENSOR_INFO_EXPOSURE_TIME_RANGE)
+            ?: android.util.Range(1_000_000L, 1_000_000_000L)
+        val minFocus = c2.getCameraCharacteristic(android.hardware.camera2.CameraCharacteristics.LENS_INFO_MINIMUM_FOCUS_DISTANCE) ?: 0f
+        val manualSensor = c2.getCameraCharacteristic(android.hardware.camera2.CameraCharacteristics.REQUEST_AVAILABLE_CAPABILITIES)
+            ?.contains(android.hardware.camera2.CameraMetadata.REQUEST_AVAILABLE_CAPABILITIES_MANUAL_SENSOR) == true
+        val exposure = info.exposureState
+
         val minZoom = zoomState.minZoomRatio
         val maxZoom = zoomState.maxZoomRatio
         val isFront = info.lensFacing == CameraSelector.LENS_FACING_FRONT
-        
-        val presets = mutableListOf<Float>()
-        
-        // Add minimum zoom if it's less than 1.0 (typically wide angle)
-        if (minZoom < 0.95f) {
-            val roundedMin = (Math.round(minZoom * 10) / 10.0).toFloat()
-            presets.add(roundedMin)
-        }
-        
-        presets.add(1.0f)
 
-        // For front camera, we usually only want wide and 1x
-        // For back camera, we add telephoto presets
+        val presets = mutableListOf<Float>()
+        if (minZoom < 0.95f) {
+            presets.add((Math.round(minZoom * 10) / 10.0).toFloat())
+        }
+        presets.add(1.0f)
         if (!isFront) {
             if (maxZoom >= 2.0f) presets.add(2.0f)
             if (maxZoom >= 5.0f) presets.add(5.0f)
@@ -521,17 +599,24 @@ class CameraXProvider(
 
         return CameraHardwareCapabilities(
             isoRange = isoRange,
-            shutterSpeedRange = shutterRange,
-            minFocusDistance = 0.0f,
+            // Cap the slider at 1s: longer exposures make the preview unusable.
+            shutterSpeedRange = android.util.Range(
+                shutterRange.lower,
+                shutterRange.upper.coerceAtMost(1_000_000_000L).coerceAtLeast(shutterRange.lower)
+            ),
+            minFocusDistance = minFocus,
             zoomRange = android.util.Range(minZoom, maxZoom),
-            zoomPresets = presets.asSequence().distinct().sorted().toList()
+            zoomPresets = presets.distinct().sorted(),
+            exposureRange = if (exposure.isExposureCompensationSupported) exposure.exposureCompensationRange else android.util.Range(0, 0),
+            exposureStep = exposure.exposureCompensationStep.toFloat(),
+            supportsManualSensor = manualSensor,
         )
     }
 
     override fun setProMode(enabled: Boolean) {
         if (isProMode != enabled) {
             isProMode = enabled
-            rebind()
+            applyProConfigLive()
         }
     }
 
@@ -540,11 +625,7 @@ class CameraXProvider(
     }
 
     override fun setFlashMode(flashMode: FlashMode) {
-        imageCapture?.flashMode = when (flashMode) {
-            FlashMode.OFF -> ImageCapture.FLASH_MODE_OFF
-            FlashMode.ON -> ImageCapture.FLASH_MODE_ON
-            FlashMode.AUTO -> ImageCapture.FLASH_MODE_AUTO
-        }
+        imageCapture?.flashMode = flashMode.toCameraX()
     }
 
     override fun setTorchEnabled(enabled: Boolean) {
@@ -552,28 +633,19 @@ class CameraXProvider(
     }
 
     override fun playShutterSound() {
-        if (currentPrefs.cameraSounds) {
-            actionSound.play(MediaActionSound.SHUTTER_CLICK)
-        }
+        if (currentPrefs.cameraSounds) actionSound.play(MediaActionSound.SHUTTER_CLICK)
     }
 
     override fun playTimerTickSound() {
-        if (currentPrefs.cameraSounds) {
-            // No direct MediaActionSound for tick, use a generic beep or FOCUS_COMPLETE
-            actionSound.play(MediaActionSound.FOCUS_COMPLETE)
-        }
+        if (currentPrefs.cameraSounds) actionSound.play(MediaActionSound.FOCUS_COMPLETE)
     }
 
     override fun playStartRecordingSound() {
-        if (currentPrefs.cameraSounds) {
-            actionSound.play(MediaActionSound.START_VIDEO_RECORDING)
-        }
+        if (currentPrefs.cameraSounds) actionSound.play(MediaActionSound.START_VIDEO_RECORDING)
     }
 
     override fun playStopRecordingSound() {
-        if (currentPrefs.cameraSounds) {
-            actionSound.play(MediaActionSound.STOP_VIDEO_RECORDING)
-        }
+        if (currentPrefs.cameraSounds) actionSound.play(MediaActionSound.STOP_VIDEO_RECORDING)
     }
 
     override fun setGestureTriggerEnabled(enabled: Boolean) {
@@ -587,77 +659,150 @@ class CameraXProvider(
         this.gestureListener = listener
     }
 
-    override fun setOnPanoramaListener(listener: (String) -> Unit) {
-        this.panoramaListener = listener
+    override fun setOnPanoramaProgressListener(listener: (PanoramaProgress) -> Unit) {
+        this.panoramaProgressListener = listener
     }
 
-    override fun setPanoramaYawProvider(provider: () -> Float) {
-        this.panoramaYawProvider = provider
+    override fun setTargetRotation(rotation: Int) {
+        if (rotation == targetRotation) return
+        targetRotation = rotation
+        imageCapture?.targetRotation = rotation
+        // A running recording keeps its orientation; the next one picks this up.
+        if (activeRecording == null) videoCapture?.targetRotation = rotation
+    }
+
+    override fun setOnCameraReadyListener(listener: () -> Unit) {
+        cameraReadyListener = listener
+    }
+
+    override fun setOnLowLightListener(listener: (Boolean) -> Unit) {
+        lowLightListener = listener
+    }
+
+    override fun setOnQrCodeListener(listener: (String?) -> Unit) {
+        qrListener = listener
+    }
+
+    /**
+     * Preview capture results drive the low-light (Night) suggestion; in video modes the
+     * same interop hook pins the requested frame rate when the camera supports it.
+     */
+    @androidx.annotation.OptIn(ExperimentalCamera2Interop::class)
+    private fun attachSceneMonitor(builder: Preview.Builder, selector: CameraSelector) {
+        val extender = Camera2Interop.Extender(builder)
+        val fps = currentPrefs.videoFrameRate.fps
+        if (currentMode == CameraMode.VIDEO && fps != null && supportsFps(selector, fps)) {
+            extender.setCaptureRequestOption(
+                android.hardware.camera2.CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE,
+                android.util.Range(fps, fps)
+            )
+        }
+        val monitor = currentPrefs.lowLightSuggestion && currentMode == CameraMode.PHOTO &&
+            selector != CameraSelector.DEFAULT_FRONT_CAMERA
+        if (!monitor) {
+            if (isLowLight) {
+                isLowLight = false
+                mainExecutor.execute { lowLightListener?.invoke(false) }
+            }
+            return
+        }
+        extender.setSessionCaptureCallback(object : android.hardware.camera2.CameraCaptureSession.CaptureCallback() {
+            override fun onCaptureCompleted(
+                session: android.hardware.camera2.CameraCaptureSession,
+                request: android.hardware.camera2.CaptureRequest,
+                result: android.hardware.camera2.TotalCaptureResult
+            ) {
+                if (++lowLightFrameCounter % 15 != 0) return
+                val exposure = result[android.hardware.camera2.CaptureResult.SENSOR_EXPOSURE_TIME] ?: return
+                val iso = result[android.hardware.camera2.CaptureResult.SENSOR_SENSITIVITY] ?: return
+                // Exposure "cost" in ISO-seconds; hysteresis avoids flicker at the threshold.
+                val cost = exposure / 1e9 * iso
+                val dark = if (isLowLight) cost > LOW_LIGHT_EXIT else cost > LOW_LIGHT_ENTER
+                if (dark != isLowLight) {
+                    isLowLight = dark
+                    mainExecutor.execute { lowLightListener?.invoke(dark) }
+                }
+            }
+        })
+    }
+
+    private fun supportsFps(selector: CameraSelector, fps: Int): Boolean = try {
+        val manager = context.getSystemService(Context.CAMERA_SERVICE) as android.hardware.camera2.CameraManager
+        val facing = if (selector == CameraSelector.DEFAULT_FRONT_CAMERA) {
+            android.hardware.camera2.CameraCharacteristics.LENS_FACING_FRONT
+        } else {
+            android.hardware.camera2.CameraCharacteristics.LENS_FACING_BACK
+        }
+        manager.cameraIdList.map { manager.getCameraCharacteristics(it) }
+            .firstOrNull { it[android.hardware.camera2.CameraCharacteristics.LENS_FACING] == facing }
+            ?.get(android.hardware.camera2.CameraCharacteristics.CONTROL_AE_AVAILABLE_TARGET_FPS_RANGES)
+            ?.any { it.lower == fps && it.upper == fps } == true
+    } catch (e: Exception) {
+        false
+    }
+
+    override fun setExposureCompensation(index: Int) {
+        exposureIndex = index
+        val cam = camera ?: return
+        val state = cam.cameraInfo.exposureState
+        if (!state.isExposureCompensationSupported) return
+        val range = state.exposureCompensationRange
+        cam.cameraControl.setExposureCompensationIndex(index.coerceIn(range.lower, range.upper))
     }
 
     override fun focusAt(x: Float, y: Float, onComplete: (Boolean) -> Unit) {
         val camera = camera ?: return
-        
-        // Cancel existing lock to force a fresh search on the new subject
-        camera.cameraControl.cancelFocusAndMetering()
-        
+
         val factory = meteringPointFactoryProvider?.invoke() ?: SurfaceOrientedMeteringPointFactory(1f, 1f)
-        val point = factory.createPoint(x, y, 0.15f) // Standard area for better contrast detection
-        
-        val action = FocusMeteringAction.Builder(point, FocusMeteringAction.FLAG_AF or FocusMeteringAction.FLAG_AE or FocusMeteringAction.FLAG_AWB)
-            .disableAutoCancel()
+        val point = factory.createPoint(x, y, 0.15f)
+
+        val action = FocusMeteringAction.Builder(
+            point,
+            FocusMeteringAction.FLAG_AF or FocusMeteringAction.FLAG_AE or FocusMeteringAction.FLAG_AWB
+        )
+            .setAutoCancelDuration(5, java.util.concurrent.TimeUnit.SECONDS)
             .build()
-        
+
         val future = camera.cameraControl.startFocusAndMetering(action)
         future.addListener({
             try {
-                val result = future.get()
-                onComplete(result.isFocusSuccessful)
+                onComplete(future.get().isFocusSuccessful)
             } catch (e: Exception) {
                 onComplete(false)
             }
-        }, ContextCompat.getMainExecutor(context))
+        }, mainExecutor)
     }
 
     override fun unbind() {
         cameraProvider?.unbindAll()
         camera = null
-        if (panoramaEnginePtr != 0L) {
-            panoramaBridge.nativeRelease(panoramaEnginePtr)
-            panoramaEnginePtr = 0
-        }
+        cancelPanorama()
     }
 
     private fun captureSinglePhoto(onSuccess: (String) -> Unit, onError: (Exception) -> Unit) {
-        val capture = imageCapture ?: return
-        
-        val name = "CAMERA_" + SimpleDateFormat("yyyy-MM-dd-HH-mm-ss-SSS", Locale.US)
-            .format(System.currentTimeMillis())
-        val contentValues = ContentValues().apply {
-            put(MediaStore.MediaColumns.DISPLAY_NAME, name)
-            put(MediaStore.MediaColumns.MIME_TYPE, "image/jpeg")
-            if (Build.VERSION.SDK_INT > Build.VERSION_CODES.P) {
-                put(MediaStore.Images.Media.RELATIVE_PATH, "DCIM/Camera")
-            }
+        val capture = imageCapture ?: run {
+            onError(IllegalStateException("Camera not ready"))
+            return
         }
 
         val metadata = ImageCapture.Metadata().apply {
-            isReversedHorizontal = currentPrefs.mirrorSelfies && lastCameraSelector == CameraSelector.DEFAULT_FRONT_CAMERA
+            isReversedHorizontal = currentPrefs.mirrorSelfies && isFrontCamera
+            location = locationProvider()
         }
 
         val outputOptions = ImageCapture.OutputFileOptions.Builder(
             context.contentResolver,
             MediaStore.Images.Media.EXTERNAL_CONTENT_URI,
-            contentValues
+            mediaSaver.newPhotoValues()
         ).setMetadata(metadata).build()
 
         capture.takePicture(
             outputOptions,
-            ContextCompat.getMainExecutor(context),
+            mainExecutor,
             object : ImageCapture.OnImageSavedCallback {
                 override fun onImageSaved(outputFileResults: ImageCapture.OutputFileResults) {
-                    val uri = outputFileResults.savedUri ?: Uri.EMPTY
-                    onSuccess(uri.toString())
+                    val uri = outputFileResults.savedUri
+                    if (uri != null) onSuccess(uri.toString()) else onError(Exception("Image was not saved"))
                 }
 
                 override fun onError(exception: ImageCaptureException) {
@@ -665,139 +810,107 @@ class CameraXProvider(
                 }
             }
         )
+    }
+
+    /** Captures in memory, decodes, and returns an upright bitmap (mirrored for selfies if requested). */
+    private fun captureUprightBitmap(
+        onBitmap: suspend (Bitmap) -> Unit,
+        onError: (Exception) -> Unit,
+    ) {
+        val capture = imageCapture ?: run {
+            onError(IllegalStateException("Camera not ready"))
+            return
+        }
+        val mirror = currentPrefs.mirrorSelfies && isFrontCamera
+        capture.takePicture(mainExecutor, object : ImageCapture.OnImageCapturedCallback() {
+            override fun onCaptureSuccess(image: ImageProxy) {
+                scope.launch(Dispatchers.Default) {
+                    try {
+                        val raw = image.toBitmap()
+                        val rotation = image.imageInfo.rotationDegrees
+                        image.close()
+                        val upright = if (rotation != 0 || mirror) {
+                            val matrix = Matrix().apply {
+                                postRotate(rotation.toFloat())
+                                if (mirror) postScale(-1f, 1f)
+                            }
+                            Bitmap.createBitmap(raw, 0, 0, raw.width, raw.height, matrix, true)
+                                .also { if (it !== raw) raw.recycle() }
+                        } else raw
+                        onBitmap(upright)
+                    } catch (e: Exception) {
+                        image.close()
+                        withContext(Dispatchers.Main) { onError(e) }
+                    }
+                }
+            }
+
+            override fun onError(exception: ImageCaptureException) {
+                onError(exception)
+            }
+        })
     }
 
     private fun capturePortrait(onSuccess: (String) -> Unit, onError: (Exception) -> Unit) {
-        captureSinglePhoto(
-            onSuccess = { uriString ->
-                Thread {
-                    try {
-                        val uri = uriString.toUri()
-                        val inputStream = context.contentResolver.openInputStream(uri)
-                        val originalBitmap = BitmapFactory.decodeStream(inputStream)
-                        inputStream?.close()
-
-                        if (originalBitmap == null) {
-                            throw Exception("Failed to decode bitmap from URI")
-                        }
-
-                        // Fix rotation before processing
-                        val rotatedBitmap = fixRotation(uri, originalBitmap)
-
-                        val portraitBitmap = processor.processPortrait(rotatedBitmap)
-                        
-                        context.contentResolver.openOutputStream(uri)?.use { out ->
-                            portraitBitmap.compress(Bitmap.CompressFormat.JPEG, 95, out)
-                        }
-                        
-                        ContextCompat.getMainExecutor(context).execute {
-                            onSuccess(uriString)
-                        }
-                    } catch (e: Exception) {
-                        android.util.Log.e("CameraXProvider", "Portrait processing failed", e)
-                        ContextCompat.getMainExecutor(context).execute {
-                            onError(e)
-                        }
-                    }
-                }.start()
-            },
-            onError = onError
-        )
-    }
-
-    private fun fixRotation(uri: Uri, bitmap: Bitmap): Bitmap {
-        val inputStream = context.contentResolver.openInputStream(uri) ?: return bitmap
-        val exif = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
-            ExifInterface(inputStream)
-        } else {
-            return bitmap
-        }
-        inputStream.close()
-
-        val orientation = exif.getAttributeInt(ExifInterface.TAG_ORIENTATION, ExifInterface.ORIENTATION_NORMAL)
-        val matrix = Matrix()
-        when (orientation) {
-            ExifInterface.ORIENTATION_ROTATE_90 -> matrix.postRotate(90f)
-            ExifInterface.ORIENTATION_ROTATE_180 -> matrix.postRotate(180f)
-            ExifInterface.ORIENTATION_ROTATE_270 -> matrix.postRotate(270f)
-            else -> return bitmap
-        }
-
-        return Bitmap.createBitmap(bitmap, 0, 0, bitmap.width, bitmap.height, matrix, true)
+        val location = locationProvider()
+        captureUprightBitmap(onBitmap = { bitmap ->
+            val portrait = processor.processPortrait(bitmap)
+            val uri = mediaSaver.saveJpeg(portrait, "PORTRAIT", location)
+            if (portrait !== bitmap) bitmap.recycle()
+            portrait.recycle()
+            withContext(Dispatchers.Main) {
+                if (uri != null) onSuccess(uri.toString()) else onError(Exception("Failed to save portrait"))
+            }
+        }, onError = onError)
     }
 
     private fun captureBinnedPhoto(onSuccess: (String) -> Unit, onError: (Exception) -> Unit) {
-        val capture = imageCapture
-        if (capture == null) {
-            android.util.Log.e("CameraXProvider", "captureBinnedPhoto: imageCapture is NULL")
-            onError(Exception("Camera not ready"))
+        val capture = imageCapture ?: run {
+            onError(IllegalStateException("Camera not ready"))
             return
         }
-        
-        android.util.Log.i("CameraXProvider", "captureBinnedPhoto: starting takePicture")
-        capture.takePicture(
-            ContextCompat.getMainExecutor(context),
-            object : ImageCapture.OnImageCapturedCallback() {
-                override fun onCaptureSuccess(image: ImageProxy) {
-                    android.util.Log.i("CameraXProvider", "onCaptureSuccess: ${image.width}x${image.height} format=${image.format}")
-                    scope.launch(Dispatchers.Default) {
-                        try {
-                            android.util.Log.i("CameraXProvider", "Calling processor.processPixelBinning")
-                            val binnedBitmap = processor.processPixelBinning(image)
-                            if (binnedBitmap != null) {
-                                android.util.Log.i("CameraXProvider", "Binning SUCCESS, saving to MediaStore")
-                                val uriString = saveBitmapToMediaStore(binnedBitmap)
-                                android.util.Log.i("CameraXProvider", "Saved URI: $uriString")
-                                ContextCompat.getMainExecutor(context).execute {
-                                    onSuccess(uriString)
-                                }
-                            } else {
-                                android.util.Log.e("CameraXProvider", "processor.processPixelBinning returned NULL")
-                                ContextCompat.getMainExecutor(context).execute {
-                                    onError(Exception("Pixel binning failed"))
-                                }
-                            }
-                        } catch (e: Exception) {
-                            android.util.Log.e("CameraXProvider", "Exception in binning scope", e)
-                            ContextCompat.getMainExecutor(context).execute {
-                                onError(e)
-                            }
-                        } finally {
-                            image.close()
+        val location = locationProvider()
+
+        capture.takePicture(mainExecutor, object : ImageCapture.OnImageCapturedCallback() {
+            override fun onCaptureSuccess(image: ImageProxy) {
+                scope.launch(Dispatchers.Default) {
+                    try {
+                        val binned = processor.processPixelBinning(image)
+                            ?: throw Exception("Pixel binning failed")
+                        val uri = mediaSaver.saveJpeg(binned, "IMG", location)
+                        binned.recycle()
+                        withContext(Dispatchers.Main) {
+                            if (uri != null) onSuccess(uri.toString()) else onError(Exception("Failed to save photo"))
                         }
+                    } catch (e: Exception) {
+                        Log.e(TAG, "Binned capture failed", e)
+                        withContext(Dispatchers.Main) { onError(e) }
+                    } finally {
+                        image.close()
                     }
                 }
-
-                override fun onError(exception: ImageCaptureException) {
-                    android.util.Log.e("CameraXProvider", "takePicture error: ${exception.message}", exception)
-                    onError(exception)
-                }
             }
-        )
+
+            override fun onError(exception: ImageCaptureException) {
+                Log.e(TAG, "takePicture error: ${exception.message}", exception)
+                onError(exception)
+            }
+        })
     }
 
-    private fun saveBitmapToMediaStore(bitmap: Bitmap): String {
-        val name = "CAMERA_BIN_" + SimpleDateFormat("yyyy-MM-dd-HH-mm-ss-SSS", Locale.US)
-            .format(System.currentTimeMillis())
-        val contentValues = ContentValues().apply {
-            put(MediaStore.MediaColumns.DISPLAY_NAME, name)
-            put(MediaStore.MediaColumns.MIME_TYPE, "image/jpeg")
-            if (Build.VERSION.SDK_INT > Build.VERSION_CODES.P) {
-                put(MediaStore.Images.Media.RELATIVE_PATH, "DCIM/Camera")
-            }
-        }
-
-        val uri = context.contentResolver.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, contentValues)
-            ?: return ""
-            
-        context.contentResolver.openOutputStream(uri)?.use { out ->
-            bitmap.compress(Bitmap.CompressFormat.JPEG, 95, out)
-        }
-        
-        return uri.toString()
+    private fun FlashMode.toCameraX(): Int = when (this) {
+        FlashMode.OFF -> ImageCapture.FLASH_MODE_OFF
+        FlashMode.ON -> ImageCapture.FLASH_MODE_ON
+        FlashMode.AUTO -> ImageCapture.FLASH_MODE_AUTO
     }
 
-    private fun captureBurst(count: Int, onSuccess: (String) -> Unit, onError: (Exception) -> Unit) {
-        captureSinglePhoto(onSuccess, onError)
+    private companion object {
+        const val TAG = "CameraXProvider"
+        // Panorama analysis stream (4:3). The stitched height is the long side.
+        const val PANO_ANALYSIS_W = 1600
+        const val PANO_ANALYSIS_H = 1200
+        const val DEFAULT_TAN_HALF_FOV = 0.7f // ~70 degrees across the long side
+        const val LOW_LIGHT_ENTER = 40.0 // e.g. ISO 1600 at 1/40 s
+        const val LOW_LIGHT_EXIT = 20.0
     }
 }

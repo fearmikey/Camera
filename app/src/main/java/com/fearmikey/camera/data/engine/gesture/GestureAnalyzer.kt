@@ -1,316 +1,140 @@
 package com.fearmikey.camera.data.engine.gesture
 
-import android.content.Context
 import android.graphics.Bitmap
-import android.graphics.BitmapFactory
 import android.graphics.Matrix
-import android.graphics.YuvImage
 import android.util.Log
 import androidx.camera.core.ImageAnalysis
 import androidx.camera.core.ImageProxy
 import androidx.compose.ui.geometry.Rect
-import com.google.mediapipe.framework.image.BitmapImageBuilder
-import com.google.mediapipe.framework.image.MediaImageBuilder
-import com.google.mediapipe.tasks.core.BaseOptions
-import com.google.mediapipe.tasks.core.Delegate
-import com.google.mediapipe.tasks.vision.core.ImageProcessingOptions
-import com.google.mediapipe.tasks.vision.core.RunningMode
-import com.google.mediapipe.tasks.vision.facedetector.FaceDetector
-import com.google.mediapipe.tasks.vision.handlandmarker.HandLandmarker
-import com.google.mediapipe.tasks.vision.handlandmarker.HandLandmarkerResult
-import java.util.concurrent.ExecutorService
-import java.util.concurrent.Executors
+import com.fearmikey.camera.data.engine.processing.FaceLocator
+import com.fearmikey.camera.data.engine.processing.NativeVisionBridge
 
 /**
- * Clean, production-ready GestureAnalyzer for Hand Trigger.
- * Implements frame skipping, smoothing, and state management.
+ * Palm-timer analyzer built entirely on FOSS components:
+ *  1. Android's framework face detector gates detection to frames with a person.
+ *  2. An OpenCV skin model, calibrated from that face, finds an open hand via
+ *     convexity defects between extended fingers (see `vision_jni.cpp`).
+ *
+ * Expects RGBA_8888 frames from [ImageAnalysis].
  */
 class GestureAnalyzer(
-    private val context: Context,
     private val onGestureTriggered: (GestureResult) -> Unit
 ) : ImageAnalysis.Analyzer {
 
-    companion object {
-        private const val TAG = "GestureAnalyzer"
-    }
-
-    // Sealed class for state management
-    sealed class State {
+    private sealed class State {
         object Searching : State()
         object HandDetected : State()
         object Cooldown : State()
     }
 
-    private var handLandmarker: HandLandmarker? = null
-    private var faceDetector: FaceDetector? = null
-    private val backgroundExecutor: ExecutorService = Executors.newSingleThreadExecutor()
-    private var isInitializing = false
-    
-    private var faceDetected = false
-    private var lastFaceTimestamp = 0L
-    private val faceTimeout = 2000L // Keep hand detection active for 2s after face is lost
-
     private var frameCounter = 0
-    private val frameSkip = 4 // Increased skip to 4 to process fewer frames (reduces processing overhead)
-    
     private var consecutiveDetections = 0
-    private val requiredConsecutiveFrames = 3 // Balanced sensitivity (was 2)
-    
     private var currentState: State = State.Searching
     private var lastTriggerTime = 0L
-    private val cooldownMillis = 8000L // Prevent re-triggering during/immediately after 3s timer
+    private var lastFaceBox: Rect? = null
+    private var lastFaceTimestamp = 0L
 
-    init {
-        // Deferred initialization to avoid blocking the main thread or engine binding
-    }
-
-    private fun setupHandLandmarker() {
-        if (handLandmarker != null) {
-            Log.d(TAG, "HandLandmarker already exists, skipping setup.")
-            return
-        }
-        
-        Log.d(TAG, "START: Gesture models setup (isInitializing=$isInitializing)")
-        
-        val handModelPath = "models/hand_landmarker.task"
-        val faceModelNames = listOf("models/blaze_face_short_range.tflite", "models/blaze_face_full_range.tflite", "models/face_detector.task")
-        
-        try {
-            // 1. Setup Hand Landmarker (Primary requirement)
-            val handOptions = HandLandmarker.HandLandmarkerOptions.builder()
-                .setBaseOptions(BaseOptions.builder().setModelAssetPath(handModelPath).setDelegate(Delegate.CPU).build())
-                .setMinHandDetectionConfidence(0.2f)
-                .setMinTrackingConfidence(0.2f)
-                .setMinHandPresenceConfidence(0.2f)
-                .setNumHands(1)
-                .setRunningMode(RunningMode.IMAGE)
-                .build()
-
-            Log.d(TAG, "Initializing HandLandmarker...")
-            handLandmarker = HandLandmarker.createFromOptions(context, handOptions)
-            Log.i(TAG, "SUCCESS: HandLandmarker initialized")
-
-            // 2. Setup Face Detector (Optional Gating)
-            var faceModelPath: String? = null
-            for (name in faceModelNames) {
-                try {
-                    context.assets.open(name).close()
-                    faceModelPath = name
-                    break
-                } catch (ignored: Exception) {}
-            }
-
-            if (faceModelPath != null) {
-                Log.d(TAG, "Attempting to load face model: $faceModelPath")
-                val faceOptions = FaceDetector.FaceDetectorOptions.builder()
-                    .setBaseOptions(BaseOptions.builder().setModelAssetPath(faceModelPath).setDelegate(Delegate.CPU).build())
-                    .setMinDetectionConfidence(0.4f)
-                    .setRunningMode(RunningMode.IMAGE)
-                    .build()
-                
-                faceDetector = FaceDetector.createFromOptions(context, faceOptions)
-                Log.i(TAG, "SUCCESS: FaceDetector initialized")
-            } else {
-                Log.w(TAG, "Face model not found. Gated detection disabled.")
-            }
-
-        } catch (e: Exception) {
-            Log.e(TAG, "FATAL: Gesture models setup failed: ${e.message}")
-            e.printStackTrace()
-        } finally {
-            isInitializing = false
-            Log.d(TAG, "END: Gesture models setup")
-        }
-    }
-
-    @androidx.annotation.OptIn(androidx.camera.core.ExperimentalGetImage::class)
     override fun analyze(image: ImageProxy) {
-        if (handLandmarker == null || faceDetector == null) {
-            if (!isInitializing) {
-                isInitializing = true
-                backgroundExecutor.execute { setupHandLandmarker() }
-            }
+        try {
+            processFrame(image)
+        } finally {
             image.close()
-            return
         }
+    }
 
-        // Cooldown expiration check
-        if (currentState is State.Cooldown) {
-            if (System.currentTimeMillis() - lastTriggerTime > cooldownMillis) {
+    /** Processes a frame without closing it (used by [com.fearmikey.camera.data.engine.analysis.FrameAnalysisRouter]). */
+    fun processFrame(image: ImageProxy) {
+        try {
+            if (currentState is State.Cooldown &&
+                System.currentTimeMillis() - lastTriggerTime > COOLDOWN_MS
+            ) {
                 currentState = State.Searching
             }
-        }
 
-        // Sampling check
-        frameCounter++
-        if (frameCounter % frameSkip != 0) {
-            image.close()
-            return
-        }
+            frameCounter++
+            if (frameCounter % FRAME_SKIP != 0) return
 
-        val rawBitmap = imageToBitmap(image)
-        if (rawBitmap == null) {
-            image.close()
-            return
-        }
-        val bitmap = rawBitmap.rotate(image.imageInfo.rotationDegrees.toFloat())
-        val mpImage = BitmapImageBuilder(bitmap).build()
-
-        try {
-            // 1. Run Face Detection (if available)
-            var isFaceRecentlySeen = true 
-            var faceBoundingBox: Rect? = null
-            
-            val detector = faceDetector
-            if (detector != null) {
-                try {
-                    val faceResult = detector.detect(mpImage)
-                    val detections = faceResult.detections()
-                    faceDetected = detections.isNotEmpty()
-                    if (faceDetected) {
-                        lastFaceTimestamp = System.currentTimeMillis()
-                        // Extract face bounding box
-                        val face = detections[0].boundingBox()
-                        faceBoundingBox = Rect(
-                            face.left / mpImage.width,
-                            face.top / mpImage.height,
-                            face.right / mpImage.width,
-                            face.bottom / mpImage.height
-                        )
-                    }
-                    isFaceRecentlySeen = (System.currentTimeMillis() - lastFaceTimestamp) < faceTimeout
-                } catch (e: Exception) {
-                    if (frameCounter % 100 == 0) Log.w(TAG, "Face detection failed: ${e.message}")
-                }
+            val frame = image.toUprightSmallBitmap() ?: return
+            try {
+                process(frame)
+            } finally {
+                frame.recycle()
             }
-
-            // 2. Only run Hand Detection if a face is recently seen
-            if (isFaceRecentlySeen) {
-                val handResult = handLandmarker?.detect(mpImage)
-                if (handResult != null) {
-                    processResult(handResult, faceBoundingBox)
-                }
-            } else {
-                onGestureTriggered(GestureResult(null, null, false))
-            }
-        } catch (error: Exception) {
-            Log.e(TAG, "Analysis failed: ${error.message}")
-        } finally {
-            image.close()
+        } catch (e: Exception) {
+            Log.e(TAG, "Analysis failed: ${e.message}")
         }
     }
 
-    private fun imageToBitmap(image: ImageProxy): Bitmap? {
-        return try {
-            if (image.format == android.graphics.ImageFormat.JPEG) {
-                val buffer = image.planes[0].buffer
-                val bytes = ByteArray(buffer.remaining())
-                buffer.get(bytes)
-                BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
-            } else {
-                val yBuffer = image.planes[0].buffer
-                val uBuffer = image.planes[1].buffer
-                val vBuffer = image.planes[2].buffer
-
-                val ySize = yBuffer.remaining()
-                val uSize = uBuffer.remaining()
-                val vSize = vBuffer.remaining()
-
-                val nv21 = ByteArray(ySize + uSize + vSize)
-
-                yBuffer.get(nv21, 0, ySize)
-                vBuffer.get(nv21, ySize, vSize)
-                uBuffer.get(nv21, ySize + vSize, uSize)
-
-                val yuvImage = YuvImage(nv21, android.graphics.ImageFormat.NV21, image.width, image.height, null)
-                val out = java.io.ByteArrayOutputStream()
-                yuvImage.compressToJpeg(android.graphics.Rect(0, 0, image.width, image.height), 100, out)
-                val imageBytes = out.toByteArray()
-                BitmapFactory.decodeByteArray(imageBytes, 0, imageBytes.size)
-            }
-        } catch (ignored: Exception) {
-            null
+    private fun process(frame: Bitmap) {
+        val now = System.currentTimeMillis()
+        val face = FaceLocator.findLargestFace(frame)
+        if (face != null) {
+            lastFaceBox = Rect(face.left, face.top, face.right, face.bottom)
+            lastFaceTimestamp = now
+        } else if (now - lastFaceTimestamp > FACE_TIMEOUT_MS) {
+            lastFaceBox = null
         }
-    }
 
-    private fun Bitmap.rotate(degrees: Float): Bitmap {
-        if (degrees == 0f) return this
-        val matrix = Matrix().apply { postRotate(degrees) }
-        return Bitmap.createBitmap(this, 0, 0, width, height, matrix, true)
-    }
-
-    private fun processResult(result: HandLandmarkerResult, faceBox: Rect?) {
-        val landmarks = result.landmarks()
-        
-        if (landmarks.isNotEmpty()) {
-            val hand = landmarks[0]
-            val wrist = hand[0]
-            
-            var minX = 1f
-            var maxX = 0f
-            var minY = 1f
-            var maxY = 0f
-            for (landmark in hand) {
-                minX = minX.coerceAtMost(landmark.x())
-                maxX = maxX.coerceAtLeast(landmark.x())
-                minY = minY.coerceAtMost(landmark.y())
-                maxY = maxY.coerceAtLeast(landmark.y())
-            }
-            val handBoundingBox = Rect(minX, minY, maxX, maxY)
-
-            val middleFingerTip = hand[12]
-            val handSize = Math.sqrt(
-                Math.pow((wrist.x() - middleFingerTip.x()).toDouble(), 2.0) +
-                Math.pow((wrist.y() - middleFingerTip.y()).toDouble(), 2.0)
-            )
-
-            val isUpright = middleFingerTip.y() < wrist.y() 
-            val isCloseEnough = handSize > 0.12 
-            val isCentered = wrist.x() in 0.1f..0.9f
-
-            if (isUpright && isCloseEnough && isCentered) {
-                consecutiveDetections++
-                if (currentState !is State.HandDetected && currentState !is State.Cooldown) {
-                    currentState = State.HandDetected
-                }
-                
-                if (consecutiveDetections >= requiredConsecutiveFrames && currentState !is State.Cooldown) {
-                    triggerGesture(handBoundingBox, faceBox)
-                } else {
-                    onGestureTriggered(GestureResult(handBoundingBox, faceBox, false))
-                }
-            } else {
-                consecutiveDetections = 0
-                if (currentState is State.HandDetected) {
-                    currentState = State.Searching
-                }
-                onGestureTriggered(GestureResult(null, faceBox, false))
-            }
-        } else {
+        val faceBox = lastFaceBox
+        if (faceBox == null) {
             consecutiveDetections = 0
-            onGestureTriggered(GestureResult(null, faceBox, false))
+            onGestureTriggered(GestureResult(null, null, false))
+            return
         }
-    }
 
-    private fun triggerGesture(handBox: Rect, faceBox: Rect?) {
-        if (currentState != State.Cooldown) {
+        val palm = NativeVisionBridge.nativeDetectOpenPalm(
+            frame, faceBox.left, faceBox.top, faceBox.right, faceBox.bottom
+        )
+        if (palm == null) {
+            consecutiveDetections = 0
+            if (currentState is State.HandDetected) currentState = State.Searching
+            onGestureTriggered(GestureResult(null, face?.let { faceBox }, false))
+            return
+        }
+
+        val handBox = Rect(palm[0], palm[1], palm[2], palm[3])
+        consecutiveDetections++
+        if (currentState is State.Searching) currentState = State.HandDetected
+
+        if (consecutiveDetections >= REQUIRED_CONSECUTIVE && currentState !is State.Cooldown) {
             currentState = State.Cooldown
-            lastTriggerTime = System.currentTimeMillis()
+            lastTriggerTime = now
             consecutiveDetections = 0
             onGestureTriggered(GestureResult(handBox, faceBox, true))
+        } else {
+            onGestureTriggered(GestureResult(handBox, faceBox, false))
         }
+    }
+
+    /** Converts the frame to an upright ARGB_8888 bitmap no larger than [ANALYSIS_MAX_SIDE]. */
+    private fun ImageProxy.toUprightSmallBitmap(): Bitmap? {
+        val raw = try {
+            toBitmap()
+        } catch (e: Exception) {
+            return null
+        }
+        val rotation = imageInfo.rotationDegrees
+        val scale = (ANALYSIS_MAX_SIDE.toFloat() / maxOf(raw.width, raw.height)).coerceAtMost(1f)
+        if (rotation == 0 && scale == 1f) return raw
+        val matrix = Matrix().apply {
+            postScale(scale, scale)
+            postRotate(rotation.toFloat())
+        }
+        val out = Bitmap.createBitmap(raw, 0, 0, raw.width, raw.height, matrix, true)
+        if (out !== raw) raw.recycle()
+        return if (out.config == Bitmap.Config.ARGB_8888) out else out.copy(Bitmap.Config.ARGB_8888, false).also { out.recycle() }
     }
 
     fun close() {
-        try {
-            backgroundExecutor.execute {
-                handLandmarker?.close()
-                faceDetector?.close()
-                handLandmarker = null
-                faceDetector = null
-            }
-            backgroundExecutor.shutdown()
-        } catch (ignored: Exception) {}
+        // Nothing to release: no native models are held.
+    }
+
+    private companion object {
+        const val TAG = "GestureAnalyzer"
+        const val FRAME_SKIP = 3
+        const val REQUIRED_CONSECUTIVE = 3
+        const val COOLDOWN_MS = 8000L // Prevent re-triggering during/after the 3s timer
+        const val FACE_TIMEOUT_MS = 2000L
+        const val ANALYSIS_MAX_SIDE = 320
     }
 }
-

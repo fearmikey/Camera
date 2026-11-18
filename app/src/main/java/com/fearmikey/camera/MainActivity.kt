@@ -27,6 +27,7 @@ import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.BiasAlignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.graphicsLayer
@@ -40,8 +41,22 @@ import androidx.compose.ui.platform.LocalLifecycleOwner
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.core.content.ContextCompat
-import coil.compose.AsyncImage
+import androidx.compose.foundation.Image
+import androidx.compose.ui.graphics.asImageBitmap
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.lifecycleScope
+import androidx.lifecycle.repeatOnLifecycle
+import android.view.OrientationEventListener
+import android.view.Surface
+import com.fearmikey.camera.data.repository.DeviceLocationProvider
+import com.fearmikey.camera.data.repository.MediaSaver
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.flow.distinctUntilChanged
+import kotlinx.coroutines.flow.map
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import com.fearmikey.camera.domain.model.CameraMode
+import com.fearmikey.camera.domain.model.CameraModes
 import com.fearmikey.camera.domain.model.FlashMode
 import com.fearmikey.camera.domain.model.CaptureType
 import com.fearmikey.camera.domain.model.ResolutionMode
@@ -64,11 +79,15 @@ import com.fearmikey.camera.ui.camera.CameraUiState
 import com.fearmikey.camera.ui.camera.FocusState
 import com.fearmikey.camera.ui.camera.ProControlOverlay
 import com.fearmikey.camera.ui.camera.HudOverlay
+import com.fearmikey.camera.ui.camera.CameraTopBar
+import com.fearmikey.camera.ui.camera.ExposureSlider
+import com.fearmikey.camera.ui.camera.PermissionRequiredScreen
+import com.fearmikey.camera.ui.camera.CameraAccent
+import com.fearmikey.camera.ui.camera.formatZoom
 import com.fearmikey.camera.data.engine.CameraXProvider
 import com.fearmikey.camera.data.engine.Camera2Provider
 import com.fearmikey.camera.data.engine.HybridCaptureEngine
 import com.fearmikey.camera.data.engine.processing.ImageProcessor
-import com.fearmikey.camera.data.engine.processing.PortraitSegmenter
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.foundation.lazy.LazyRow
@@ -94,10 +113,42 @@ import kotlin.math.abs
 
 class MainActivity : ComponentActivity() {
     private lateinit var viewModel: CameraViewModel
+    private lateinit var locationProvider: DeviceLocationProvider
     private var isSecureCamera = false
 
+    /** Feeds device rotation to the engine so captures are upright while the UI stays portrait. */
+    private val orientationListener by lazy {
+        object : OrientationEventListener(this) {
+            override fun onOrientationChanged(orientation: Int) {
+                if (orientation == ORIENTATION_UNKNOWN || !::viewModel.isInitialized) return
+                val rotation = when (orientation) {
+                    in 45 until 135 -> Surface.ROTATION_270
+                    in 135 until 225 -> Surface.ROTATION_180
+                    in 225 until 315 -> Surface.ROTATION_90
+                    else -> Surface.ROTATION_0
+                }
+                viewModel.setDeviceRotation(rotation)
+            }
+        }
+    }
+
+    private val locationPermissionLauncher = registerForActivityResult(
+        ActivityResultContracts.RequestMultiplePermissions()
+    ) { result ->
+        if (result.values.any { it }) {
+            locationProvider.start()
+        } else if (viewModel.uiState.value.userPreferences.locationTagging) {
+            // Permission refused: turn the setting back off so the UI stays truthful.
+            viewModel.toggleLocationTagging()
+        }
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
-        enableEdgeToEdge()
+        // The camera UI is always dark, so keep light system-bar icons regardless of system theme.
+        enableEdgeToEdge(
+            statusBarStyle = androidx.activity.SystemBarStyle.dark(android.graphics.Color.TRANSPARENT),
+            navigationBarStyle = androidx.activity.SystemBarStyle.dark(android.graphics.Color.TRANSPARENT),
+        )
         super.onCreate(savedInstanceState)
         
         if ((intent.action == MediaStore.INTENT_ACTION_STILL_IMAGE_CAMERA) ||
@@ -108,9 +159,18 @@ class MainActivity : ComponentActivity() {
             isSecureCamera = true
         }
         
-        val processor = ImageProcessor(this, PortraitSegmenter(this))
-        val cameraXProvider = CameraXProvider(this, processor)
-        val camera2Provider = Camera2Provider(this, processor)
+        locationProvider = DeviceLocationProvider(this)
+        val geotag: () -> android.location.Location? = {
+            if (::viewModel.isInitialized && viewModel.uiState.value.userPreferences.locationTagging) {
+                locationProvider.currentLocation()
+            } else {
+                null
+            }
+        }
+        val processor = ImageProcessor(this)
+        val mediaSaver = MediaSaver(this)
+        val cameraXProvider = CameraXProvider(this, processor, mediaSaver, geotag)
+        val camera2Provider = Camera2Provider(this, processor, mediaSaver, geotag)
         val hybridCaptureEngine = HybridCaptureEngine(cameraXProvider, camera2Provider)
         val mediaRepository = MediaRepository(this)
         val userPreferencesRepository = UserPreferencesRepository(this)
@@ -118,9 +178,10 @@ class MainActivity : ComponentActivity() {
 
         val sensorManager = getSystemService(SENSOR_SERVICE) as SensorManager
         viewModel.initSensors(sensorManager)
+        observeLocationSetting()
 
         setContent {
-            MaterialTheme(colorScheme = darkColorScheme()) {
+            com.fearmikey.camera.ui.theme.ViewfinderTheme {
                 Surface(
                     modifier = Modifier.fillMaxSize(),
                     color = Color.Black,
@@ -132,13 +193,29 @@ class MainActivity : ComponentActivity() {
     }
 
     override fun onKeyDown(keyCode: Int, event: KeyEvent?): Boolean {
-        if (::viewModel.isInitialized && viewModel.uiState.value.userPreferences.volumeKeyShutter) {
-            if (keyCode == KeyEvent.KEYCODE_VOLUME_DOWN || keyCode == KeyEvent.KEYCODE_VOLUME_UP) {
-                viewModel.toggleCapture()
-                return true
-            }
+        if (::viewModel.isInitialized &&
+            (keyCode == KeyEvent.KEYCODE_VOLUME_DOWN || keyCode == KeyEvent.KEYCODE_VOLUME_UP)
+        ) {
+            // Ignore auto-repeat so holding the key doesn't fire a burst of shots.
+            if ((event?.repeatCount ?: 0) > 0 &&
+                viewModel.uiState.value.userPreferences.volumeKeyAction == com.fearmikey.camera.domain.model.VolumeKeyAction.SHUTTER
+            ) return true
+            if (viewModel.onVolumeKey(up = keyCode == KeyEvent.KEYCODE_VOLUME_UP)) return true
         }
         return super.onKeyDown(keyCode, event)
+    }
+
+    override fun onResume() {
+        super.onResume()
+        viewModel.onResume()
+        orientationListener.enable()
+    }
+
+    override fun onPause() {
+        viewModel.onPause()
+        orientationListener.disable()
+        locationProvider.stop()
+        super.onPause()
     }
 
     override fun onStop() {
@@ -146,6 +223,86 @@ class MainActivity : ComponentActivity() {
         if (isSecureCamera) {
             finish()
         }
+    }
+
+    /** Starts/stops location updates while resumed, requesting permission when the setting is enabled. */
+    private fun observeLocationSetting() {
+        lifecycleScope.launch {
+            repeatOnLifecycle(Lifecycle.State.RESUMED) {
+                viewModel.uiState
+                    .map { it.userPreferences.locationTagging }
+                    .distinctUntilChanged()
+                    .collect { enabled ->
+                        when {
+                            !enabled -> locationProvider.stop()
+                            locationProvider.hasPermission() -> locationProvider.start()
+                            else -> locationPermissionLauncher.launch(
+                                arrayOf(
+                                    Manifest.permission.ACCESS_FINE_LOCATION,
+                                    Manifest.permission.ACCESS_COARSE_LOCATION,
+                                )
+                            )
+                        }
+                    }
+            }
+        }
+    }
+}
+
+/** Layout check: top bar + bottom controls over a placeholder viewfinder (phone size). */
+@androidx.compose.ui.tooling.preview.Preview(name = "Camera layout", widthDp = 393, heightDp = 852, showSystemUi = true)
+@Composable
+private fun CameraLayoutPreview() {
+    com.fearmikey.camera.ui.theme.ViewfinderTheme {
+        Box(Modifier.fillMaxSize().background(Color.Black)) {
+            // 4:3 viewfinder placement as in CameraPreview (directly below the top bar)
+            Box(
+                Modifier
+                    .padding(top = 28.dp + com.fearmikey.camera.ui.camera.TopBarHeight)
+                    .fillMaxWidth()
+                    .aspectRatio(3f / 4f)
+                    .background(Color(0xFF556B55))
+            )
+            CameraTopBar(
+                rotation = 0, showResolution = true, isFullResolution = false, showFlash = true,
+                flashLabel = "Off", flashIcon = Icons.Default.FlashOff, flashActive = false,
+                timerSeconds = 0, macroOn = false,
+                onResolutionClick = {}, onFlashClick = {}, onTimerClick = {},
+                modifier = Modifier.align(Alignment.TopCenter).padding(top = 28.dp, start = 12.dp, end = 12.dp)
+            )
+            CameraControls(
+                modifier = Modifier.align(Alignment.BottomCenter).padding(bottom = 24.dp),
+                currentMode = CameraMode.PHOTO,
+                captureType = CaptureType.PHOTO,
+                isRecording = false, isPaused = false, isProcessing = false, isPanoramaCapturing = false,
+                captureProgress = 0f, recordingDuration = "00:00", lastCapturedUri = null,
+                orientation = 0, zoomLevel = 1f, zoomPresets = listOf(0.6f, 1f, 2f, 5f),
+                onZoomChanged = {}, onModeSelected = {}, onCapture = {}, onPause = {}, onResume = {},
+                onVideoSnapshot = {}, onQuickTakeStart = {}, onQuickTakeStop = {}, onThumbnailClick = {},
+                onFlipCamera = {}, onTypeSelected = {}, onSettingsClick = {}
+            )
+        }
+    }
+}
+
+/** Thumbnail of the most recent capture, loaded with the platform thumbnail API. */
+@Composable
+fun MediaThumbnail(uri: android.net.Uri, modifier: Modifier = Modifier) {
+    val context = LocalContext.current
+    val thumbnail by produceState<androidx.compose.ui.graphics.ImageBitmap?>(initialValue = null, uri) {
+        value = withContext(Dispatchers.IO) {
+            runCatching {
+                context.contentResolver.loadThumbnail(uri, android.util.Size(192, 192), null).asImageBitmap()
+            }.getOrNull()
+        }
+    }
+    thumbnail?.let {
+        Image(
+            bitmap = it,
+            contentDescription = "Last captured media",
+            modifier = modifier,
+            contentScale = ContentScale.Crop,
+        )
     }
 }
 
@@ -172,14 +329,17 @@ fun CameraScreen(
     }
 
     val launcher = rememberLauncherForActivityResult(
-        contract = ActivityResultContracts.RequestPermission()
-    ) { granted ->
-        hasCameraPermission = granted
+        contract = ActivityResultContracts.RequestMultiplePermissions()
+    ) { result ->
+        hasCameraPermission = result[Manifest.permission.CAMERA] ?: hasCameraPermission
     }
 
     LaunchedEffect(key1 = true) {
-        if (!hasCameraPermission) {
-            launcher.launch(Manifest.permission.CAMERA)
+        val needed = listOf(Manifest.permission.CAMERA, Manifest.permission.RECORD_AUDIO).filter {
+            ContextCompat.checkSelfPermission(context, it) != PackageManager.PERMISSION_GRANTED
+        }
+        if (needed.isNotEmpty()) {
+            launcher.launch(needed.toTypedArray())
         }
     }
 
@@ -198,14 +358,30 @@ fun CameraScreen(
                 gestureFlow = viewModel.gestureState,
                 onZoomChanged = { viewModel.setZoom(it) },
                 onFocusAt = { x, y -> viewModel.focusAt(x, y) },
+                exposureIndex = uiState.exposureIndex,
+                exposureRange = uiState.capabilities?.exposureRange?.let { it.lower..it.upper } ?: 0..0,
+                exposureStep = uiState.capabilities?.exposureStep ?: 0f,
+                onExposureChange = { viewModel.setExposureIndex(it) },
+                onDoubleTap = { if (uiState.userPreferences.doubleTapSwitch) viewModel.toggleCamera() },
+                viewfinderOverlay = {
+                    if (uiState.currentMode == CameraMode.PANORAMA) {
+                        com.fearmikey.camera.ui.camera.PanoramaViewfinderGuide(
+                            progress = uiState.panoramaProgress,
+                            capturing = uiState.isPanoramaCapturing,
+                            showIdleHint = uiState.backgroundTaskMessage == null,
+                            // The corner preview hangs into the viewfinder (strip top is 8dp under
+                            // the status bar, the viewfinder starts under the top bar).
+                            pillTop = (8.dp + com.fearmikey.camera.ui.camera.PanoramaStripHeight + 12.dp -
+                                com.fearmikey.camera.ui.camera.TopBarHeight).coerceAtLeast(20.dp),
+                        )
+                    }
+                },
                 onBindToLifecycle = { owner, provider, factoryProvider -> 
                     viewModel.bindToLifecycle(owner, provider, factoryProvider) 
                 },
                 onModeSwiped = { direction ->
-                    val photoModes = listOf(CameraMode.PORTRAIT, CameraMode.PHOTO, CameraMode.NIGHT_SIGHT, CameraMode.PANORAMA)
-                    val videoModes = listOf(CameraMode.VIDEO, CameraMode.SLOW_MO)
-                    val modes = if (uiState.captureType == CaptureType.PHOTO) photoModes else videoModes
-                    
+                    val modes = if (uiState.captureType == CaptureType.PHOTO) CameraModes.photo else CameraModes.video
+
                     val currentIndex = modes.indexOf(uiState.currentMode)
                     val nextIndex = if (direction > 0) {
                         (currentIndex - 1).coerceAtLeast(0)
@@ -219,118 +395,50 @@ fun CameraScreen(
                 }
             )
 
-            // Top Bar Icons
-            Box(
+            val prefs = uiState.userPreferences
+            val isPhoto = uiState.captureType == CaptureType.PHOTO
+            // Flash/torch exists only on the rear camera; Night/HDR/Panorama never fire it.
+            val flashSupportedHere = !uiState.isFrontCamera && uiState.currentMode !in setOf(
+                CameraMode.NIGHT_SIGHT, CameraMode.HDR, CameraMode.PANORAMA, CameraMode.SLOW_MO,
+                CameraMode.TIME_LAPSE, CameraMode.LONG_EXPOSURE
+            ) && !(uiState.currentMode == CameraMode.PHOTO && prefs.hdrPhoto)
+            CameraTopBar(
+                rotation = orientation,
+                showResolution = isPhoto && !uiState.isFrontCamera && uiState.currentMode == CameraMode.PHOTO,
+                isFullResolution = prefs.resolution == ResolutionMode.MP_50,
+                showFlash = flashSupportedHere,
+                flashLabel = prefs.lightMode.label,
+                flashIcon = when (prefs.lightMode) {
+                    LightMode.AUTO_NIGHT_SIGHT -> Icons.Default.FlashAuto
+                    LightMode.FLASH -> Icons.Default.FlashOn
+                    LightMode.NONE -> Icons.Default.FlashOff
+                },
+                flashActive = prefs.lightMode == LightMode.FLASH,
+                timerSeconds = if (isPhoto) prefs.timer.seconds else 0,
+                macroOn = prefs.macroFocus == com.fearmikey.camera.domain.model.MacroMode.ON && !uiState.isFrontCamera,
+                onResolutionClick = {
+                    viewModel.updateResolution(
+                        if (prefs.resolution == ResolutionMode.MP_12) ResolutionMode.MP_50 else ResolutionMode.MP_12
+                    )
+                    haptic.performHapticFeedback(HapticFeedbackType.LongPress)
+                },
+                onFlashClick = { viewModel.cycleFlash() },
+                onTimerClick = { viewModel.setShowSettingsSheet(true) },
                 modifier = Modifier
-                    .fillMaxWidth()
-                    .padding(top = systemBarsPadding.calculateTopPadding() + 8.dp, start = 20.dp, end = 20.dp)
                     .align(Alignment.TopCenter)
-            ) {
-                Row(
-                    modifier = Modifier.align(Alignment.CenterStart),
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    // Resolution indicator (Hidden for Front Camera)
-                    if (!uiState.isFrontCamera) {
-                        Box(
-                            modifier = Modifier
-                                .size(34.dp)
-                                .clip(androidx.compose.foundation.shape.RoundedCornerShape(8.dp))
-                                .background(Color.Black.copy(alpha = 0.2f))
-                                .border(1.dp, Color.White.copy(alpha = 0.8f), androidx.compose.foundation.shape.RoundedCornerShape(8.dp))
-                                .clickable { 
-                                    val nextRes = if (uiState.userPreferences.resolution == ResolutionMode.MP_12) 
-                                        ResolutionMode.MP_50 else ResolutionMode.MP_12
-                                    viewModel.updateResolution(nextRes)
-                                    haptic.performHapticFeedback(HapticFeedbackType.LongPress)
-                                },
-                            contentAlignment = Alignment.Center
-                        ) {
-                            Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                                Text(
-                                    text = if (uiState.userPreferences.resolution == ResolutionMode.MP_12) "12" else "50",
-                                    color = Color.White,
-                                    style = MaterialTheme.typography.labelSmall.copy(fontSize = 11.sp),
-                                    fontWeight = FontWeight.Bold,
-                                    lineHeight = 11.sp
-                                )
-                                Text(
-                                    "MP",
-                                    color = Color.White,
-                                    style = MaterialTheme.typography.labelSmall.copy(fontSize = 8.sp),
-                                    fontWeight = FontWeight.Bold,
-                                    lineHeight = 8.sp
-                                )
-                            }
-                        }
+                    .padding(top = systemBarsPadding.calculateTopPadding(), start = 12.dp, end = 12.dp)
+                    .alpha(if (uiState.isPanoramaCapturing) 0f else 1f)
+            )
 
-                        Spacer(modifier = Modifier.width(16.dp))
-                    }
-
-                    // Macro Indicator
-                    if (!uiState.isFrontCamera) {
-                        Box(contentAlignment = Alignment.Center) {
-                            Icon(
-                                imageVector = Icons.Default.LocalFlorist,
-                                contentDescription = "Macro",
-                                tint = Color.White,
-                                modifier = Modifier.size(22.dp)
-                            )
-                            Text(
-                                "A",
-                                color = Color.White,
-                                style = MaterialTheme.typography.labelSmall.copy(
-                                    fontSize = 7.sp,
-                                    fontWeight = FontWeight.Black
-                                ),
-                                modifier = Modifier.padding(top = 1.dp)
-                            )
-                        }
-
-                        Spacer(modifier = Modifier.width(16.dp))
-                    }
-
-                    // Light Mode Indicator
-                    if (uiState.userPreferences.lightMode != LightMode.NONE) {
-                        val icon = when (uiState.userPreferences.lightMode) {
-                            LightMode.AUTO_NIGHT_SIGHT -> Icons.Default.AutoMode
-                            LightMode.FLASH -> Icons.Default.FlashOn
-                            else -> Icons.Default.Block
-                        }
-                        Icon(
-                            imageVector = icon,
-                            contentDescription = "Light Mode",
-                            tint = if (uiState.userPreferences.lightMode == LightMode.FLASH) Color.Yellow else Color.White,
-                            modifier = Modifier.size(22.dp).clickable { viewModel.setShowSettingsSheet(true) }
-                        )
-                    }
-                }
-
-                // Top Right Flip Camera (Shortcut)
-                IconButton(
-                    onClick = { /* Flip shortcut */ },
-                    modifier = Modifier.align(Alignment.CenterEnd).size(36.dp)
-                ) {
-                    Box(contentAlignment = Alignment.Center) {
-                        Icon(
-                            imageVector = Icons.Default.FlipCameraAndroid,
-                            contentDescription = "Flip Camera",
-                            tint = Color.White,
-                            modifier = Modifier.size(26.dp)
-                        )
-                    }
-                }
-            }
-
-            // UI Overlays
+            // Manual controls sit below the top bar so they never cover the shutter.
             if (uiState.isProMode) {
                 ProControlOverlay(
                     uiState = uiState,
                     onConfigChange = { viewModel.updateProConfig(it) },
+                    onReset = { viewModel.resetProConfig() },
                     modifier = Modifier
-                        .align(Alignment.CenterEnd)
-                        .width(250.dp)
-                        .fillMaxHeight()
+                        .align(Alignment.TopCenter)
+                        .padding(top = systemBarsPadding.calculateTopPadding() + com.fearmikey.camera.ui.camera.TopBarHeight + 8.dp, start = 12.dp, end = 12.dp)
                 )
             }
 
@@ -364,15 +472,23 @@ fun CameraScreen(
                 onQuickTakeStart = { viewModel.quickTakeStart() },
                 onQuickTakeStop = { viewModel.quickTakeStop() },
                 onThumbnailClick = {
-                    val intent = Intent(Intent.ACTION_VIEW).apply {
-                        type = "image/*"
-                        flags = Intent.FLAG_ACTIVITY_NEW_TASK
+                    uiState.lastCapturedUri?.let { uri ->
+                        val intent = Intent(Intent.ACTION_VIEW).apply {
+                            setDataAndType(uri, context.contentResolver.getType(uri) ?: "image/*")
+                            addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                        }
+                        try {
+                            context.startActivity(intent)
+                        } catch (e: android.content.ActivityNotFoundException) {
+                            android.widget.Toast.makeText(context, "No gallery app installed", android.widget.Toast.LENGTH_SHORT).show()
+                        }
                     }
-                    context.startActivity(intent)
                 },
                 onFlipCamera = { viewModel.toggleCamera() },
                 onTypeSelected = { viewModel.setCaptureType(it) },
-                onSettingsClick = { viewModel.setShowSettingsSheet(true) }
+                onSettingsClick = { viewModel.setShowSettingsSheet(true) },
+                onProControlsClick = { viewModel.toggleProMode() },
+                isProMode = uiState.isProMode,
             )
 
             if (uiState.showSettingsSheet) {
@@ -385,15 +501,16 @@ fun CameraScreen(
                     onTimerChange = { viewModel.updateTimer(it) },
                     onLightModeChange = { viewModel.updateLightMode(it) },
                     onMacroFocusChange = { viewModel.updateMacroFocus(it) },
-                    onTopShotToggle = { viewModel.updateTopShot(it) },
-                    onMotionPhotoChange = { viewModel.updateMotionPhoto(it) },
                     onResolutionChange = { viewModel.updateResolution(it) },
                     onSaveModeChange = { viewModel.updateSaveMode(it) },
-                    onLensSelectionChange = { viewModel.updateLensSelection(it) },
+                    onVideoResolutionChange = { viewModel.updateVideoResolution(it) },
+                    onVideoStabilizationToggle = { viewModel.toggleVideoStabilization() },
+                    onVideoFrameRateChange = { viewModel.updateVideoFrameRate(it) },
+                    onHdrToggle = { viewModel.updateHdrPhoto(it) },
+                    onRecordAudioToggle = { viewModel.updateRecordAudio(it) },
                     onGridLinesToggle = { viewModel.toggleGridLines() },
                     onLevelerToggle = { viewModel.toggleLeveler() },
                     onLocationTaggingToggle = { viewModel.toggleLocationTagging() },
-                    onVolumeKeyShutterToggle = { viewModel.toggleVolumeKeyShutter() },
                     onFullSettingsClick = { 
                         context.startActivity(Intent(context, SettingsActivity::class.java))
                     }
@@ -409,7 +526,12 @@ fun CameraScreen(
                 }
             }
 
-            if (uiState.isProcessing) {
+            // Full-screen progress only for the slow multi-frame pipelines; quick photos
+            // just show a spinner on the thumbnail so the camera stays usable.
+            val slowPipeline = uiState.currentMode in setOf(
+                CameraMode.NIGHT_SIGHT, CameraMode.HDR, CameraMode.PORTRAIT, CameraMode.LONG_EXPOSURE
+            ) || (uiState.currentMode == CameraMode.PHOTO && prefs.hdrPhoto && !uiState.isFrontCamera)
+            if (uiState.isProcessing && slowPipeline) {
                 Box(
                     modifier = Modifier
                         .fillMaxSize()
@@ -417,11 +539,13 @@ fun CameraScreen(
                     contentAlignment = Alignment.Center
                 ) {
                     Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                        CircularProgressIndicator(color = Color.Yellow)
+                        CircularProgressIndicator(color = CameraAccent)
                         Spacer(modifier = Modifier.height(8.dp))
                         val processingText = when (uiState.currentMode) {
-                            CameraMode.HDR -> "HDR Processing..."
-                            CameraMode.NIGHT_SIGHT -> "Processing Night Sight..."
+                            CameraMode.HDR, CameraMode.PHOTO -> "Merging HDR exposures..."
+                            CameraMode.NIGHT_SIGHT -> "Hold still... merging night shot"
+                            CameraMode.LONG_EXPOSURE -> "Hold still... capturing long exposure"
+                            CameraMode.PORTRAIT -> "Blurring background..."
                             CameraMode.PANORAMA -> "Stitching Panorama..."
                             else -> "Processing..."
                         }
@@ -430,15 +554,53 @@ fun CameraScreen(
                 }
             }
 
+            // Suggestions under the top bar (QR code, low light).
+            if (!uiState.isProMode && !uiState.isRecording) {
+                com.fearmikey.camera.ui.camera.SuggestionChips(
+                    qrCode = uiState.qrCode,
+                    showNightSuggestion = uiState.lowLightSuggested && uiState.currentMode == CameraMode.PHOTO,
+                    onQrClick = { text ->
+                        com.fearmikey.camera.ui.camera.openQrPayload(context, text)
+                        viewModel.dismissQrCode()
+                    },
+                    onQrDismiss = { viewModel.dismissQrCode() },
+                    onNightClick = { viewModel.acceptNightSuggestion() },
+                    onNightDismiss = { viewModel.dismissNightSuggestion() },
+                    modifier = Modifier
+                        .align(Alignment.TopCenter)
+                        .padding(top = systemBarsPadding.calculateTopPadding() + com.fearmikey.camera.ui.camera.TopBarHeight + 8.dp)
+                )
+            }
+
+            // Camera2-recorded modes can't feed the CameraX preview while recording.
+            if (uiState.isRecording && CameraModes.isCamera2Video(uiState.currentMode)) {
+                Box(Modifier.fillMaxSize().background(Color.Black.copy(alpha = 0.55f)), contentAlignment = Alignment.Center) {
+                    Text(
+                        if (uiState.currentMode == CameraMode.TIME_LAPSE) "Recording time lapse\nKeep the phone steady"
+                        else "Recording slow motion",
+                        color = Color.White,
+                        textAlign = androidx.compose.ui.text.style.TextAlign.Center,
+                        style = MaterialTheme.typography.titleMedium
+                    )
+                }
+            }
+
             uiState.timerCountdown?.let { countdown ->
                 TimerCountdownOverlay(countdown = countdown)
             }
 
-            if (uiState.isPanoramaCapturing) {
-                PanoramaGuideOverlay(
-                    state = uiState,
-                    modifier = Modifier.fillMaxSize(),
-                )
+            // Panorama corner preview: live view before the sweep, growing mosaic during it.
+            // Leftward sweeps grow from the right corner, rightward ones from the left.
+            val panoramaProgress = uiState.panoramaProgress
+            if (uiState.currentMode == CameraMode.PANORAMA && panoramaProgress?.preview != null) {
+                Box(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(top = systemBarsPadding.calculateTopPadding() + 8.dp, start = 12.dp, end = 12.dp),
+                    contentAlignment = if (panoramaProgress.direction > 0) Alignment.TopStart else Alignment.TopEnd
+                ) {
+                    com.fearmikey.camera.ui.camera.PanoramaStrip(panoramaProgress)
+                }
             }
 
             // Background Task Indicator (Top Center)
@@ -462,7 +624,7 @@ fun CameraScreen(
                                 CircularProgressIndicator(
                                     modifier = Modifier.size(18.dp),
                                     strokeWidth = 2.dp,
-                                    color = Color.Yellow
+                                    color = CameraAccent
                                 )
                                 Spacer(modifier = Modifier.width(12.dp))
                             }
@@ -477,9 +639,9 @@ fun CameraScreen(
             }
         }
     } else {
-        Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
-            Text("Camera permission required", color = Color.White)
-        }
+        PermissionRequiredScreen(
+            onRequest = { launcher.launch(arrayOf(Manifest.permission.CAMERA, Manifest.permission.RECORD_AUDIO)) }
+        )
     }
 }
 
@@ -498,12 +660,25 @@ fun CameraPreview(
     onZoomChanged: (Float) -> Unit,
     onFocusAt: (Float, Float) -> Unit,
     onBindToLifecycle: (androidx.lifecycle.LifecycleOwner, androidx.camera.core.Preview.SurfaceProvider, () -> androidx.camera.core.MeteringPointFactory?) -> Unit,
-    onModeSwiped: (Float) -> Unit = {}
+    onModeSwiped: (Float) -> Unit = {},
+    exposureIndex: Int = 0,
+    exposureRange: IntRange = 0..0,
+    exposureStep: Float = 0f,
+    onExposureChange: (Int) -> Unit = {},
+    onDoubleTap: () -> Unit = {},
+    /** Drawn on top of the viewfinder, sized and centred to it (e.g. the panorama guide). */
+    viewfinderOverlay: @Composable androidx.compose.foundation.layout.BoxScope.() -> Unit = {},
 ) {
     val lifecycleOwner = LocalLifecycleOwner.current
-    
-    var currentScale by remember(zoomLevel) { mutableFloatStateOf(zoomLevel) }
+
+    // Gesture lambdas live across recompositions, so read the latest values through state.
+    val latestZoom by rememberUpdatedState(zoomLevel)
+    val latestOnZoom by rememberUpdatedState(onZoomChanged)
+    val latestOnSwipe by rememberUpdatedState(onModeSwiped)
+    val latestOnFocus by rememberUpdatedState(onFocusAt)
+    val latestOnDoubleTap by rememberUpdatedState(onDoubleTap)
     var totalDragX by remember { mutableFloatStateOf(0f) }
+    val focusState by focusFlow.collectAsState()
 
     val ratioValue = remember(aspectRatio) {
         when (aspectRatio) {
@@ -519,19 +694,18 @@ fun CameraPreview(
             .pointerInput(Unit) {
                 detectTransformGestures { _, pan, zoom, _ ->
                     if (zoom != 1f) {
-                        currentScale *= zoom
-                        onZoomChanged(currentScale)
+                        latestOnZoom(latestZoom * zoom)
                         totalDragX = 0f
                     } else {
                         totalDragX += pan.x
                         if (abs(totalDragX) > 200) {
-                            onModeSwiped(totalDragX)
+                            latestOnSwipe(totalDragX)
                             totalDragX = 0f
                         }
                     }
                 }
             },
-        contentAlignment = BiasAlignment(0f, -0.7f) 
+        contentAlignment = Alignment.TopCenter
     ) {
         val previewWidth: androidx.compose.ui.unit.Dp
         val previewHeight: androidx.compose.ui.unit.Dp
@@ -549,14 +723,23 @@ fun CameraPreview(
             previewWidth = maxWidth
             previewHeight = maxHeight
         }
+        // Cropped ratios start right under the top bar (like most camera apps) so the
+        // shutter area below stays clear; full-screen fills everything.
+        val topBarBottom = WindowInsets.statusBars.asPaddingValues().calculateTopPadding() +
+            com.fearmikey.camera.ui.camera.TopBarHeight
+        val previewTop = if (ratioValue > 0) {
+            topBarBottom.coerceAtMost((maxHeight - previewHeight).coerceAtLeast(0.dp))
+        } else 0.dp
 
         Box(
             modifier = Modifier
+                .offset(y = previewTop)
                 .size(previewWidth, previewHeight)
                 .pointerInput(Unit) {
-                    detectTapGestures { offset ->
-                        onFocusAt(offset.x / size.width, offset.y / size.height)
-                    }
+                    detectTapGestures(
+                        onDoubleTap = { latestOnDoubleTap() },
+                        onTap = { offset -> latestOnFocus(offset.x / size.width, offset.y / size.height) }
+                    )
                 }
         ) {
             AndroidView(
@@ -581,128 +764,21 @@ fun CameraPreview(
                 isFrontCamera = isFrontCamera,
                 modifier = Modifier.fillMaxSize()
             )
-        }
-    }
-}
+            viewfinderOverlay()
 
-@Composable
-fun PanoramaGuideOverlay(
-    state: CameraUiState,
-    modifier: Modifier = Modifier
-) {
-    val message = state.panoramaMessage ?: "Move camera to the dots"
-    val yaw = state.panoramaYaw
-    val pitch = state.panoramaPitch
-    val targets = state.panoramaTargets
-    val captured = state.panoramaCapturedIndices
-
-    // Animate the yaw value once at the top level to ensure all dots stay perfectly synced
-    val animatedYaw by animateFloatAsState(
-        targetValue = yaw,
-        animationSpec = spring(stiffness = Spring.StiffnessMediumLow),
-        label = "trackYaw"
-    )
-
-    Box(
-        modifier = modifier.fillMaxSize(),
-        contentAlignment = Alignment.Center
-    ) {
-        // Horizontal Track
-        Box(
-            modifier = Modifier
-                .fillMaxWidth(0.9f)
-                .height(80.dp),
-            contentAlignment = Alignment.Center
-        ) {
-            // The Track line
-            HorizontalDivider(
-                color = Color.White.copy(alpha = 0.3f),
-                thickness = 2.dp,
-                modifier = Modifier.fillMaxWidth()
-            )
-
-            // Center Ring (Static - where the user is aiming)
-            Box(
-                modifier = Modifier
-                    .size(44.dp)
-                    .border(2.dp, Color.White.copy(alpha = 0.8f), CircleShape),
-                contentAlignment = Alignment.Center
-            ) {
-                // Pitch indicator (Vertical line to help level)
-                val pitchOffset by animateDpAsState(
-                    targetValue = (pitch * 6f).dp.coerceIn((-30).dp, 30.dp),
-                    animationSpec = spring(stiffness = Spring.StiffnessMediumLow),
-                    label = "pitchMovement"
-                )
-                Box(
-                    modifier = Modifier
-                        .width(2.dp)
-                        .height(24.dp)
-                        .offset(y = pitchOffset)
-                        .background(if (abs(pitch) < 2f) Color.Green else Color.Red)
-                )
-                
-                // Aiming reticle
-                Box(modifier = Modifier.size(4.dp).background(Color.White, CircleShape))
-            }
-
-            // Targets (Dots moving along the track)
-            // Increased scale for better precision
-            val pixelsPerDegree = 10f 
-
-            targets.forEachIndexed { index, targetYaw ->
-                if (index !in captured) {
-                    // Use the single animatedYaw for all dots to keep spacing rigid
-                    val relativeX = (targetYaw - animatedYaw) * pixelsPerDegree
-                    
-                    // Only draw if within visible track range (+ buffer)
-                    if (abs(relativeX) < 200f) {
-                        Box(
-                            modifier = Modifier
-                                .size(24.dp)
-                                .offset(x = relativeX.dp)
-                                .background(Color.Yellow.copy(alpha = 0.9f), CircleShape)
-                                .border(1.5.dp, Color.Black, CircleShape),
-                            contentAlignment = Alignment.Center
-                        ) {
-                            if (abs(relativeX) < 8f) {
-                                // Locked on indicator
-                                Box(modifier = Modifier.size(10.dp).background(Color.White, CircleShape))
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        // Guidance Message and Stats at Top of Preview
-        Column(
-            horizontalAlignment = Alignment.CenterHorizontally,
-            modifier = Modifier
-                .align(Alignment.TopCenter)
-                .padding(top = 100.dp) // Below the top bar icons
-        ) {
-            Surface(
-                color = Color.Black.copy(alpha = 0.6f),
-                shape = RoundedCornerShape(12.dp)
-            ) {
-                Column(
-                    horizontalAlignment = Alignment.CenterHorizontally,
-                    modifier = Modifier.padding(horizontal = 20.dp, vertical = 10.dp)
-                ) {
-                    Text(
-                        text = message,
-                        color = Color.White,
-                        style = MaterialTheme.typography.titleMedium,
-                        fontWeight = FontWeight.Bold
-                    )
-                    
-                    Spacer(modifier = Modifier.height(4.dp))
-                    
-                    Text(
-                        "Captured ${captured.size} / ${targets.size} points",
-                        color = Color.White.copy(alpha = 0.8f),
-                        style = MaterialTheme.typography.labelMedium
+            // Brightness slider beside the focus ring (flips to the left near the right edge).
+            focusState?.let { focus ->
+                if (exposureRange.first < exposureRange.last) {
+                    val ringX = previewWidth * focus.point.x
+                    val ringY = previewHeight * focus.point.y
+                    val sliderX = if (focus.point.x > 0.75f) ringX - 100.dp else ringX + 52.dp
+                    val sliderY = (ringY - 90.dp).coerceIn(0.dp, (previewHeight - 170.dp).coerceAtLeast(0.dp))
+                    ExposureSlider(
+                        index = exposureIndex,
+                        range = exposureRange,
+                        stepEv = exposureStep,
+                        onIndexChange = onExposureChange,
+                        modifier = Modifier.offset(x = sliderX, y = sliderY)
                     )
                 }
             }
@@ -773,20 +849,31 @@ fun CameraModeSelector(
     onModeSelected: (CameraMode) -> Unit,
     modifier: Modifier = Modifier
 ) {
-    val listState = rememberLazyListState()
+    // Start with the selected mode near the centre (refined by the effect below).
+    val listState = rememberLazyListState(initialFirstVisibleItemIndex = modes.indexOf(currentMode).coerceAtLeast(0))
     
-    LaunchedEffect(currentMode) {
+    // Keep the selected mode centred under the shutter.
+    LaunchedEffect(currentMode, modes) {
         val index = modes.indexOf(currentMode)
-        if (index != -1) {
+        if (index == -1) return@LaunchedEffect
+        val info = listState.layoutInfo
+        val item = info.visibleItemsInfo.firstOrNull { it.index == index }
+        if (item == null) {
             listState.animateScrollToItem(index)
+        } else {
+            val viewportCenter = (info.viewportStartOffset + info.viewportEndOffset) / 2
+            val delta = item.offset + item.size / 2 - viewportCenter
+            if (delta != 0) listState.animateScrollBy(delta.toFloat())
         }
     }
 
+    // Half-screen padding lets the first and last modes scroll to the centre too.
+    BoxWithConstraints(modifier = modifier.fillMaxWidth()) {
+    val sidePadding = (maxWidth / 2 - 48.dp).coerceAtLeast(0.dp)
     LazyRow(
         state = listState,
-        modifier = modifier.fillMaxWidth(),
-        horizontalArrangement = Arrangement.Center,
-        contentPadding = PaddingValues(horizontal = 16.dp),
+        modifier = Modifier.fillMaxWidth(),
+        contentPadding = PaddingValues(horizontal = sidePadding),
         verticalAlignment = Alignment.CenterVertically
     ) {
         items(
@@ -794,16 +881,7 @@ fun CameraModeSelector(
             key = { it.name }
         ) { mode ->
             val isSelected = mode == currentMode
-            val label = when(mode) {
-                CameraMode.PHOTO -> "Photo"
-                CameraMode.VIDEO -> "Video"
-                CameraMode.NIGHT_SIGHT -> "Night Sight"
-                CameraMode.SLOW_MO -> "Slow Motion"
-                CameraMode.PORTRAIT -> "Portrait"
-                CameraMode.PANORAMA -> "Panorama"
-
-                CameraMode.HDR -> "HDR"
-            }
+            val label = CameraModes.label(mode)
             
             Box(
                 modifier = Modifier
@@ -824,6 +902,7 @@ fun CameraModeSelector(
             }
         }
     }
+    }
 }
 
 @Composable
@@ -832,7 +911,7 @@ fun PhotoVideoToggle(
     onTypeSelected: (CaptureType) -> Unit,
     modifier: Modifier = Modifier
 ) {
-    val darkGray = Color(0xFF202124)
+    val darkGray = com.fearmikey.camera.ui.camera.ControlBackground
     Surface(
         color = darkGray,
         shape = CircleShape,
@@ -894,8 +973,11 @@ fun ZoomSwitcher(
             modifier = Modifier.padding(horizontal = 4.dp, vertical = 4.dp),
             verticalAlignment = Alignment.CenterVertically
         ) {
+            // The active pill is the largest preset at or below the current zoom; it shows
+            // the live value (e.g. "3.4x") while pinching between presets.
+            val activePreset = zoomPresets.lastOrNull { it <= currentZoom + 0.05f } ?: zoomPresets.firstOrNull()
             zoomPresets.forEach { zoom ->
-                val isSelected = abs(currentZoom - zoom) < 0.05f
+                val isSelected = zoom == activePreset
                 Box(
                     modifier = Modifier
                         .size(42.dp)
@@ -904,15 +986,7 @@ fun ZoomSwitcher(
                         .clickable { onZoomSelected(zoom) },
                     contentAlignment = Alignment.Center
                 ) {
-                    val label = when {
-                        zoom == 1.0f -> "1x"
-                        zoom < 1.0f -> {
-                            val valStr = (kotlin.math.round(zoom * 10f) / 10.0f).toString()
-                            if (valStr.startsWith("0.")) valStr.substring(1) else valStr
-                        }
-                        zoom == zoom.toInt().toFloat() -> "${zoom.toInt()}x"
-                        else -> "${(kotlin.math.round(zoom * 10f) / 10.0f)}x"
-                    }
+                    val label = if (isSelected) formatZoom(currentZoom) else formatZoom(zoom)
                     Text(
                         text = label,
                         color = if (isSelected) Color.Black else Color.White,
@@ -951,12 +1025,16 @@ fun CameraControls(
     onThumbnailClick: () -> Unit,
     onFlipCamera: () -> Unit,
     onTypeSelected: (CaptureType) -> Unit,
-    onSettingsClick: () -> Unit
+    onSettingsClick: () -> Unit,
+    onProControlsClick: () -> Unit = {},
+    isProMode: Boolean = false,
 ) {
-    val photoModes = listOf(CameraMode.PORTRAIT, CameraMode.PHOTO, CameraMode.NIGHT_SIGHT, CameraMode.PANORAMA)
-    val videoModes = listOf(CameraMode.VIDEO, CameraMode.SLOW_MO)
-    val currentModes = if (captureType == CaptureType.PHOTO) photoModes else videoModes
-    val darkGray = Color(0xFF202124)
+    val currentModes = if (captureType == CaptureType.PHOTO) CameraModes.photo else CameraModes.video
+    val darkGray = com.fearmikey.camera.ui.camera.ControlBackground
+    // During a panorama sweep only the shutter stays; everything else fades out in place
+    // (layout keeps its size so the shutter doesn't jump).
+    val idle = !isPanoramaCapturing
+    val chromeAlpha by animateFloatAsState(if (idle) 1f else 0f, label = "panoChrome")
 
     Column(
         modifier = modifier.fillMaxWidth(),
@@ -965,15 +1043,15 @@ fun CameraControls(
         ZoomSwitcher(
             currentZoom = zoomLevel,
             zoomPresets = zoomPresets,
-            onZoomSelected = onZoomChanged,
-            modifier = Modifier.padding(top = 10.dp, bottom = 10.dp)
+            onZoomSelected = { if (idle) onZoomChanged(it) },
+            modifier = Modifier.padding(top = 8.dp, bottom = 8.dp).alpha(chromeAlpha)
         )
 
         Row(
             modifier = Modifier
                 .fillMaxWidth()
                 .padding(horizontal = 40.dp)
-                .padding(bottom = 24.dp),
+                .padding(bottom = 12.dp),
             horizontalArrangement = Arrangement.SpaceBetween,
             verticalAlignment = Alignment.CenterVertically
         ) {
@@ -981,9 +1059,10 @@ fun CameraControls(
             Box(
                 modifier = Modifier
                     .size(56.dp)
+                    .alpha(chromeAlpha)
                     .clip(androidx.compose.foundation.shape.RoundedCornerShape(12.dp))
                     .background(darkGray)
-                    .clickable { 
+                    .clickable(enabled = idle) { 
                         if (isRecording) {
                             if (isPaused) onResume() else onPause()
                         } else {
@@ -1001,11 +1080,13 @@ fun CameraControls(
                     )
                 } else {
                     lastCapturedUri?.let { uri ->
-                        AsyncImage(
-                            model = uri,
-                            contentDescription = "Last captured media",
-                            modifier = Modifier.fillMaxSize(),
-                            contentScale = ContentScale.Crop,
+                        MediaThumbnail(uri = uri, modifier = Modifier.fillMaxSize())
+                    }
+                    if (isProcessing) {
+                        CircularProgressIndicator(
+                            modifier = Modifier.size(28.dp),
+                            strokeWidth = 3.dp,
+                            color = CameraAccent
                         )
                     }
                 }
@@ -1017,7 +1098,7 @@ fun CameraControls(
                     modifier = Modifier.size(92.dp),
                     contentAlignment = Alignment.Center
                 ) {
-                    if (isProcessing && (currentMode == CameraMode.NIGHT_SIGHT || currentMode == CameraMode.HDR)) {
+                    if (isProcessing && currentMode in setOf(CameraMode.NIGHT_SIGHT, CameraMode.HDR, CameraMode.LONG_EXPOSURE)) {
                         val progressAnim by animateFloatAsState(
                             targetValue = captureProgress,
                             animationSpec = spring(stiffness = Spring.StiffnessLow),
@@ -1038,24 +1119,30 @@ fun CameraControls(
                         }
                     }
 
-                    val isVideoMode = currentMode == CameraMode.VIDEO || currentMode == CameraMode.SLOW_MO
-                    val isCapturing = isRecording || isPanoramaCapturing
-                    val shutterColor = if (isVideoMode || isCapturing) Color.Red else Color.White
-                    val shutterInnerShape = if (isCapturing) androidx.compose.foundation.shape.RoundedCornerShape(12.dp) else CircleShape
+                    val isVideoMode = CameraModes.isVideo(currentMode)
+                    val isPanorama = currentMode == CameraMode.PANORAMA
+                    val shutterColor = when {
+                        // Dark disc; translucent white so it still reads on the black control area.
+                        isPanoramaCapturing -> Color.White.copy(alpha = 0.16f)
+                        isVideoMode || isRecording -> Color.Red
+                        else -> Color.White
+                    }
+                    val shutterInnerShape = if (isRecording) androidx.compose.foundation.shape.RoundedCornerShape(12.dp) else CircleShape
 
                     Box(
+                        contentAlignment = Alignment.Center,
                         modifier = Modifier
                             .size(80.dp)
                             .clip(shutterInnerShape)
                             .background(shutterColor)
                             .border(2.dp, Color.Black.copy(alpha = 0.1f), shutterInnerShape)
-                            .pointerInput(Unit) {
+                            .pointerInput(isPanorama) {
                                 awaitEachGesture {
                                     awaitFirstDown()
                                     val result = withTimeoutOrNull(500) {
                                         waitForUpOrCancellation()
                                     }
-                                    if (result == null) {
+                                    if (result == null && !isPanorama) {
                                         onQuickTakeStart()
                                         waitForUpOrCancellation()
                                         onQuickTakeStop()
@@ -1064,10 +1151,21 @@ fun CameraControls(
                                     }
                                 }
                             }
-                    )
-                    
+                    ) {
+                        if (isPanoramaCapturing) {
+                            // Stop: white rounded square on a dark translucent disc.
+                            Box(
+                                Modifier
+                                    .size(40.dp)
+                                    .background(Color.White, androidx.compose.foundation.shape.RoundedCornerShape(10.dp))
+                            )
+                        } else if (isPanorama) {
+                            com.fearmikey.camera.ui.camera.PanoramaShutterGlyph()
+                        }
+                    }
+
                     // Outer white ring for non-recording photo mode
-                    if (!isRecording && !isVideoMode) {
+                    if (!isRecording && !isVideoMode && !isPanoramaCapturing) {
                         Box(
                             modifier = Modifier
                                 .size(92.dp)
@@ -1098,9 +1196,10 @@ fun CameraControls(
             Box(
                 modifier = Modifier
                     .size(56.dp)
+                    .alpha(chromeAlpha)
                     .clip(CircleShape)
                     .background(darkGray)
-                    .clickable { if (isRecording) onVideoSnapshot() else onFlipCamera() },
+                    .clickable(enabled = idle) { if (isRecording) onVideoSnapshot() else onFlipCamera() },
                 contentAlignment = Alignment.Center
             ) {
                 if (isRecording) {
@@ -1121,46 +1220,39 @@ fun CameraControls(
         CameraModeSelector(
             modes = currentModes,
             currentMode = currentMode,
-            onModeSelected = onModeSelected,
-            modifier = Modifier.padding(bottom = 24.dp)
+            onModeSelected = { if (idle) onModeSelected(it) },
+            modifier = Modifier.padding(bottom = 12.dp).alpha(chromeAlpha)
         )
 
         Row(
             modifier = Modifier
                 .fillMaxWidth()
                 .padding(horizontal = 24.dp)
-                .padding(bottom = 16.dp),
+                .padding(bottom = 8.dp)
+                .alpha(chromeAlpha),
             horizontalArrangement = Arrangement.SpaceBetween,
             verticalAlignment = Alignment.CenterVertically
         ) {
-            IconButton(
-                onClick = onSettingsClick,
-                modifier = Modifier.background(darkGray, CircleShape)
-            ) {
-                Icon(
-                    imageVector = Icons.Default.Settings,
-                    contentDescription = "Settings",
-                    tint = Color.White,
-                    modifier = Modifier.size(20.dp)
-                )
-            }
+            com.fearmikey.camera.ui.camera.RotatingIconButton(
+                icon = Icons.Default.Settings,
+                contentDescription = "Settings",
+                rotation = orientation,
+                onClick = { if (idle) onSettingsClick() },
+            )
 
             PhotoVideoToggle(
                 currentType = captureType,
-                onTypeSelected = onTypeSelected
+                onTypeSelected = { if (idle) onTypeSelected(it) }
             )
 
-            IconButton(
-                onClick = { /* Tuning/Filters */ },
-                modifier = Modifier.background(darkGray, CircleShape)
-            ) {
-                Icon(
-                    imageVector = Icons.Default.Tune,
-                    contentDescription = "Controls",
-                    tint = Color.White,
-                    modifier = Modifier.size(20.dp)
-                )
-            }
+            com.fearmikey.camera.ui.camera.RotatingIconButton(
+                icon = Icons.Default.Tune,
+                contentDescription = "Manual controls",
+                rotation = orientation,
+                onClick = { if (idle) onProControlsClick() },
+                tint = if (isProMode) com.fearmikey.camera.ui.camera.OnCameraAccent else Color.White,
+                background = if (isProMode) CameraAccent else darkGray,
+            )
         }
     }
 }

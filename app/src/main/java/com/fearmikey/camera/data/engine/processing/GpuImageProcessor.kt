@@ -3,12 +3,8 @@ package com.fearmikey.camera.data.engine.processing
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.graphics.Matrix
-import android.graphics.Rect
-import android.graphics.YuvImage
-import android.media.Image
 import android.opengl.*
 import androidx.camera.core.ImageProxy
-import java.io.ByteArrayOutputStream
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import java.nio.FloatBuffer
@@ -208,21 +204,9 @@ class GpuImageProcessor {
                 buffer.get(bytes)
                 BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
             } else if (image.format == android.graphics.ImageFormat.YUV_420_888) {
-                val yBuffer = image.planes[0].buffer
-                val uBuffer = image.planes[1].buffer
-                val vBuffer = image.planes[2].buffer
-                val ySize = yBuffer.remaining()
-                val uSize = uBuffer.remaining()
-                val vSize = vBuffer.remaining()
-                val nv21 = ByteArray(ySize + uSize + vSize)
-                yBuffer.get(nv21, 0, ySize)
-                vBuffer.get(nv21, ySize, vSize)
-                uBuffer.get(nv21, ySize + vSize, uSize)
-                val yuvImage = YuvImage(nv21, android.graphics.ImageFormat.NV21, image.width, image.height, null)
-                val out = ByteArrayOutputStream()
-                yuvImage.compressToJpeg(Rect(0, 0, image.width, image.height), 100, out)
-                val imageBytes = out.toByteArray()
-                BitmapFactory.decodeByteArray(imageBytes, 0, imageBytes.size)
+                // CameraX's converter honours row/pixel strides (the previous manual
+                // NV21 packing corrupted images on devices with padded rows).
+                image.toBitmap()
             } else {
                 null
             }
@@ -262,10 +246,7 @@ class GpuImageProcessor {
         return shader
     }
 
-    fun initAccumulator(image: Image) {}
-    fun mergeFrame(image: Image, matrix: Matrix, weight: Float) {}
-    fun readResult(): Bitmap = Bitmap.createBitmap(1, 1, Bitmap.Config.ARGB_8888)
-
+    /** Destroys the EGL context. Only call when the processor is no longer used. */
     fun release() {
         if (eglDisplay != EGL14.EGL_NO_DISPLAY) {
             EGL14.eglDestroySurface(eglDisplay, eglSurface)

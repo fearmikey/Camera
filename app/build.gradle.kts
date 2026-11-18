@@ -4,6 +4,14 @@ plugins {
     id("org.jetbrains.kotlin.plugin.compose") version "2.0.21"
 }
 
+// Optional per-ABI builds (e.g. for F-Droid): ./gradlew assembleRelease -PabiFilter=arm64-v8a
+// Each ABI gets a distinct versionCode (base * 10 + n) so they can be published side by side.
+val baseVersionCode = 9
+val abiVersionOffsets = mapOf("armeabi-v7a" to 1, "arm64-v8a" to 2, "x86" to 3, "x86_64" to 4)
+val abiFilter: String? = providers.gradleProperty("abiFilter").orNull?.also {
+    require(it in abiVersionOffsets) { "Unknown abiFilter '$it'. Use one of ${abiVersionOffsets.keys}" }
+}
+
 android {
     namespace = "com.fearmikey.camera"
     compileSdk = 35
@@ -12,14 +20,17 @@ android {
         applicationId = "com.fearmikey.camera"
         minSdk = 31
         targetSdk = 35
-        versionCode = 8
-        versionName = "1.0.7"
+        versionCode = abiFilter?.let { baseVersionCode * 10 + abiVersionOffsets.getValue(it) } ?: baseVersionCode
+        versionName = "1.1.0"
+
+        abiFilter?.let { ndk { abiFilters += it } }
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
 
         externalNativeBuild {
             cmake {
-                arguments("-DOpenCV_DIR=${project.rootDir}/opencv/OpenCV-android-sdk/sdk/native/jni")
+                // The OpenCV AAR ships libc++_shared, so our library must use the same STL.
+                arguments("-DANDROID_STL=c++_shared")
             }
         }
     }
@@ -27,10 +38,6 @@ android {
     buildTypes {
         release {
             isMinifyEnabled = false
-            proguardFiles(
-                getDefaultProguardFile("proguard-android-optimize.txt"),
-                "proguard-rules.pro"
-            )
         }
     }
     compileOptions {
@@ -42,6 +49,8 @@ android {
     }
     buildFeatures {
         compose = true
+        prefab = true
+        buildConfig = true
     }
 
     externalNativeBuild {
@@ -55,17 +64,21 @@ android {
         resources {
             excludes += "/META-INF/{AL2.0,LGPL2.1}"
         }
+        jniLibs {
+            // Both the OpenCV AAR and our CMake build provide libc++_shared.so.
+            pickFirsts += "lib/*/libc++_shared.so"
+        }
     }
 
-    androidResources {
-        noCompress += listOf("task", "tflite")
+    // F-Droid: don't embed the Google-signed dependency metadata blob in the APK/AAB.
+    dependenciesInfo {
+        includeInApk = false
+        includeInBundle = false
     }
 }
 
 dependencies {
     implementation(libs.androidx.core.ktx)
-    implementation(libs.androidx.appcompat)
-    implementation(libs.material)
     implementation(libs.androidx.lifecycle.runtime.ktx)
     implementation(libs.androidx.activity.compose)
     implementation(platform(libs.androidx.compose.bom))
@@ -84,17 +97,8 @@ dependencies {
     implementation(libs.androidx.camera.view)
     implementation(libs.androidx.camera.extensions)
 
-    // TFLite
-    implementation(libs.tensorflow.lite)
-    implementation(libs.tensorflow.lite.support)
-    implementation(libs.tensorflow.lite.gpu)
-    implementation(libs.tensorflow.lite.gpu.api)
-
-    // Coil
-    implementation(libs.coil.compose)
-
-    // MediaPipe
-    implementation(libs.mediapipe.tasks.vision)
+    // OpenCV (Apache-2.0, Maven Central) - native code consumed via prefab
+    implementation(libs.opencv)
 
     testImplementation(libs.junit)
     androidTestImplementation(libs.androidx.junit)

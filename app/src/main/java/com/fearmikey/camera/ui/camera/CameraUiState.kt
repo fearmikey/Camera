@@ -7,6 +7,7 @@ import com.fearmikey.camera.domain.model.ProConfig
 import com.fearmikey.camera.domain.model.CameraHardwareCapabilities
 import com.fearmikey.camera.domain.model.UserPreferences
 import com.fearmikey.camera.domain.model.FlashMode
+import com.fearmikey.camera.domain.model.PanoramaProgress
 import androidx.compose.runtime.Stable
 import androidx.compose.ui.geometry.Offset
 
@@ -28,11 +29,8 @@ data class CameraUiState(
     val isProcessing: Boolean = false,
     val backgroundTaskMessage: String? = null,
     val isPanoramaCapturing: Boolean = false,
-    val panoramaMessage: String? = null,
-    val panoramaYaw: Float = 0f,
-    val panoramaPitch: Float = 0f,
-    val panoramaTargets: List<Float> = emptyList(),
-    val panoramaCapturedIndices: Set<Int> = emptySet(),
+    /** Live sweep state while [isPanoramaCapturing]. */
+    val panoramaProgress: PanoramaProgress? = null,
     val timerCountdown: Int? = null,
     val captureProgress: Float = 0f,
     val zoomLevel: Float = 1.0f,
@@ -42,5 +40,11 @@ data class CameraUiState(
     val userPreferences: UserPreferences = UserPreferences(),
     val showSettingsSheet: Boolean = false,
     val isFrontCamera: Boolean = false,
-    val flashMode: FlashMode = FlashMode.OFF
+    val flashMode: FlashMode = FlashMode.OFF,
+    /** Exposure compensation in device steps (see capabilities.exposureStep). */
+    val exposureIndex: Int = 0,
+    /** Scene is dark: offer to switch to Night mode. */
+    val lowLightSuggested: Boolean = false,
+    /** Last decoded QR payload while a code is in view. */
+    val qrCode: String? = null,
 )

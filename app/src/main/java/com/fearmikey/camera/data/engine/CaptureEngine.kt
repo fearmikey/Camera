@@ -10,6 +10,7 @@ import com.fearmikey.camera.domain.model.ProConfig
 import com.fearmikey.camera.domain.model.CameraHardwareCapabilities
 import com.fearmikey.camera.domain.model.UserPreferences
 import com.fearmikey.camera.domain.model.FlashMode
+import com.fearmikey.camera.domain.model.PanoramaProgress
 
 interface CaptureEngine {
     fun bindToLifecycle(
@@ -41,7 +42,27 @@ interface CaptureEngine {
     fun playStopRecordingSound()
     fun setGestureTriggerEnabled(enabled: Boolean)
     fun setOnGestureListener(listener: (GestureResult) -> Unit)
-    fun setOnPanoramaListener(listener: (String) -> Unit)
-    fun setPanoramaYawProvider(provider: () -> Float)
+
+    /** Live sweep progress (main thread) between startPanorama and stopPanorama. */
+    fun setOnPanoramaProgressListener(listener: (PanoramaProgress) -> Unit)
+
+    /**
+     * Device rotation as a [android.view.Surface] ROTATION_* constant. The UI is
+     * portrait-locked, so this is what makes landscape photos/videos upright.
+     */
+    fun setTargetRotation(rotation: Int)
+
+    /** Invoked on the main thread whenever a camera finishes binding (capabilities are then valid). */
+    fun setOnCameraReadyListener(listener: () -> Unit)
+
+    /** Exposure compensation in device steps (see CameraHardwareCapabilities.exposureRange). */
+    fun setExposureCompensation(index: Int)
+
+    /** Called (main thread) when the scene becomes dark enough to suggest Night mode, and when it brightens again. */
+    fun setOnLowLightListener(listener: (Boolean) -> Unit)
+
+    /** Called (main thread) with a decoded QR payload, or null when no code has been visible for a while. */
+    fun setOnQrCodeListener(listener: (String?) -> Unit)
+
     fun unbind()
 }

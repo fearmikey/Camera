@@ -39,7 +39,18 @@ class UserPreferencesRepository(private val context: Context) {
         val MIRROR_SELFIES = booleanPreferencesKey("mirror_selfies")
         val ULTRA_HDR = booleanPreferencesKey("ultra_hdr")
         val TIMER_LIGHT = booleanPreferencesKey("timer_light")
+        val VIDEO_STABILIZATION = booleanPreferencesKey("video_stabilization")
+        val HDR_PHOTO = booleanPreferencesKey("hdr_photo")
+        val VIDEO_FRAME_RATE = stringPreferencesKey("video_frame_rate")
+        val RECORD_AUDIO = booleanPreferencesKey("record_audio")
+        val VOLUME_KEY_ACTION = stringPreferencesKey("volume_key_action")
+        val SCAN_QR_CODES = booleanPreferencesKey("scan_qr_codes")
+        val DOUBLE_TAP_SWITCH = booleanPreferencesKey("double_tap_switch")
+        val LOW_LIGHT_SUGGESTION = booleanPreferencesKey("low_light_suggestion")
     }
+
+    private inline fun <reified T : Enum<T>> enumOr(value: String?, default: T): T =
+        value?.let { runCatching { enumValueOf<T>(it) }.getOrNull() } ?: default
 
     val userPreferencesFlow: Flow<UserPreferences> = context.dataStore.data
         .catch { exception ->
@@ -75,7 +86,7 @@ class UserPreferencesRepository(private val context: Context) {
                     preferences[PreferencesKeys.TIMER] ?: TimerMode.OFF.name
                 ),
                 lightMode = LightMode.valueOf(
-                    preferences[PreferencesKeys.LIGHT_MODE] ?: LightMode.AUTO_NIGHT_SIGHT.name
+                    preferences[PreferencesKeys.LIGHT_MODE] ?: LightMode.NONE.name
                 ),
                 macroFocus = MacroMode.valueOf(
                     preferences[PreferencesKeys.MACRO_FOCUS] ?: MacroMode.AUTO.name
@@ -93,7 +104,7 @@ class UserPreferencesRepository(private val context: Context) {
                 lensSelection = LensSelectionMode.valueOf(
                     preferences[PreferencesKeys.LENS_SELECTION] ?: LensSelectionMode.AUTO.name
                 ),
-                gestureTrigger = preferences[PreferencesKeys.GESTURE_TRIGGER] ?: true,
+                gestureTrigger = preferences[PreferencesKeys.GESTURE_TRIGGER] ?: false,
                 cameraSounds = preferences[PreferencesKeys.CAMERA_SOUNDS] ?: true,
                 gridMode = GridMode.valueOf(
                     preferences[PreferencesKeys.GRID_MODE] ?: GridMode.OFF.name,
@@ -101,6 +112,18 @@ class UserPreferencesRepository(private val context: Context) {
                 mirrorSelfies = preferences[PreferencesKeys.MIRROR_SELFIES] ?: false,
                 ultraHdr = preferences[PreferencesKeys.ULTRA_HDR] ?: true,
                 timerLight = preferences[PreferencesKeys.TIMER_LIGHT] ?: false,
+                videoStabilization = preferences[PreferencesKeys.VIDEO_STABILIZATION] ?: true,
+                hdrPhoto = preferences[PreferencesKeys.HDR_PHOTO] ?: false,
+                videoFrameRate = enumOr(preferences[PreferencesKeys.VIDEO_FRAME_RATE], VideoFrameRate.AUTO),
+                recordAudio = preferences[PreferencesKeys.RECORD_AUDIO] ?: true,
+                // Migrates the old boolean: an explicit "off" maps to normal volume behaviour.
+                volumeKeyAction = enumOr(
+                    preferences[PreferencesKeys.VOLUME_KEY_ACTION],
+                    if (preferences[PreferencesKeys.VOLUME_KEY_SHUTTER] == false) VolumeKeyAction.VOLUME else VolumeKeyAction.SHUTTER
+                ),
+                scanQrCodes = preferences[PreferencesKeys.SCAN_QR_CODES] ?: true,
+                doubleTapSwitch = preferences[PreferencesKeys.DOUBLE_TAP_SWITCH] ?: true,
+                lowLightSuggestion = preferences[PreferencesKeys.LOW_LIGHT_SUGGESTION] ?: true,
             )
         }
 
@@ -233,6 +256,24 @@ class UserPreferencesRepository(private val context: Context) {
     suspend fun updateTimerLight(enabled: Boolean) {
         context.dataStore.edit { preferences ->
             preferences[PreferencesKeys.TIMER_LIGHT] = enabled
+        }
+    }
+
+    private suspend fun <T> put(key: Preferences.Key<T>, value: T) {
+        context.dataStore.edit { it[key] = value }
+    }
+
+    suspend fun updateHdrPhoto(enabled: Boolean) = put(PreferencesKeys.HDR_PHOTO, enabled)
+    suspend fun updateVideoFrameRate(rate: VideoFrameRate) = put(PreferencesKeys.VIDEO_FRAME_RATE, rate.name)
+    suspend fun updateRecordAudio(enabled: Boolean) = put(PreferencesKeys.RECORD_AUDIO, enabled)
+    suspend fun updateVolumeKeyAction(action: VolumeKeyAction) = put(PreferencesKeys.VOLUME_KEY_ACTION, action.name)
+    suspend fun updateScanQrCodes(enabled: Boolean) = put(PreferencesKeys.SCAN_QR_CODES, enabled)
+    suspend fun updateDoubleTapSwitch(enabled: Boolean) = put(PreferencesKeys.DOUBLE_TAP_SWITCH, enabled)
+    suspend fun updateLowLightSuggestion(enabled: Boolean) = put(PreferencesKeys.LOW_LIGHT_SUGGESTION, enabled)
+
+    suspend fun updateVideoStabilization(enabled: Boolean) {
+        context.dataStore.edit { preferences ->
+            preferences[PreferencesKeys.VIDEO_STABILIZATION] = enabled
         }
     }
 }

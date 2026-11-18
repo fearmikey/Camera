@@ -128,6 +128,7 @@ fun CameraGrid(mode: GridMode) {
 
 @Composable
 fun HorizonLeveler(tilt: Float) {
+    val accent = CameraAccent
     Canvas(modifier = Modifier.fillMaxSize()) {
         val centerX = size.width / 2
         val centerY = size.height / 2
@@ -143,7 +144,7 @@ fun HorizonLeveler(tilt: Float) {
         
         val relativeTilt = tilt - targetRotation
         val isLevel = abs(relativeTilt) < 1.0f
-        val color = if (isLevel) Color.Yellow else Color.White
+        val color = if (isLevel) accent else Color.White
         val strokeWidth = if (isLevel) 2.dp.toPx() else 1.dp.toPx()
         
         withTransform({
@@ -201,9 +202,10 @@ fun FocusRing(state: FocusState) {
         label = "focusEntryScale"
     )
 
+    val accent = CameraAccent
     Canvas(modifier = Modifier.fillMaxSize()) {
         val radiusPx = 40.dp.toPx()
-        val color = if (state.isLocked) Color.Yellow else Color.White
+        val color = if (state.isLocked) accent else Color.White
         val opacity = if (state.isLocked) 1.0f else pulseOpacity
         val animatedColor = color.copy(alpha = opacity)
         
@@ -246,9 +248,10 @@ fun HandDetectionBox(
         label = "cornerPulse"
     )
 
+    val accent = CameraAccent
     Canvas(modifier = Modifier.fillMaxSize()) {
         val strokeWidth = if (isPending) 3.dp.toPx() else 2.dp.toPx()
-        val color = if (isPending) Color.Yellow else Color.White.copy(alpha = 0.8f) // White until locked on
+        val color = if (isPending) accent else Color.White.copy(alpha = 0.8f) // White until locked on
         
         // Map normalized coordinates to pixel coordinates
         // Flip X if front camera

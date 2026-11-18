@@ -11,11 +11,14 @@ import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import androidx.core.net.toUri
 import com.fearmikey.camera.data.engine.CaptureEngine
+import com.fearmikey.camera.data.engine.processing.PanoramaTooShortException
 import com.fearmikey.camera.data.repository.MediaRepository
 import com.fearmikey.camera.data.repository.UserPreferencesRepository
 import com.fearmikey.camera.domain.model.*
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.withContext
 import kotlinx.coroutines.flow.*
 import kotlinx.coroutines.launch
 import kotlin.math.abs
@@ -70,21 +73,138 @@ class CameraViewModel(
     private var boxClearJob: Job? = null
     private var secondsRecorded = 0L
 
-    private var panoramaInitialYaw = 0f
-    private var panoramaInitialPitch = 0f
-    private val panoramaTargets = listOf(-45f, -30f, -15f, 0f, 15f, 30f, 45f)
-    private var lastAutoCaptureTime = 0L
+    /** A finished sweep is still being stitched; a new one waits so memory stays bounded. */
+    private var panoramaStitching = false
+    private var panoramaMessageJob: Job? = null
 
     private var smoothedHandBox: androidx.compose.ui.geometry.Rect? = null
     private var smoothedFaceBox: androidx.compose.ui.geometry.Rect? = null
     private val boxSmoothing = 0.5f 
+
+    // QuickTake (long-press shutter in photo mode records a clip).
+    private var quickTakePending = false
+    private var quickTakeActive = false
+    private var quickTakeReturnMode: CameraMode? = null
+    private var messageJob: Job? = null
 
     init {
         refreshThumbnail()
         observePreferences()
         setupGestureTrigger()
         setupPanoramaListener()
-        captureEngine.setPanoramaYawProvider { currentYaw }
+        captureEngine.setOnCameraReadyListener { onCameraReady() }
+        captureEngine.setOnLowLightListener { dark -> _uiState.update { it.copy(lowLightSuggested = dark) } }
+        captureEngine.setOnQrCodeListener { text -> _uiState.update { it.copy(qrCode = text) } }
+    }
+
+    fun dismissQrCode() = _uiState.update { it.copy(qrCode = null) }
+
+    fun acceptNightSuggestion() {
+        _uiState.update { it.copy(lowLightSuggested = false) }
+        setMode(CameraMode.NIGHT_SIGHT)
+    }
+
+    fun dismissNightSuggestion() = _uiState.update { it.copy(lowLightSuggested = false) }
+
+    /** Hardware volume keys. Returns true if the key was consumed. */
+    fun onVolumeKey(up: Boolean): Boolean = when (_uiState.value.userPreferences.volumeKeyAction) {
+        VolumeKeyAction.SHUTTER -> { toggleCapture(); true }
+        VolumeKeyAction.ZOOM -> {
+            val z = _uiState.value.zoomLevel
+            setZoom(if (up) z * 1.25f else z / 1.25f)
+            true
+        }
+        VolumeKeyAction.VOLUME -> false
+    }
+
+    fun updateHdrPhoto(enabled: Boolean) = viewModelScope.launch { userPreferencesRepository.updateHdrPhoto(enabled) }
+    fun updateVideoFrameRate(rate: VideoFrameRate) = viewModelScope.launch { userPreferencesRepository.updateVideoFrameRate(rate) }
+    fun updateRecordAudio(enabled: Boolean) = viewModelScope.launch { userPreferencesRepository.updateRecordAudio(enabled) }
+
+    private fun onCameraReady() {
+        val capabilities = captureEngine.getCapabilities()
+        _uiState.update {
+            it.copy(
+                capabilities = capabilities,
+                zoomPresets = capabilities?.zoomPresets ?: listOf(1.0f)
+            )
+        }
+        if (quickTakePending) {
+            quickTakePending = false
+            quickTakeActive = true
+            startVideo()
+        }
+        applyTorch()
+    }
+
+    /** In video, "Flash On" means a continuous torch. */
+    private fun applyTorch() {
+        val state = _uiState.value
+        val torch = state.captureType == CaptureType.VIDEO &&
+            state.userPreferences.lightMode == LightMode.FLASH && !state.isFrontCamera
+        captureEngine.setTorchEnabled(torch)
+    }
+
+    /** Quick flash toggle in the top bar: Off -> Auto -> On (Auto is skipped in video). */
+    fun cycleFlash() {
+        val state = _uiState.value
+        val next = when (state.userPreferences.lightMode) {
+            LightMode.NONE -> if (state.captureType == CaptureType.VIDEO) LightMode.FLASH else LightMode.AUTO_NIGHT_SIGHT
+            LightMode.AUTO_NIGHT_SIGHT -> LightMode.FLASH
+            LightMode.FLASH -> LightMode.NONE
+        }
+        updateLightMode(next)
+    }
+
+    /** Brightness slider shown after tap-to-focus. */
+    fun setExposureIndex(index: Int) {
+        val range = _uiState.value.capabilities?.exposureRange ?: return
+        val clamped = index.coerceIn(range.lower, range.upper)
+        if (clamped == _uiState.value.exposureIndex) return
+        _uiState.update { it.copy(exposureIndex = clamped) }
+        captureEngine.setExposureCompensation(clamped)
+        // Keep the focus ring (and slider) visible while the user adjusts.
+        scheduleFocusDismiss()
+    }
+
+    fun updateVideoResolution(resolution: VideoResolution) {
+        viewModelScope.launch { userPreferencesRepository.updateVideoResolution(resolution) }
+    }
+
+    fun toggleVideoStabilization() {
+        viewModelScope.launch {
+            userPreferencesRepository.updateVideoStabilization(!_uiState.value.userPreferences.videoStabilization)
+        }
+    }
+
+    /** Returns all manual controls to automatic. */
+    fun resetProConfig() = updateProConfig(ProConfig())
+
+    /** Shows a short status message in the top pill. */
+    private fun showMessage(message: String, durationMs: Long = 2500) {
+        messageJob?.cancel()
+        _uiState.update { it.copy(backgroundTaskMessage = message) }
+        messageJob = viewModelScope.launch {
+            delay(durationMs)
+            if (_uiState.value.backgroundTaskMessage == message) {
+                _uiState.update { it.copy(backgroundTaskMessage = null) }
+            }
+        }
+    }
+
+    /** Device rotation from an OrientationEventListener (Surface.ROTATION_*). */
+    fun setDeviceRotation(rotation: Int) {
+        captureEngine.setTargetRotation(rotation)
+    }
+
+    fun onResume() {
+        startLeveler()
+    }
+
+    fun onPause() {
+        sensorManager?.unregisterListener(this)
+        if (_uiState.value.isRecording) stopVideo()
+        cancelTimer()
     }
 
     private fun observePreferences() {
@@ -96,7 +216,8 @@ class CameraViewModel(
                     flashMode = prefs.flashMode,
                 ) }
                 captureEngine.applySettings(prefs)
-                captureEngine.setFlashMode(prefs.flashMode)
+                captureEngine.setFlashMode(prefs.effectiveFlashMode)
+                applyTorch()
                 captureEngine.setGestureTriggerEnabled(prefs.gestureTrigger)
                 
                 if (prefs.showLeveler && !prevShowLeveler) {
@@ -147,11 +268,8 @@ class CameraViewModel(
     fun toggleGridLines() {
         viewModelScope.launch {
             val currentMode = _uiState.value.userPreferences.gridMode
-            val nextMode = when (currentMode) {
-                GridMode.OFF -> GridMode.GRID_3X3
-                GridMode.GRID_3X3 -> GridMode.OFF
-                else -> GridMode.OFF
-            }
+            val modes = GridMode.entries
+            val nextMode = modes[(modes.indexOf(currentMode) + 1) % modes.size]
             userPreferencesRepository.updateGridMode(nextMode)
         }
     }
@@ -212,17 +330,18 @@ class CameraViewModel(
             CameraSelector.DEFAULT_BACK_CAMERA
         }
         
+        currentMeteringFactoryProvider = meteringPointFactoryProvider
+        // Capabilities are refreshed in onCameraReady() once binding completes.
         captureEngine.bindToLifecycle(lifecycleOwner, surfaceProvider, selector, meteringPointFactoryProvider)
-        val capabilities = captureEngine.getCapabilities()
-        _uiState.update { it.copy(
-            capabilities = capabilities,
-            zoomPresets = capabilities?.zoomPresets ?: listOf(1.0f)
-        ) }
     }
 
+    private var currentMeteringFactoryProvider: () -> androidx.camera.core.MeteringPointFactory? = { null }
+
     fun toggleCamera() {
+        if (_uiState.value.isRecording || _uiState.value.isProcessing) return
         val nextIsFront = !_uiState.value.isFrontCamera
-        _uiState.update { it.copy(isFrontCamera = nextIsFront) }
+        _uiState.update { it.copy(isFrontCamera = nextIsFront, zoomLevel = 1.0f, exposureIndex = 0) }
+        captureEngine.setExposureCompensation(0)
         
         val lifecycleOwner = currentLifecycleOwner
         val surfaceProvider = currentSurfaceProvider
@@ -233,27 +352,23 @@ class CameraViewModel(
             } else {
                 CameraSelector.DEFAULT_BACK_CAMERA
             }
-            captureEngine.bindToLifecycle(lifecycleOwner, surfaceProvider, selector)
-            
-            // Update capabilities for the new camera
-            val capabilities = captureEngine.getCapabilities()
-            _uiState.update { it.copy(
-                capabilities = capabilities,
-                zoomPresets = capabilities?.zoomPresets ?: listOf(1.0f)
-            ) }
+            captureEngine.bindToLifecycle(lifecycleOwner, surfaceProvider, selector, currentMeteringFactoryProvider)
         }
     }
 
     fun setCaptureType(type: CaptureType) {
+        if (_uiState.value.isRecording) return
         _uiState.update { 
             val nextMode = if (type == CaptureType.PHOTO) CameraMode.PHOTO else CameraMode.VIDEO
             it.copy(captureType = type, currentMode = nextMode) 
         }
         captureEngine.setMode(if (type == CaptureType.PHOTO) CameraMode.PHOTO else CameraMode.VIDEO)
+        applyTorch()
     }
 
     fun setMode(mode: CameraMode) {
-        _uiState.update { it.copy(currentMode = mode) }
+        if (_uiState.value.isRecording || _uiState.value.isPanoramaCapturing) return
+        _uiState.update { it.copy(currentMode = mode, lowLightSuggested = false, qrCode = null, panoramaProgress = null) }
         captureEngine.setMode(mode)
     }
 
@@ -320,80 +435,74 @@ class CameraViewModel(
                 }
             },
             onError = { error ->
-                error.printStackTrace()
+                android.util.Log.e("CameraViewModel", "Capture failed", error)
                 _uiState.update { it.copy(isProcessing = false) }
+                showMessage("Capture failed")
             }
         )
     }
 
     private fun handlePanoramaCapture() {
-        if (!_uiState.value.isPanoramaCapturing) {
-            _uiState.update { it.copy(
-                isPanoramaCapturing = true, 
-                panoramaMessage = "Don't move!",
-                panoramaYaw = 0f,
-                panoramaPitch = 0f,
-                panoramaTargets = panoramaTargets,
-                panoramaCapturedIndices = emptySet()
-            ) }
-            
-            // Set current sensor angles as 0,0 reference
-            panoramaInitialYaw = currentYaw
-            panoramaInitialPitch = currentPitch
-            
-            // Allow the first capture to trigger immediately
-            lastAutoCaptureTime = 0L
+        if (_uiState.value.isPanoramaCapturing) {
+            stopPanoramaCapture()
+            return
+        }
+        if (panoramaStitching) {
+            showMessage("Still stitching the last panorama")
+            return
+        }
+        _uiState.update { it.copy(isPanoramaCapturing = true, panoramaProgress = null) }
+        captureEngine.playStartRecordingSound()
+        captureEngine.startPanorama(
+            onSuccess = {},
+            onError = { error ->
+                android.util.Log.e("CameraViewModel", "Panorama start failed", error)
+                _uiState.update { it.copy(isPanoramaCapturing = false, panoramaProgress = null) }
+                showMessage("Panorama unavailable")
+            }
+        )
+    }
 
-            captureEngine.startPanorama(
-                onSuccess = {
-                    // Manually trigger the first capture for the starting position (0,0)
-                    // This provides the immediate "shutter click" feedback the user expects.
-                    val centerIndex = panoramaTargets.indexOf(0f)
-                    if (centerIndex >= 0) {
-                        autoCapturePanorama(centerIndex)
-                    }
-                },
-                onError = { error ->
-                    error.printStackTrace()
-                    _uiState.update { it.copy(isPanoramaCapturing = false, panoramaMessage = null) }
+    private fun stopPanoramaCapture() {
+        if (!_uiState.value.isPanoramaCapturing) return
+        panoramaStitching = true
+        captureEngine.playStopRecordingSound()
+        _uiState.update {
+            it.copy(isPanoramaCapturing = false, panoramaProgress = null, backgroundTaskMessage = "Stitching panorama...")
+        }
+        captureEngine.stopPanorama(
+            onSuccess = { uriString ->
+                panoramaStitching = false
+                _uiState.update { it.copy(lastCapturedUri = uriString.toUri()) }
+                setPanoramaMessage("Panorama saved", 2500)
+                viewModelScope.launch {
+                    delay(500.milliseconds)
+                    refreshThumbnail()
                 }
-            )
-        } else {
-            _uiState.update { it.copy(isPanoramaCapturing = false, panoramaMessage = null, backgroundTaskMessage = "Stitching Panorama...") }
-            captureEngine.stopPanorama(
-                onSuccess = { uriString ->
-                    val uri = uriString.toUri()
-                    _uiState.update { it.copy(lastCapturedUri = uri, backgroundTaskMessage = "Panorama Saved") }
-                    
-                    // Notify user with thumbnail and clear message
-                    viewModelScope.launch {
-                        delay(2500)
-                        if (_uiState.value.backgroundTaskMessage == "Panorama Saved") {
-                            _uiState.update { it.copy(backgroundTaskMessage = null) }
-                        }
-                    }
-                    viewModelScope.launch {
-                        delay(500.milliseconds)
-                        refreshThumbnail()
-                    }
-                },
-                onError = { error ->
-                    error.printStackTrace()
-                    _uiState.update { it.copy(backgroundTaskMessage = "Stitching Failed") }
-                    viewModelScope.launch {
-                        delay(3000)
-                        if (_uiState.value.backgroundTaskMessage == "Stitching Failed") {
-                            _uiState.update { it.copy(backgroundTaskMessage = null) }
-                        }
-                    }
-                }
-            )
+            },
+            onError = { error ->
+                panoramaStitching = false
+                android.util.Log.e("CameraViewModel", "Panorama failed", error)
+                val text = if (error is PanoramaTooShortException) error.message!! else "Stitching failed"
+                setPanoramaMessage(text, 3000)
+            }
+        )
+    }
+
+    private fun setPanoramaMessage(text: String, durationMs: Long) {
+        panoramaMessageJob?.cancel()
+        _uiState.update { it.copy(backgroundTaskMessage = text) }
+        panoramaMessageJob = viewModelScope.launch {
+            delay(durationMs)
+            if (_uiState.value.backgroundTaskMessage == text) {
+                _uiState.update { it.copy(backgroundTaskMessage = null) }
+            }
         }
     }
 
     fun toggleCapture() {
         val state = _uiState.value
-        if ((state.currentMode == CameraMode.VIDEO) || (state.currentMode == CameraMode.SLOW_MO)) {
+        if (CameraModes.isVideo(state.currentMode)) {
             if (state.isRecording) {
                 stopVideo()
             } else {
@@ -414,9 +523,11 @@ class CameraViewModel(
                 // Recording actually started
             },
             onError = { error ->
-                error.printStackTrace()
+                android.util.Log.e("CameraViewModel", "Recording failed", error)
                 stopRecordingTimer()
-                _uiState.update { it.copy(isRecording = false) }
+                _uiState.update { it.copy(isRecording = false, isPaused = false) }
+                endQuickTake()
+                showMessage(error.message ?: "Recording failed")
             }
         )
     }
@@ -424,14 +535,20 @@ class CameraViewModel(
     fun stopVideo() {
         stopRecordingTimer()
         captureEngine.playStopRecordingSound()
+        // Update UI immediately; the URI arrives once the file is finalized.
+        _uiState.update { it.copy(isRecording = false, isPaused = false) }
         captureEngine.stopSlowMoVideo { uriString ->
-            val uri = uriString.toUri()
-            _uiState.update { it.copy(lastCapturedUri = uri, isRecording = false, isPaused = false) }
-            viewModelScope.launch {
-                delay(800.milliseconds) // Slightly longer delay for video indexing
-                refreshThumbnail()
-            }
+            _uiState.update { it.copy(lastCapturedUri = uriString.toUri()) }
+            endQuickTake()
         }
+    }
+
+    private fun endQuickTake() {
+        if (!quickTakeActive && !quickTakePending) return
+        quickTakeActive = false
+        quickTakePending = false
+        quickTakeReturnMode?.let { captureEngine.setMode(it) }
+        quickTakeReturnMode = null
     }
 
     fun pauseVideo() {
@@ -451,11 +568,10 @@ class CameraViewModel(
     }
 
     fun takePhotoDuringVideo() {
+        captureEngine.playShutterSound()
         captureEngine.captureVideoSnapshot(
-            onSuccess = { _ ->
-                // Maybe play a sound or show a flash
-            },
-            onError = { it.printStackTrace() },
+            onSuccess = { uriString -> _uiState.update { it.copy(lastCapturedUri = uriString.toUri()) } },
+            onError = { showMessage("Snapshot not available") },
         )
     }
 
@@ -485,14 +601,25 @@ class CameraViewModel(
     }
 
     fun quickTakeStart() {
-        _uiState.update { it.copy(isRecording = true) }
-        // In a real app, Quick Take might use a different capture request template
-        // but here we reuse the video logic
-        startVideo()
+        val state = _uiState.value
+        if (state.isRecording || state.isProcessing || timerJob != null) return
+        when (state.currentMode) {
+            CameraMode.VIDEO -> startVideo()
+            CameraMode.PHOTO, CameraMode.PORTRAIT -> {
+                // Temporarily switch the engine to video; recording starts in onCameraReady().
+                quickTakeReturnMode = state.currentMode
+                quickTakePending = true
+                captureEngine.setMode(CameraMode.VIDEO)
+            }
+            else -> Unit
+        }
     }
 
     fun quickTakeStop() {
-        stopVideo()
+        when {
+            quickTakePending -> endQuickTake() // released before the camera was ready
+            _uiState.value.isRecording -> stopVideo()
+        }
     }
 
     private fun setupGestureTrigger() {
@@ -562,67 +689,15 @@ class CameraViewModel(
         }
     }
 
+    /** Sweep progress comes from image tracking in the native engine (no sensor dots). */
     private fun setupPanoramaListener() {
-        captureEngine.setOnPanoramaListener { message ->
-            _uiState.update { it.copy(panoramaMessage = message) }
-            // Clear message after a short delay
-            viewModelScope.launch {
-                delay(2000)
-                if (_uiState.value.panoramaMessage == message) {
-                    _uiState.update { it.copy(panoramaMessage = null) }
-                }
-            }
-        }
-    }
-
-    private fun updatePanoramaState(yaw: Float, pitch: Float) {
-        var deltaYaw = yaw - panoramaInitialYaw
-        while (deltaYaw > 180) deltaYaw -= 360f
-        while (deltaYaw < -180) deltaYaw += 360f
-        
-        val deltaPitch = pitch - panoramaInitialPitch
-
-        _uiState.update { it.copy(panoramaYaw = deltaYaw, panoramaPitch = deltaPitch) }
-
-        // Check for auto-capture alignment
-        val state = _uiState.value
-        val targets = state.panoramaTargets
-        val captured = state.panoramaCapturedIndices
-        
-        for (i in targets.indices) {
-            if (i !in captured) {
-                val targetYaw = targets[i]
-                if (abs(deltaYaw - targetYaw) < 1.0f && abs(deltaPitch) < 1.5f) {
-                    // Align!
-                    if (System.currentTimeMillis() - lastAutoCaptureTime > 1500) {
-                        autoCapturePanorama(i)
-                    }
-                }
-            }
-        }
-    }
-
-    private fun autoCapturePanorama(index: Int) {
-        lastAutoCaptureTime = System.currentTimeMillis()
-        _uiState.update { it.copy(
-            panoramaCapturedIndices = it.panoramaCapturedIndices + index,
-            panoramaMessage = "Don't move!"
-        ) }
-        
-        captureEngine.playShutterSound()
-        // Here we could also signal the engine to prioritize this frame
-        
-        viewModelScope.launch {
-            delay(800.milliseconds)
-            if (_uiState.value.isPanoramaCapturing) {
-                val captured = _uiState.value.panoramaCapturedIndices.size
-                val total = _uiState.value.panoramaTargets.size
-                if (captured < total) {
-                    _uiState.update { it.copy(panoramaMessage = "Move to the next dot") }
-                } else {
-                    _uiState.update { it.copy(panoramaMessage = "Perfect! Press stop to finish") }
-                }
-            }
+        captureEngine.setOnPanoramaProgressListener { progress ->
+            val state = _uiState.value
+            if (state.currentMode != CameraMode.PANORAMA) return@setOnPanoramaProgressListener
+            // Idle thumbnails only before a sweep, sweep progress only during one.
+            if (progress.isIdlePreview == state.isPanoramaCapturing) return@setOnPanoramaProgressListener
+            _uiState.update { it.copy(panoramaProgress = progress) }
+            if (!progress.isIdlePreview && progress.hint == PanoramaHint.COMPLETE) stopPanoramaCapture()
         }
     }
 
@@ -640,7 +715,9 @@ class CameraViewModel(
 
     fun refreshThumbnail() {
         viewModelScope.launch {
-            val uri = mediaRepository.getLatestMediaUri()
+            val uri = withContext(Dispatchers.IO) {
+                runCatching { mediaRepository.getLatestMediaUri() }.getOrNull()
+            }
             _uiState.update { it.copy(lastCapturedUri = uri) }
         }
     }
@@ -661,9 +738,22 @@ class CameraViewModel(
         captureEngine.updateManualConfig(config)
     }
 
+    private fun scheduleFocusDismiss() {
+        focusJob?.cancel()
+        focusJob = viewModelScope.launch {
+            delay(4000)
+            _focusState.value = null
+        }
+    }
+
     fun focusAt(x: Float, y: Float) {
         val offset = androidx.compose.ui.geometry.Offset(x, y)
         _focusState.value = FocusState(offset, isLocked = false)
+        // A new tap starts from neutral brightness, as on most camera apps.
+        if (_uiState.value.exposureIndex != 0) {
+            _uiState.update { it.copy(exposureIndex = 0) }
+            captureEngine.setExposureCompensation(0)
+        }
         
         captureEngine.focusAt(x, y) { success ->
             if (success) {
@@ -672,12 +762,7 @@ class CameraViewModel(
                 }
             }
         }
-        
-        focusJob?.cancel()
-        focusJob = viewModelScope.launch {
-            delay(4000)
-            _focusState.value = null
-        }
+        scheduleFocusDismiss()
     }
 
     fun initSensors(sensorManager: SensorManager) {
@@ -694,8 +779,7 @@ class CameraViewModel(
         if (this.rotationSensor == null) {
             this.rotationSensor = sensorManager.getDefaultSensor(Sensor.TYPE_ACCELEROMETER)
         }
-        
-        startLeveler()
+        // Listener is registered in onResume() and removed in onPause().
     }
 
     private fun startLeveler() {
@@ -754,10 +838,6 @@ class CameraViewModel(
             
             updateOrientationFromRoll(roll)
 
-            if (_uiState.value.isPanoramaCapturing) {
-                updatePanoramaState(currentYaw, currentPitch)
-            }
-
             // Auto leveler logic
             if (abs(currentPitch) < 60) {
                 currentTilt += alpha * (roll - currentTilt)
@@ -804,6 +884,6 @@ class CameraViewModel(
 
     override fun onCleared() {
         super.onCleared()
-        stopLeveler()
+        sensorManager?.unregisterListener(this)
     }
 }

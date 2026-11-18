@@ -1,0 +1,8 @@
+• Removed all Google/proprietary dependencies (MediaPipe, TensorFlow Lite, Coil/OkHttp, Material Components)
+• Night mode now merges an aligned burst of longer exposures
+• Real HDR exposure fusion
+• Portrait mode now actually segments the subject and blurs the background
+• Videos now record audio
+• Photos taken in landscape are saved the right way up
+• Location tagging works (no Play Services needed)
+• Flip-camera, manual-controls and gallery buttons work

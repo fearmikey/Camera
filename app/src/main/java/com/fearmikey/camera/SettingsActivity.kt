@@ -1,79 +1,98 @@
 package com.fearmikey.camera
 
 import android.os.Bundle
+import android.os.Environment
+import android.os.StatFs
+import android.text.format.Formatter
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
-import androidx.compose.foundation.clickable
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.tooling.preview.Preview
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
-import com.fearmikey.camera.domain.model.UserPreferences
-import com.fearmikey.camera.domain.model.GridMode
 import com.fearmikey.camera.data.repository.UserPreferencesRepository
-import androidx.compose.material3.ExperimentalMaterial3Api
+import com.fearmikey.camera.domain.model.GridMode
+import com.fearmikey.camera.domain.model.UserPreferences
+import com.fearmikey.camera.domain.model.VideoFrameRate
+import com.fearmikey.camera.domain.model.VideoResolution
+import com.fearmikey.camera.domain.model.VolumeKeyAction
 import kotlinx.coroutines.launch
+
+import com.fearmikey.camera.ui.theme.CameraAppTheme
+
+/** Every action the settings list can trigger; keeps the list composable previewable. */
+data class SettingsActions(
+    val onToggle: (String, Boolean) -> Unit = { _, _ -> },
+    val onGridMode: (GridMode) -> Unit = {},
+    val onVolumeKeyAction: (VolumeKeyAction) -> Unit = {},
+    val onVideoResolution: (VideoResolution) -> Unit = {},
+    val onVideoFrameRate: (VideoFrameRate) -> Unit = {},
+)
 
 @OptIn(ExperimentalMaterial3Api::class)
 class SettingsActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         enableEdgeToEdge()
         super.onCreate(savedInstanceState)
-        
+
         val repository = UserPreferencesRepository(this)
-        
+
         setContent {
             val prefs by repository.userPreferencesFlow.collectAsState(initial = UserPreferences())
-            
-            MaterialTheme(colorScheme = darkColorScheme()) {
+            val scope = rememberCoroutineScope()
+            val actions = remember {
+                SettingsActions(
+                    onToggle = { key, value ->
+                        scope.launch {
+                            when (key) {
+                                "location" -> repository.updateLocationTagging(value)
+                                "leveler" -> repository.updateShowLeveler(value)
+                                "camera_sounds" -> repository.updateCameraSounds(value)
+                                "mirror_selfies" -> repository.updateMirrorSelfies(value)
+                                "timer_light" -> repository.updateTimerLight(value)
+                                "palm_timer" -> repository.updateGestureTrigger(value)
+                                "scan_qr" -> repository.updateScanQrCodes(value)
+                                "double_tap" -> repository.updateDoubleTapSwitch(value)
+                                "low_light" -> repository.updateLowLightSuggestion(value)
+                                "hdr" -> repository.updateHdrPhoto(value)
+                                "stabilization" -> repository.updateVideoStabilization(value)
+                                "audio" -> repository.updateRecordAudio(value)
+                            }
+                        }
+                    },
+                    onGridMode = { scope.launch { repository.updateGridMode(it) } },
+                    onVolumeKeyAction = { scope.launch { repository.updateVolumeKeyAction(it) } },
+                    onVideoResolution = { scope.launch { repository.updateVideoResolution(it) } },
+                    onVideoFrameRate = { scope.launch { repository.updateVideoFrameRate(it) } },
+                )
+            }
+
+            CameraAppTheme {
                 Scaffold(
                     topBar = {
                         CenterAlignedTopAppBar(
-                            title = { Text("Settings") },
+                            title = { Text("Camera settings") },
                             navigationIcon = {
                                 IconButton(onClick = { finish() }) {
                                     Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Back")
                                 }
                             },
-                            colors = TopAppBarDefaults.centerAlignedTopAppBarColors(
-                                containerColor = Color.Black,
-                                titleContentColor = Color.White,
-                                navigationIconContentColor = Color.White,
-                            ),
                         )
                     },
-                    containerColor = Color.Black,
                 ) { padding ->
-                    val coroutineScope = rememberCoroutineScope()
-                    SettingsList(
-                        prefs = prefs,
-                        onToggle = { key, value ->
-                            coroutineScope.launch {
-                                when (key) {
-                                    "location" -> repository.updateLocationTagging(value)
-                                    "leveler" -> repository.updateShowLeveler(value)
-                                    "camera_sounds" -> repository.updateCameraSounds(value)
-                                    "mirror_selfies" -> repository.updateMirrorSelfies(value)
-                                    "ultra_hdr" -> repository.updateUltraHdr(value)
-                                    "timer_light" -> repository.updateTimerLight(value)
-                                    "palm_timer" -> repository.updateGestureTrigger(value)
-                                }
-                            }
-                        },
-                        onGridModeChange = { mode ->
-                            coroutineScope.launch { repository.updateGridMode(mode) }
-                        },
-                        modifier = Modifier.padding(padding)
-                    )
+                    SettingsList(prefs = prefs, actions = actions, modifier = Modifier.padding(padding))
                 }
             }
         }
@@ -83,113 +102,103 @@ class SettingsActivity : ComponentActivity() {
 @Composable
 fun SettingsList(
     prefs: UserPreferences,
-    onToggle: (String, Boolean) -> Unit,
-    onGridModeChange: (GridMode) -> Unit,
+    actions: SettingsActions,
     modifier: Modifier = Modifier,
 ) {
-    var showGridDialog by remember { mutableStateOf(value = false) }
-
-    if (showGridDialog) {
-        GridModeDialog(
-            currentMode = prefs.gridMode,
-            onModeSelected = {
-                onGridModeChange(it)
-                showGridDialog = false
-            },
-        ) { showGridDialog = false }
+    val context = LocalContext.current
+    var dialog by remember { mutableStateOf<String?>(null) }
+    val freeSpace = remember {
+        runCatching {
+            val stat = StatFs(Environment.getExternalStorageDirectory().path)
+            Formatter.formatShortFileSize(context, stat.availableBytes) + " available"
+        }.getOrDefault("Unknown")
     }
 
-    LazyColumn(
-        modifier = modifier
-            .fillMaxSize()
-            .padding(horizontal = 16.dp)
-    ) {
+    when (dialog) {
+        "grid" -> ChoiceDialog("Grid type", GridMode.entries, prefs.gridMode, { it.label }, { actions.onGridMode(it); dialog = null }) { dialog = null }
+        "volume" -> ChoiceDialog("Volume key action", VolumeKeyAction.entries, prefs.volumeKeyAction, { it.label }, { actions.onVolumeKeyAction(it); dialog = null }) { dialog = null }
+        "resolution" -> ChoiceDialog("Video resolution", VideoResolution.entries, prefs.videoResolution, { it.value }, { actions.onVideoResolution(it); dialog = null }) { dialog = null }
+        "fps" -> ChoiceDialog("Video frame rate", VideoFrameRate.entries, prefs.videoFrameRate, { it.label }, { actions.onVideoFrameRate(it); dialog = null }) { dialog = null }
+    }
+
+    val versionName = remember {
+        runCatching { context.packageManager.getPackageInfo(context.packageName, 0).versionName }.getOrNull() ?: "—"
+    }
+    val toggle = actions.onToggle
+    LazyColumn(modifier = modifier.fillMaxSize().padding(horizontal = 16.dp)) {
         item { SettingsHeader("General") }
-        item { SettingsItem("Save location", "Other apps may be able to view photo & video location info", prefs.locationTagging) { onToggle("location", it) } }
-        item { SettingsItem("Camera sounds", null, prefs.cameraSounds) { onToggle("camera_sounds", it) } }
-        item { SettingsItem("Device storage", null, false, enabled = false) { } }
-        item { SettingsItem("Camera scan suggestions", "Point your camera to scan QR codes and documents", true, enabled = false) { } }
-        item { SettingsItem("Model download", null, false, enabled = false) { } }
+        item { SettingsItem("Save location", "Add GPS coordinates to photos and videos. Other apps may be able to view this information.", prefs.locationTagging, onCheckedChange = { toggle("location", it) }) }
+        item { SettingsItem("Camera sounds", "Shutter, timer and recording sounds", prefs.cameraSounds, onCheckedChange = { toggle("camera_sounds", it) }) }
+        item { SettingsItem("Device storage", "$freeSpace · Saved to DCIM/Camera") }
+        item { SettingsItem("Scan QR codes", "Show a suggestion when a QR code is in view (Photo mode). Decoded on-device.", prefs.scanQrCodes, onCheckedChange = { toggle("scan_qr", it) }) }
 
         item { SettingsHeader("Composition") }
-        item { SettingsItem("Framing hints", "On-screen tips and tools, like levelers and focus tips", prefs.showLeveler) { onToggle("leveler", it) } }
-        item { 
-            SettingsItem(
-                title = "Grid type", 
-                description = prefs.gridMode.label,
-                onClick = { showGridDialog = true }
-            ) 
-        }
-        item { SettingsItem("Keep selfies as seen", "Save selfies as they appear on screen", prefs.mirrorSelfies) { onToggle("mirror_selfies", it) } }
-        item { SettingsItem("Guided Frame", "For people with blindness or low vision. Helps frame and automatically take photos.", false, enabled = false) { } }
-        item { SettingsItem("Camera Coach (Preview)", "Get photo inspiration and capture the perfect shot with step-by-step guidance", false, enabled = false) { } }
+        item { SettingsItem("Framing hints", "Show a horizon leveler in the viewfinder", prefs.showLeveler, onCheckedChange = { toggle("leveler", it) }) }
+        item { SettingsItem("Grid type", prefs.gridMode.label, onClick = { dialog = "grid" }) }
+        item { SettingsItem("Keep selfies as seen", "Save selfies mirrored, as they appear on screen", prefs.mirrorSelfies, onCheckedChange = { toggle("mirror_selfies", it) }) }
 
         item { SettingsHeader("Fast access") }
-        item { SettingsItem("Quick access controls", "Adjust white balance, exposure, and shadows by tapping the viewfinder", true, enabled = false) { } }
-        item { SettingsItem("Volume key action", "Shutter", null, enabled = false) { } }
-        item { SettingsItem("Palm timer", "Start a photo timer by showing your palm to the front or rear cameras", prefs.gestureTrigger) { onToggle("palm_timer", it) } }
+        item { SettingsItem("Volume key action", prefs.volumeKeyAction.label, onClick = { dialog = "volume" }) }
+        item { SettingsItem("Double-tap to switch camera", "Double-tap the viewfinder to flip between front and back", prefs.doubleTapSwitch, onCheckedChange = { toggle("double_tap", it) }) }
+        item { SettingsItem("Palm timer", "Hold up an open hand next to your face to start a 3-second timer", prefs.gestureTrigger, onCheckedChange = { toggle("palm_timer", it) }) }
 
         item { SettingsHeader("Photo") }
-        item { SettingsItem("Rich color in photos", "Use Display P3 color format instead of sRGB for richer and more vibrant colors.", false, enabled = false) { } }
-        item { SettingsItem("Ultra HDR", "Ultra HDR brightens the lightest parts of images...", prefs.ultraHdr, enabled = false) { onToggle("ultra_hdr", it) } }
-        item { SettingsItem("Auto Best Take", "Automatically choose the best expressions...", true, enabled = false) { } }
-        item { SettingsItem("Social media depth features", "Depth data will be saved...", false, enabled = false) { } }
-        item { SettingsItem("Frequent Faces", null, false, enabled = false) { } }
-        item { SettingsItem("Astrophotography", null, false, enabled = false) }
-        
+        item { SettingsItem("HDR", "Capture an exposure bracket and merge it for more detail in highlights and shadows (slower)", prefs.hdrPhoto, onCheckedChange = { toggle("hdr", it) }) }
+        item { SettingsItem("Low-light suggestions", "Offer Night mode when the scene is dark", prefs.lowLightSuggestion, onCheckedChange = { toggle("low_light", it) }) }
+
         item { SettingsHeader("Video") }
-        item { SettingsItem("Video stabilization", "Reduce camera shake to make videos smoother.", true, enabled = false) { } }
-        item { SettingsItem("Audio zoom", "Zooming in on subject boosts sound and reduces background noise", true, enabled = false) { } }
-        item { SettingsItem("Video format", "H.265/HEVC", null, enabled = false) { } }
-        item { SettingsItem("Optimize FPS", "Automatically adjust from 60 FPS to 30 FPS...", true, enabled = false) }
-        
-        item { SettingsHeader("Advanced capture") }
-        item { SettingsItem("Timer light", "Flashes the back camera light during the timer countdown.", prefs.timerLight) { onToggle("timer_light", it) } }
-        item { SettingsItem("Show dirty lens warning", "Display warning when the lens may be too dirty...", true, enabled = false) { } }
-        item { SettingsItem("Underwater photography and video", "Restores true colors...", false, enabled = false) { } }
-        
-        item { SettingsHeader("Help & feedback") }
-        item { SettingsItem("Send feedback", null, false, enabled = false) }
-        
+        item { SettingsItem("Resolution", prefs.videoResolution.value, onClick = { dialog = "resolution" }) }
+        item { SettingsItem("Frame rate", prefs.videoFrameRate.label, onClick = { dialog = "fps" }) }
+        item { SettingsItem("Video stabilization", "Reduce camera shake for smoother videos", prefs.videoStabilization, onCheckedChange = { toggle("stabilization", it) }) }
+        item { SettingsItem("Record audio", null, prefs.recordAudio, onCheckedChange = { toggle("audio", it) }) }
+
+        item { SettingsHeader("Advanced") }
+        item { SettingsItem("Timer light", "Flash the rear light during the timer countdown", prefs.timerLight, onCheckedChange = { toggle("timer_light", it) }) }
+
+        item { SettingsHeader("About") }
+        item { SettingsItem("Version", versionName) }
+        item {
+            SettingsItem(
+                "Free & open source",
+                "No ads, no analytics, no network access. All processing happens on your device using OpenCV and the Android camera APIs."
+            )
+        }
+        item { SettingsItem("License", "GNU General Public License v3.0 or later. Uses OpenCV and AndroidX (Apache-2.0).") }
+
         item { Spacer(modifier = Modifier.height(32.dp)) }
     }
 }
 
 @Composable
-fun GridModeDialog(
-    currentMode: GridMode,
-    onModeSelected: (GridMode) -> Unit,
-    onDismiss: () -> Unit
+fun <T> ChoiceDialog(
+    title: String,
+    options: List<T>,
+    selected: T,
+    label: (T) -> String,
+    onSelect: (T) -> Unit,
+    onDismiss: () -> Unit,
 ) {
     AlertDialog(
         onDismissRequest = onDismiss,
-        title = { Text("Grid type") },
+        title = { Text(title) },
         text = {
             Column {
-                GridMode.entries.forEach { mode ->
+                options.forEach { option ->
                     Row(
                         modifier = Modifier
                             .fillMaxWidth()
-                            .clickable { onModeSelected(mode) }
+                            .clickable { onSelect(option) }
                             .padding(vertical = 12.dp),
                         verticalAlignment = Alignment.CenterVertically
                     ) {
-                        RadioButton(
-                            selected = mode == currentMode,
-                            onClick = { onModeSelected(mode) }
-                        )
+                        RadioButton(selected = option == selected, onClick = { onSelect(option) })
                         Spacer(modifier = Modifier.width(8.dp))
-                        Text(mode.label)
+                        Text(label(option))
                     }
                 }
             }
         },
-        confirmButton = {
-            TextButton(onClick = onDismiss) { Text("Cancel") }
-        },
-        containerColor = Color(0xFF2C2C2C),
-        titleContentColor = Color.White,
-        textContentColor = Color.White
+        confirmButton = { TextButton(onClick = onDismiss) { Text("Cancel") } },
     )
 }
 
@@ -197,7 +206,7 @@ fun GridModeDialog(
 fun SettingsHeader(title: String) {
     Text(
         text = title,
-        color = Color(0xFFDDE4D7),
+        color = MaterialTheme.colorScheme.primary,
         style = MaterialTheme.typography.labelLarge,
         fontWeight = FontWeight.Bold,
         modifier = Modifier.padding(top = 24.dp, bottom = 8.dp)
@@ -214,42 +223,49 @@ fun SettingsItem(
     onCheckedChange: ((Boolean) -> Unit)? = null,
 ) {
     val alpha = if (enabled) 1f else 0.4f
+    val rowClick: (() -> Unit)? = when {
+        !enabled -> null
+        onClick != null -> onClick
+        checked != null && onCheckedChange != null -> { { onCheckedChange(!checked) } }
+        else -> null
+    }
     Row(
         modifier = Modifier
             .fillMaxWidth()
-            .clickable(enabled = (enabled && onClick != null)) { onClick?.invoke() }
+            .clickable(enabled = rowClick != null) { rowClick?.invoke() }
             .padding(vertical = 12.dp),
         horizontalArrangement = Arrangement.SpaceBetween,
         verticalAlignment = Alignment.CenterVertically,
     ) {
-        Column(modifier = Modifier.weight(1f)) {
+        Column(modifier = Modifier.weight(1f).padding(end = 12.dp)) {
             Text(
                 text = title,
-                color = Color.White.copy(alpha = alpha),
+                color = MaterialTheme.colorScheme.onSurface.copy(alpha = alpha),
                 style = MaterialTheme.typography.bodyLarge,
                 fontWeight = FontWeight.Medium,
             )
             description?.let {
                 Text(
                     text = it,
-                    color = Color.Gray.copy(alpha = alpha),
+                    color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = alpha),
                     style = MaterialTheme.typography.bodySmall,
                     lineHeight = 16.sp,
                 )
             }
         }
         if (checked != null) {
-            Switch(
-                checked = checked,
-                onCheckedChange = onCheckedChange,
-                enabled = enabled,
-                colors = SwitchDefaults.colors(
-                    checkedThumbColor = MaterialTheme.colorScheme.onPrimary,
-                    checkedTrackColor = MaterialTheme.colorScheme.primary,
-                    uncheckedThumbColor = MaterialTheme.colorScheme.outline,
-                    uncheckedTrackColor = MaterialTheme.colorScheme.surfaceVariant
-                )
-            )
+            Switch(checked = checked, onCheckedChange = onCheckedChange, enabled = enabled)
+        }
+    }
+}
+
+@Preview(name = "Light", widthDp = 393, heightDp = 900, showBackground = true)
+@Preview(name = "Dark", widthDp = 393, heightDp = 900, showBackground = true, uiMode = android.content.res.Configuration.UI_MODE_NIGHT_YES)
+@Composable
+private fun SettingsListPreview() {
+    CameraAppTheme {
+        Surface(color = MaterialTheme.colorScheme.surface) {
+            SettingsList(prefs = UserPreferences(), actions = SettingsActions())
         }
     }
 }

@@ -1,0 +1,29 @@
+A fully free and open-source camera app with computational photography that runs entirely on your device.
+
+<b>Capture modes</b>
+<ul>
+<li><b>Photo</b> – GPU pixel binning for clean 12 MP shots, or full sensor resolution</li>
+<li><b>Night</b> – aligns and merges a burst of longer exposures for bright, low-noise low-light photos</li>
+<li><b>HDR</b> option – captures an exposure bracket and fuses it to keep detail in highlights and shadows</li>
+<li><b>Portrait</b> – detects the subject and blurs the background</li>
+<li><b>Long exposure</b> – handheld motion blur for waterfalls and light trails</li>
+<li><b>Panorama</b> – guided capture with native stitching</li>
+<li><b>Video</b>, <b>Time lapse</b> and <b>Slow motion</b> (on devices that support high-speed capture)</li>
+<li>QR code scanning built in</li>
+</ul>
+
+<b>Features</b>
+<ul>
+<li>Manual ISO, shutter speed, focus and white balance</li>
+<li>Tap-to-focus brightness slider</li>
+<li>4K video with stabilization</li>
+<li>Macro focus</li>
+<li>RAW (DNG) + JPEG capture</li>
+<li>Palm timer: raise an open hand to start a 3-second countdown</li>
+<li>Grid overlays, horizon leveler, tap to focus, pinch to zoom, volume-key shutter</li>
+<li>Optional photo geotagging using Android's built-in location service</li>
+<li>Works as the lock-screen camera</li>
+</ul>
+
+<b>Privacy</b>
+No ads, no analytics, no Google Play Services and no internet permission. All image processing uses OpenCV and the Android camera APIs on your device.

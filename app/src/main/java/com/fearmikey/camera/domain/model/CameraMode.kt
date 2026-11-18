@@ -4,8 +4,36 @@ enum class CameraMode {
     PHOTO,
     VIDEO,
     NIGHT_SIGHT,
+    /** Not a mode-row entry anymore: PHOTO captures use the HDR pipeline when UserPreferences.hdrPhoto is on. */
     HDR,
     SLOW_MO,
     PORTRAIT,
-    PANORAMA
+    PANORAMA,
+    /** Aligned multi-frame average that blurs moving subjects (waterfalls, traffic). */
+    LONG_EXPOSURE,
+    /** Camera2 MediaRecorder recording at a low capture rate, played back at 30 fps. */
+    TIME_LAPSE,
+}
+
+/** Mode rows shown under the shutter. Single source of truth for the UI. */
+object CameraModes {
+    val photo = listOf(CameraMode.NIGHT_SIGHT, CameraMode.PORTRAIT, CameraMode.PHOTO, CameraMode.LONG_EXPOSURE, CameraMode.PANORAMA)
+    val video = listOf(CameraMode.SLOW_MO, CameraMode.TIME_LAPSE, CameraMode.VIDEO)
+
+    fun label(mode: CameraMode): String = when (mode) {
+        CameraMode.PHOTO -> "Photo"
+        CameraMode.VIDEO -> "Video"
+        CameraMode.NIGHT_SIGHT -> "Night"
+        CameraMode.HDR -> "HDR"
+        CameraMode.SLOW_MO -> "Slow motion"
+        CameraMode.PORTRAIT -> "Portrait"
+        CameraMode.PANORAMA -> "Panorama"
+        CameraMode.LONG_EXPOSURE -> "Long exposure"
+        CameraMode.TIME_LAPSE -> "Time lapse"
+    }
+
+    /** Modes recorded with Camera2 + MediaRecorder (no live preview while recording). */
+    fun isCamera2Video(mode: CameraMode) = mode == CameraMode.SLOW_MO || mode == CameraMode.TIME_LAPSE
+
+    fun isVideo(mode: CameraMode) = mode == CameraMode.VIDEO || isCamera2Video(mode)
 }

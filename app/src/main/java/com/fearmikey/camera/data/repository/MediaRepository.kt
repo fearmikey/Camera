@@ -2,7 +2,9 @@ package com.fearmikey.camera.data.repository
 
 import android.content.ContentUris
 import android.content.Context
+import android.graphics.Bitmap
 import android.net.Uri
+import android.util.Size
 import android.provider.MediaStore
 
 class MediaRepository(private val context: Context) {
@@ -63,4 +65,13 @@ class MediaRepository(private val context: Context) {
 
         return if (latestImageDate > latestVideoDate) latestImageUri else latestVideoUri
     }
+
+    /** Platform thumbnail (works for both images and videos). Call off the main thread. */
+    fun loadThumbnail(uri: Uri, sizePx: Int): Bitmap? = try {
+        context.contentResolver.loadThumbnail(uri, Size(sizePx, sizePx), null)
+    } catch (e: Exception) {
+        null
+    }
+
+    fun mimeType(uri: Uri): String? = context.contentResolver.getType(uri)
 }

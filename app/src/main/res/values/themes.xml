@@ -1,4 +1,18 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
-    <style name="Theme.Camera" parent="Theme.Material3.DayNight.NoActionBar" />
+    <!-- Follows the system light/dark setting (Compose draws the content with
+         Material You colours; this only controls the window before Compose starts). -->
+    <style name="Theme.Camera" parent="android:Theme.DeviceDefault.DayNight">
+        <item name="android:windowActionBar">false</item>
+        <item name="android:windowNoTitle">true</item>
+        <item name="android:statusBarColor">@android:color/transparent</item>
+        <item name="android:navigationBarColor">@android:color/transparent</item>
+    </style>
+
+    <!-- The viewfinder is always dark, whatever the system theme. -->
+    <style name="Theme.Camera.Viewfinder">
+        <item name="android:windowBackground">@android:color/black</item>
+        <item name="android:windowLightStatusBar">false</item>
+        <item name="android:windowLightNavigationBar">false</item>
+    </style>
 </resources>

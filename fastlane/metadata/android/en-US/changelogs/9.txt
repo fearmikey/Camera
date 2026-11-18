@@ -1,0 +1,8 @@
+• New Long exposure and Time lapse modes
+• Rebuilt panorama: tap once and sweep, live preview, automatic stop at 360°
+• Rewritten Night, HDR and Portrait modes (OpenCV, no ML models)
+• QR code suggestions, low-light Night suggestion, macro focus, brightness slider
+• Material You theming and themed launcher icon
+• Video: 1080p/4K, frame rate, stabilization, audio options
+• Volume key can act as shutter, zoom or volume
+• Removed all Google/proprietary dependencies; app is GPL-3.0-or-later
