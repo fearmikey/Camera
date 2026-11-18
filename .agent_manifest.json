@@ -21,7 +21,7 @@
       "image_loading": "ContentResolver.loadThumbnail (MediaThumbnail composable in MainActivity.kt); no image-loading library",
       "location": "Framework LocationManager (DeviceLocationProvider); no Play Services",
       "async": "Kotlin Coroutines & StateFlow; Camera2 uses a HandlerThread; analyzers use ExecutorServices",
-      "build": "AGP 8.7.3, compileSdk/targetSdk 35, minSdk 31, version catalog gradle/libs.versions.toml, minify disabled, buildConfig + prefab enabled, dependenciesInfo excluded from APK/AAB, optional -PabiFilter=<abi> per-ABI build"
+      "build": "AGP 8.7.3, compileSdk/targetSdk 35, minSdk 31, version catalog gradle/libs.versions.toml, release R8 minify + shrinkResources enabled (app/proguard-rules.pro keeps NativePanoramaBridge/NativeVisionBridge for JNI), buildConfig + prefab enabled, dependenciesInfo excluded from APK/AAB, optional -PabiFilter=<abi> per-ABI build"
     }
   },
   "data_flow_pattern": {
