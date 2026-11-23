@@ -14,7 +14,7 @@
  * 1-point translation RANSAC (phase correlation as fallback), and a new keyframe is taken
  * once the view has moved far enough and the frame is sharp.
  *
- * Stitch: pairwise offsets are refined at half resolution, vertical drift is levelled,
+ * Stitch: pairwise offsets are refined at half resolution, vertical drift is leveled,
  * exposure is matched per seam, min-cost seams are cut through each overlap and blended
  * locally with a Laplacian pyramid, and the result is cropped to the largest clean
  * rectangle.

@@ -2,73 +2,28 @@ package com.fearmikey.camera.data.engine.analysis
 
 import android.graphics.Bitmap
 import android.graphics.Matrix
-import android.util.Log
 import androidx.camera.core.ImageAnalysis
 import androidx.camera.core.ImageProxy
 import com.fearmikey.camera.data.engine.gesture.GestureAnalyzer
-import com.fearmikey.camera.data.engine.processing.NativeVisionBridge
 
 /**
  * CameraX allows one analyzer per ImageAnalysis, so this fans each frame out to
- * the enabled sub-analyzers (palm timer, QR scanner) and closes it afterwards.
+ * the enabled sub-analyzers (palm timer, QR/barcode scanner, Portrait face tracking)
+ * and closes it afterwards.
  */
 class FrameAnalysisRouter(
     private val gesture: GestureAnalyzer?,
-    private val qr: QrCodeAnalyzer?,
+    private val codes: CodeScanAnalyzer?,
+    private val portraitFaces: PortraitFaceAnalyzer? = null,
 ) : ImageAnalysis.Analyzer {
     override fun analyze(image: ImageProxy) {
         try {
-            qr?.processFrame(image)
+            codes?.processFrame(image)
+            portraitFaces?.processFrame(image)
             gesture?.processFrame(image)
         } finally {
             image.close()
         }
-    }
-}
-
-/**
- * Decodes QR codes with OpenCV's QRCodeDetector (FOSS, on-device). Reports a
- * payload once when it appears and null once it has been out of view for a while.
- */
-class QrCodeAnalyzer(private val onResult: (String?) -> Unit) {
-    private var frameCounter = 0
-    private var lastPayload: String? = null
-    private var lastSeen = 0L
-
-    fun processFrame(image: ImageProxy) {
-        frameCounter++
-        if (frameCounter % FRAME_SKIP != 0) return
-        val now = System.currentTimeMillis()
-        val bitmap = try {
-            image.toUprightBitmap(MAX_SIDE)
-        } catch (e: Exception) {
-            return
-        }
-        val text = try {
-            NativeVisionBridge.nativeDecodeQr(bitmap)
-        } catch (e: Exception) {
-            Log.w(TAG, "QR decode error: ${e.message}")
-            null
-        } finally {
-            bitmap.recycle()
-        }
-        if (!text.isNullOrBlank()) {
-            lastSeen = now
-            if (text != lastPayload) {
-                lastPayload = text
-                onResult(text)
-            }
-        } else if (lastPayload != null && now - lastSeen > CLEAR_AFTER_MS) {
-            lastPayload = null
-            onResult(null)
-        }
-    }
-
-    private companion object {
-        const val TAG = "QrCodeAnalyzer"
-        const val FRAME_SKIP = 5
-        const val MAX_SIDE = 1024
-        const val CLEAR_AFTER_MS = 4000L
     }
 }
 

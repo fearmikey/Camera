@@ -5,11 +5,13 @@ import android.os.Looper
 import androidx.camera.core.CameraSelector
 import androidx.camera.core.Preview
 import androidx.lifecycle.LifecycleOwner
+import com.fearmikey.camera.data.engine.analysis.CodeScanFrame
+import com.fearmikey.camera.data.engine.analysis.PortraitFaceFrame
 import com.fearmikey.camera.data.engine.gesture.GestureResult
 import com.fearmikey.camera.domain.model.CameraHardwareCapabilities
 import com.fearmikey.camera.domain.model.CameraMode
 import com.fearmikey.camera.domain.model.FlashMode
-import com.fearmikey.camera.domain.model.ImageSaveMode
+import com.fearmikey.camera.domain.model.ModeCapabilities
 import com.fearmikey.camera.domain.model.ProConfig
 import com.fearmikey.camera.domain.model.UserPreferences
 
@@ -28,6 +30,10 @@ class HybridCaptureEngine(
     private var currentPrefs: UserPreferences = UserPreferences()
     private var isFrontCamera = false
     private var slowMoActive = false
+    private var isProMode = false
+    private var proConfig = ProConfig()
+    /** Last low-light state from CameraX's scene monitor (drives Auto Night). Main thread. */
+    private var sceneIsDark = false
     private val mainHandler = Handler(Looper.getMainLooper())
 
     private fun onMain(block: () -> Unit) {
@@ -38,11 +44,11 @@ class HybridCaptureEngine(
         lifecycleOwner: LifecycleOwner,
         surfaceProvider: Preview.SurfaceProvider,
         cameraSelector: CameraSelector,
-        meteringPointFactoryProvider: () -> androidx.camera.core.MeteringPointFactory?
+        meteringPointProvider: MeteringPointProvider
     ) {
         isFrontCamera = cameraSelector == CameraSelector.DEFAULT_FRONT_CAMERA
-        cameraXProvider.bindToLifecycle(lifecycleOwner, surfaceProvider, cameraSelector, meteringPointFactoryProvider)
-        camera2Provider.bindToLifecycle(lifecycleOwner, surfaceProvider, cameraSelector, meteringPointFactoryProvider)
+        cameraXProvider.bindToLifecycle(lifecycleOwner, surfaceProvider, cameraSelector, meteringPointProvider)
+        camera2Provider.bindToLifecycle(lifecycleOwner, surfaceProvider, cameraSelector, meteringPointProvider)
     }
 
     override fun setMode(mode: CameraMode) {
@@ -57,38 +63,35 @@ class HybridCaptureEngine(
         camera2Provider.applySettings(prefs)
     }
 
-    private fun usesCamera2ForPhoto(): Boolean = when (currentMode) {
-        CameraMode.NIGHT_SIGHT, CameraMode.HDR, CameraMode.LONG_EXPOSURE -> true
-        CameraMode.PHOTO -> !isFrontCamera &&
-            (currentPrefs.saveMode == ImageSaveMode.RAW_JPEG || currentPrefs.hdrPhoto)
-        else -> false
-    }
-
     override fun capturePhoto(onSuccess: (String) -> Unit, onError: (Exception) -> Unit) {
         if (com.fearmikey.camera.domain.model.CameraModes.isVideo(currentMode)) {
             onError(Exception("Use the record button in video modes."))
             return
         }
-        if (!usesCamera2ForPhoto()) {
+        // Same rule the UI uses (ModeCapabilities): RAW, Auto Night, HDR, flash, front camera.
+        val pipeline = ModeCapabilities.pipelineFor(
+            currentMode, isFrontCamera, currentPrefs, sceneIsDark,
+            manualExposure = isProMode && proConfig.hasManualExposure,
+        )
+        if (!pipeline.usesCamera2) {
             cameraXProvider.capturePhoto(onSuccess, onError)
             return
         }
         // Release the device for direct Camera2 access, then always restore CameraX.
         cameraXProvider.unbind()
-        camera2Provider.capturePhoto(
-            onSuccess = { uri ->
-                onMain {
-                    cameraXProvider.restore()
-                    onSuccess(uri)
-                }
-            },
-            onError = { error ->
-                onMain {
-                    cameraXProvider.restore()
-                    onError(error)
-                }
+        val done: (String) -> Unit = { uri ->
+            onMain {
+                cameraXProvider.restore()
+                onSuccess(uri)
             }
-        )
+        }
+        val failed: (Exception) -> Unit = { error ->
+            onMain {
+                cameraXProvider.restore()
+                onError(error)
+            }
+        }
+        camera2Provider.capture(pipeline, done, failed)
     }
 
     override fun startPanorama(onSuccess: () -> Unit, onError: (Exception) -> Unit) {
@@ -124,13 +127,16 @@ class HybridCaptureEngine(
         )
     }
 
-    override fun stopSlowMoVideo(onSuccess: (String) -> Unit) {
+    override fun stopSlowMoVideo(onSuccess: (String) -> Unit, onError: (Exception) -> Unit) {
         if (!slowMoActive) {
-            cameraXProvider.stopSlowMoVideo(onSuccess)
+            cameraXProvider.stopSlowMoVideo(onSuccess, onError)
             return
         }
         slowMoActive = false
-        camera2Provider.stopSlowMoVideo { uri -> onMain { onSuccess(uri) } }
+        camera2Provider.stopSlowMoVideo(
+            onSuccess = { uri -> onMain { onSuccess(uri) } },
+            onError = { error -> onMain { onError(error) } },
+        )
         cameraXProvider.restore()
     }
 
@@ -151,6 +157,7 @@ class HybridCaptureEngine(
     }
 
     override fun updateManualConfig(config: ProConfig) {
+        proConfig = config
         cameraXProvider.updateManualConfig(config)
         camera2Provider.updateManualConfig(config)
     }
@@ -161,6 +168,7 @@ class HybridCaptureEngine(
     }
 
     override fun setProMode(enabled: Boolean) {
+        isProMode = enabled
         cameraXProvider.setProMode(enabled)
         camera2Provider.setProMode(enabled)
     }
@@ -172,6 +180,18 @@ class HybridCaptureEngine(
 
     override fun focusAt(x: Float, y: Float, onComplete: (Boolean) -> Unit) {
         cameraXProvider.focusAt(x, y, onComplete)
+        // Camera2 remembers the point and meters/focuses there in its next capture.
+        camera2Provider.focusAt(x, y)
+    }
+
+    override fun cancelFocus() {
+        cameraXProvider.cancelFocus()
+        camera2Provider.cancelFocus()
+    }
+
+    override fun setViewfinderAspectRatio(widthOverHeight: Float) {
+        cameraXProvider.setViewfinderAspectRatio(widthOverHeight)
+        camera2Provider.setViewfinderAspectRatio(widthOverHeight)
     }
 
     override fun setFlashMode(flashMode: FlashMode) {
@@ -219,12 +239,27 @@ class HybridCaptureEngine(
     }
 
     override fun setOnLowLightListener(listener: (Boolean) -> Unit) {
-        cameraXProvider.setOnLowLightListener(listener)
+        // CameraX delivers on the main thread; remember the state for Auto Night routing.
+        cameraXProvider.setOnLowLightListener { dark ->
+            sceneIsDark = dark
+            listener(dark)
+        }
         camera2Provider.setOnLowLightListener(listener)
     }
 
-    override fun setOnQrCodeListener(listener: (String?) -> Unit) {
-        cameraXProvider.setOnQrCodeListener(listener)
-        camera2Provider.setOnQrCodeListener(listener)
+    override fun setOnCaptureProgressListener(listener: (Float) -> Unit) {
+        cameraXProvider.setOnCaptureProgressListener(listener)
+        // Camera2 reports from its background thread.
+        camera2Provider.setOnCaptureProgressListener { p -> onMain { listener(p) } }
+    }
+
+    override fun setOnCodeScanListener(listener: (CodeScanFrame) -> Unit) {
+        cameraXProvider.setOnCodeScanListener(listener)
+        camera2Provider.setOnCodeScanListener(listener)
+    }
+
+    override fun setOnPortraitFacesListener(listener: (PortraitFaceFrame) -> Unit) {
+        cameraXProvider.setOnPortraitFacesListener(listener)
+        camera2Provider.setOnPortraitFacesListener(listener)
     }
 }

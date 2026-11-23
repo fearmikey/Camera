@@ -141,7 +141,7 @@ std::vector<int> findSeam(const cv::Mat& a, const cv::Mat& aMask, const cv::Mat&
         auto* fr = from.ptr<int8_t>(y);
         const float* prev = y > 0 ? acc.ptr<float>(y - 1) : nullptr;
         for (int x = 0; x < w; ++x) {
-            float cost = 0.02f * std::abs(x - mid); // mild pull towards the overlap centre
+            float cost = 0.02f * std::abs(x - mid); // mild pull toward the overlap center
             if (ma[x] && mb[x]) {
                 cost += static_cast<float>(std::abs(pa[x][0] - pb[x][0]) + std::abs(pa[x][1] - pb[x][1]) +
                                            std::abs(pa[x][2] - pb[x][2]));
@@ -175,7 +175,7 @@ using PointPairs = std::pair<std::vector<cv::Point2f>, std::vector<cv::Point2f>>
 /**
  * How far the matches deviate from a pure translation once both frames are projected onto
  * a cylinder of focal [f]: per pair, the mean truncated squared distance (in radians, so
- * there is no bias towards small f) from the median displacement; summed over pairs.
+ * there is no bias toward small f) from the median displacement; summed over pairs.
  */
 double cylinderResidual(const std::vector<PointPairs>& pairs, double f, double cap) {
     double total = 0;
@@ -480,13 +480,13 @@ void PanoramaEngine::calibrateLive(const cv::Mat& gray) {
     if (ds.rows < 30) return;
     std::vector<std::vector<cv::DMatch>> knn;
     mMatcher->knnMatch(mCalibDesc, ds, knn, 2);
-    const cv::Point2f centre(mSmall.width * 0.5f, mSmall.height * 0.5f);
+    const cv::Point2f center(mSmall.width * 0.5f, mSmall.height * 0.5f);
     const auto toFull = static_cast<float>(1.0 / mTrackScale);
     std::vector<cv::Point2f> a, b;
     for (const auto& m : knn) {
         if (m.size() < 2 || m[0].distance >= 0.75f * m[1].distance) continue;
-        a.push_back((mCalibKp[m[0].queryIdx].pt - centre) * toFull);
-        b.push_back((kp[m[0].trainIdx].pt - centre) * toFull);
+        a.push_back((mCalibKp[m[0].queryIdx].pt - center) * toFull);
+        b.push_back((kp[m[0].trainIdx].pt - center) * toFull);
     }
     if (a.size() < 30) return;
     cv::Mat inliers;
@@ -623,7 +623,7 @@ double PanoramaEngine::estimateFocal(std::vector<cv::Point2d>& offsets, std::vec
     constexpr double kScale = 0.5;
     auto orb = cv::ORB::create(2000, 1.2f, 6, 31, 0, 2, cv::ORB::HARRIS_SCORE, 31, 10);
     const cv::Size half(cvRound(mW * kScale), cvRound(mH * kScale));
-    const cv::Point2f centre(half.width * 0.5f, half.height * 0.5f);
+    const cv::Point2f center(half.width * 0.5f, half.height * 0.5f);
     auto features = [&](const cv::Mat& img, std::vector<cv::KeyPoint>& kp, cv::Mat& ds) {
         cv::Mat small, gray;
         cv::resize(img, small, half, 0, 0, cv::INTER_AREA);
@@ -643,8 +643,8 @@ double PanoramaEngine::estimateFocal(std::vector<cv::Point2d>& offsets, std::vec
             std::vector<cv::Point2f> a, b;
             for (const auto& m : knn) {
                 if (m.size() < 2 || m[0].distance >= 0.75f * m[1].distance) continue;
-                a.push_back(prevKp[m[0].queryIdx].pt - centre);
-                b.push_back(curKp[m[0].trainIdx].pt - centre);
+                a.push_back(prevKp[m[0].queryIdx].pt - center);
+                b.push_back(curKp[m[0].trainIdx].pt - center);
             }
             if (a.size() >= 40) {
                 // A homography is exact for any rotation, so its inliers are clean matches

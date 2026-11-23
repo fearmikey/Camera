@@ -204,7 +204,7 @@ class GpuImageProcessor {
                 buffer.get(bytes)
                 BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
             } else if (image.format == android.graphics.ImageFormat.YUV_420_888) {
-                // CameraX's converter honours row/pixel strides (the previous manual
+                // CameraX's converter honors row/pixel strides (the previous manual
                 // NV21 packing corrupted images on devices with padded rows).
                 image.toBitmap()
             } else {

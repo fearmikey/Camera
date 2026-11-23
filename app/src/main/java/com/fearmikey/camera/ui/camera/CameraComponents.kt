@@ -14,6 +14,7 @@ import androidx.compose.material.icons.filled.FlashAuto
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.NightsStay
 import androidx.compose.material.icons.filled.QrCode2
+import androidx.compose.material.icons.filled.QrCodeScanner
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.role
@@ -30,7 +31,7 @@ import androidx.compose.runtime.ReadOnlyComposable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
-import androidx.compose.ui.draw.rotate
+import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.vector.ImageVector
@@ -41,13 +42,15 @@ import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.tooling.preview.Preview
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import com.fearmikey.camera.domain.model.CodeFormat
+import com.fearmikey.camera.domain.model.ScannedCode
 import java.util.Locale
 import kotlin.math.roundToInt
 
 /** Height reserved for [CameraTopBar]; the viewfinder starts directly below it. */
-val TopBarHeight = 52.dp
+val TopBarHeight = 44.dp
 
-/** Accent for active controls: the system (Material You) primary colour. */
+/** Accent for active controls: the system (Material You) primary color. */
 val CameraAccent: Color
     @Composable @ReadOnlyComposable get() = MaterialTheme.colorScheme.primary
 
@@ -77,7 +80,11 @@ fun RotatingIconButton(
         label = "iconRotation"
     )
     IconButton(onClick = onClick, modifier = modifier.background(bg, CircleShape)) {
-        Icon(icon, contentDescription = contentDescription, tint = tint, modifier = Modifier.size(20.dp).rotate(animated))
+        // Rotation is read in the draw phase, so the turn animation doesn't recompose the button.
+        Icon(
+            icon, contentDescription = contentDescription, tint = tint,
+            modifier = Modifier.size(20.dp).graphicsLayer { rotationZ = animated },
+        )
     }
 }
 
@@ -211,12 +218,24 @@ fun CameraTopBar(
     onFlashClick: () -> Unit,
     onTimerClick: () -> Unit,
     modifier: Modifier = Modifier,
+    /** Non-null shows the "scan a code from an image" button. */
+    onScanImageClick: (() -> Unit)? = null,
+    isScanningImage: Boolean = false,
+    /**
+     * Resolution/timer/macro chips react to taps. Off while recording: they change settings
+     * that rebind the camera, which would end the recording. (Flash stays: in video it is the torch.)
+     */
+    chipsEnabled: Boolean = true,
 ) {
     val animatedRotation by animateFloatAsState(
         targetValue = rotation.toFloat(),
         animationSpec = spring(stiffness = Spring.StiffnessLow),
         label = "topBarRotation"
     )
+    // Read only in the draw phase (graphicsLayer), so turning the phone doesn't recompose the
+    // bar on every animation frame.
+    val rotationProvider = { animatedRotation }
+    val rotate = Modifier.graphicsLayer { rotationZ = animatedRotation }
     Row(
         modifier = modifier.fillMaxWidth().height(TopBarHeight),
         verticalAlignment = Alignment.CenterVertically,
@@ -226,9 +245,10 @@ fun CameraTopBar(
             TopBarChip(
                 text = if (isFullResolution) "MAX" else "12MP",
                 active = isFullResolution,
-                rotation = animatedRotation,
+                rotation = rotationProvider,
                 onClick = onResolutionClick,
-                description = if (isFullResolution) "Full resolution" else "12 megapixel"
+                description = if (isFullResolution) "Full resolution" else "12 megapixel",
+                enabled = chipsEnabled,
             )
         }
         if (showFlash) {
@@ -237,7 +257,7 @@ fun CameraTopBar(
                     flashIcon,
                     contentDescription = "Flash $flashLabel",
                     tint = if (flashActive) CameraAccent else Color.White,
-                    modifier = Modifier.size(22.dp).rotate(animatedRotation)
+                    modifier = Modifier.size(22.dp).then(rotate)
                 )
             }
         }
@@ -245,26 +265,53 @@ fun CameraTopBar(
             TopBarChip(
                 text = "${timerSeconds}s",
                 active = true,
-                rotation = animatedRotation,
+                rotation = rotationProvider,
                 onClick = onTimerClick,
-                description = "Timer $timerSeconds seconds"
+                description = "Timer $timerSeconds seconds",
+                enabled = chipsEnabled,
             )
         }
         if (macroOn) {
-            TopBarChip(text = "MACRO", active = true, rotation = animatedRotation, onClick = onTimerClick, description = "Macro focus on")
+            // Opens the quick settings sheet (macro is set there), like the timer chip.
+            TopBarChip(
+                text = "MACRO", active = true, rotation = rotationProvider, onClick = onTimerClick,
+                description = "Macro focus on", enabled = chipsEnabled,
+            )
+        }
+        if (onScanImageClick != null) {
+            IconButton(onClick = onScanImageClick, enabled = !isScanningImage, modifier = Modifier.size(40.dp)) {
+                if (isScanningImage) {
+                    CircularProgressIndicator(modifier = Modifier.size(18.dp), strokeWidth = 2.dp, color = Color.White)
+                } else {
+                    Icon(
+                        Icons.Default.QrCodeScanner,
+                        contentDescription = "Scan code from image",
+                        tint = Color.White,
+                        modifier = Modifier.size(22.dp).then(rotate)
+                    )
+                }
+            }
         }
     }
 }
 
 @Composable
-private fun TopBarChip(text: String, active: Boolean, rotation: Float, onClick: () -> Unit, description: String) {
+private fun TopBarChip(
+    text: String,
+    active: Boolean,
+    /** Degrees, read in the draw phase. */
+    rotation: () -> Float,
+    onClick: () -> Unit,
+    description: String,
+    enabled: Boolean = true,
+) {
     Box(
         modifier = Modifier
             .height(30.dp)
             .widthIn(min = 40.dp)
             .clip(RoundedCornerShape(15.dp))
             .background(if (active) CameraAccent else Color.Black.copy(alpha = 0.35f))
-            .clickableWithDescription(description, onClick)
+            .clickableWithDescription(description, enabled, onClick)
             .padding(horizontal = 8.dp),
         contentAlignment = Alignment.Center
     ) {
@@ -273,36 +320,47 @@ private fun TopBarChip(text: String, active: Boolean, rotation: Float, onClick: 
             color = if (active) OnCameraAccent else Color.White,
             fontSize = 11.sp,
             fontWeight = FontWeight.Bold,
-            modifier = Modifier.rotate(rotation)
+            modifier = Modifier.graphicsLayer { rotationZ = rotation() }
         )
     }
 }
 
-private fun Modifier.clickableWithDescription(description: String, onClick: () -> Unit): Modifier =
+private fun Modifier.clickableWithDescription(description: String, enabled: Boolean, onClick: () -> Unit): Modifier =
     this
         .semantics { contentDescription = description; role = Role.Button }
-        .clickable(onClick = onClick)
+        .clickable(enabled = enabled, onClick = onClick)
 
-/** Contextual chips under the top bar: detected QR code and low-light Night suggestion. */
+/** Contextual chips under the top bar: detected QR codes/barcodes and low-light Night suggestion. */
 @Composable
 fun SuggestionChips(
-    qrCode: String?,
+    codes: List<ScannedCode>,
     showNightSuggestion: Boolean,
-    onQrClick: (String) -> Unit,
-    onQrDismiss: () -> Unit,
+    onCodesClick: () -> Unit,
+    onCodesDismiss: () -> Unit,
     onNightClick: () -> Unit,
     onNightDismiss: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
     Column(modifier = modifier.padding(horizontal = 24.dp), horizontalAlignment = Alignment.CenterHorizontally) {
-        qrCode?.let { text ->
-            SuggestionChip(
-                icon = Icons.Default.QrCode2,
-                title = qrTitle(text),
-                subtitle = text.take(48),
-                onClick = { onQrClick(text) },
-                onDismiss = onQrDismiss,
-            )
+        codes.firstOrNull()?.let { first ->
+            val payload = first.payload
+            if (codes.size == 1) {
+                SuggestionChip(
+                    icon = CodeActions.icon(payload),
+                    title = CodeActions.primaryLabel(payload),
+                    subtitle = CodeActions.summary(payload).ifEmpty { CodeActions.title(payload) }.take(48),
+                    onClick = onCodesClick,
+                    onDismiss = onCodesDismiss,
+                )
+            } else {
+                SuggestionChip(
+                    icon = Icons.Default.QrCode2,
+                    title = "${codes.size} codes found",
+                    subtitle = codes.joinToString(" · ") { CodeActions.title(it.payload) }.take(48),
+                    onClick = onCodesClick,
+                    onDismiss = onCodesDismiss,
+                )
+            }
             Spacer(Modifier.height(8.dp))
         }
         if (showNightSuggestion) {
@@ -339,36 +397,6 @@ private fun SuggestionChip(icon: ImageVector, title: String, subtitle: String, o
     }
 }
 
-private fun qrTitle(text: String): String {
-    val lower = text.lowercase(Locale.ROOT)
-    return when {
-        lower.startsWith("http://") || lower.startsWith("https://") -> "Open link"
-        lower.startsWith("wifi:") -> "Wi-Fi network (copy)"
-        lower.startsWith("tel:") -> "Call number"
-        lower.startsWith("mailto:") -> "Send email"
-        lower.startsWith("geo:") -> "Open location"
-        lower.startsWith("smsto:") || lower.startsWith("sms:") -> "Send message"
-        else -> "Copy text"
-    }
-}
-
-/** Opens actionable QR payloads in the matching app; copies everything else. */
-fun openQrPayload(context: android.content.Context, text: String) {
-    val lower = text.lowercase(Locale.ROOT)
-    val actionable = listOf("http://", "https://", "tel:", "mailto:", "geo:", "smsto:", "sms:").any { lower.startsWith(it) }
-    if (actionable) {
-        try {
-            context.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(text)).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
-            return
-        } catch (_: android.content.ActivityNotFoundException) {
-            // fall through to copy
-        }
-    }
-    val clipboard = context.getSystemService(android.content.ClipboardManager::class.java)
-    clipboard?.setPrimaryClip(android.content.ClipData.newPlainText("QR code", text))
-    android.widget.Toast.makeText(context, "Copied to clipboard", android.widget.Toast.LENGTH_SHORT).show()
-}
-
 /** Zoom label: ".6", "1x", "2.5x". */
 fun formatZoom(zoom: Float): String {
     val rounded = (zoom * 10f).roundToInt() / 10f
@@ -393,17 +421,28 @@ private fun CameraTopBarPreview() {
         flashLabel = "Auto", flashIcon = Icons.Default.FlashAuto, flashActive = false,
         timerSeconds = 3, macroOn = true,
         onResolutionClick = {}, onFlashClick = {}, onTimerClick = {},
-        modifier = Modifier.padding(horizontal = 12.dp)
+        modifier = Modifier.padding(horizontal = 12.dp),
+        onScanImageClick = {},
     )
 }
 
 @Preview(widthDp = 400, showBackground = true, backgroundColor = 0xFF3A4A3A)
 @Composable
 private fun SuggestionChipsPreview() {
-    SuggestionChips(
-        qrCode = "https://f-droid.org", showNightSuggestion = true,
-        onQrClick = {}, onQrDismiss = {}, onNightClick = {}, onNightDismiss = {}
-    )
+    Column {
+        SuggestionChips(
+            codes = listOf(ScannedCode("https://f-droid.org", CodeFormat.QR_CODE)), showNightSuggestion = true,
+            onCodesClick = {}, onCodesDismiss = {}, onNightClick = {}, onNightDismiss = {}
+        )
+        SuggestionChips(
+            codes = listOf(
+                ScannedCode("WIFI:T:WPA;S:Cafe;P:espresso42;;", CodeFormat.QR_CODE),
+                ScannedCode("4006381333931", CodeFormat.EAN_13),
+            ),
+            showNightSuggestion = false,
+            onCodesClick = {}, onCodesDismiss = {}, onNightClick = {}, onNightDismiss = {}
+        )
+    }
 }
 
 @Preview

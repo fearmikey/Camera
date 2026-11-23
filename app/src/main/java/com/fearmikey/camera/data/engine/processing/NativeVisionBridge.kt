@@ -15,8 +15,9 @@ object NativeVisionBridge {
         System.loadLibrary("panorama_engine")
     }
 
-    // Night mode: aligned temporal averaging of a YUV_420_888 burst.
-    external fun nativeNightCreate(width: Int, height: Int): Long
+    // Night / Long exposure: aligned temporal merge of a YUV_420_888 burst. [longExposure]
+    // accumulates linear light + per-pixel peak instead of the night 8-bit sum.
+    external fun nativeNightCreate(width: Int, height: Int, longExposure: Boolean): Long
     external fun nativeNightAddFrame(
         ptr: Long,
         y: ByteBuffer,
@@ -27,25 +28,25 @@ object NativeVisionBridge {
         uvPixelStride: Int,
     ): Boolean
     external fun nativeNightFrameCount(ptr: Long): Int
-    external fun nativeNightFinish(ptr: Long, out: Bitmap, rotationDegrees: Int, toneMap: Boolean): Boolean
+    // Night: brighten in linear light by max(minGain, auto gain) with a highlight roll-off and
+    // chroma denoise. Long exposure: linear mean x minGain with light-trail recovery. Both are
+    // sharpened once and dithered from 16 to 8 bits.
+    external fun nativeNightFinish(ptr: Long, out: Bitmap, rotationDegrees: Int, minGain: Float): Boolean
     external fun nativeNightRelease(ptr: Long)
 
     // HDR: MTB alignment + Mertens exposure fusion. All inputs and output share one size.
     external fun nativeFuseExposures(inputs: Array<Bitmap>, out: Bitmap): Boolean
 
-    // Portrait: face-seeded GrabCut + background bokeh, applied to [bitmap] in place.
-    // Face coordinates are normalized (0..1); pass all zeros when no face was found.
-    external fun nativePortraitBokeh(
-        bitmap: Bitmap,
-        faceLeft: Float,
-        faceTop: Float,
-        faceRight: Float,
-        faceBottom: Float,
-        strength: Float,
-    ): Boolean
+    // Portrait: face-seeded GrabCut + guided-filter matte + lens bokeh, applied to [bitmap]
+    // in place (PortraitEngine.cpp). [faceBoxes] holds normalized (0..1) {left, top, right,
+    // bottom} per face (empty = centered subject); [strength] 1.0 ~ f/2.8 (PortraitAperture).
+    external fun nativePortraitBokeh(bitmap: Bitmap, faceBoxes: FloatArray, strength: Float): Boolean
 
-    // QR code payload in [bitmap], or null.
-    external fun nativeDecodeQr(bitmap: Bitmap): String?
+    // QR codes + EAN/UPC barcodes in [bitmap]. Returns interleaved raw bytes
+    // {format0, payload0, format1, payload1, ...} or null; [cornersOut] receives 8
+    // normalized floats (4 corners) per code and its size caps the number of codes.
+    // Use CodeDecoder rather than calling this directly.
+    external fun nativeDecodeCodes(bitmap: Bitmap, cornersOut: FloatArray, tryHarder: Boolean): Array<ByteArray>?
 
     // Open-palm detector. Returns normalized {left, top, right, bottom} or null.
     external fun nativeDetectOpenPalm(

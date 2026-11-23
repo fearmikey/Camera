@@ -7,12 +7,18 @@ import android.media.Image
 /**
  * Streams a YUV_420_888 burst into a native accumulator one frame at a time, so
  * only a single camera buffer needs to be held. Each frame is aligned to the
- * first (median-threshold-bitmap translation) and averaged; the result is tone
- * mapped to lift shadows. Not thread-safe: feed frames from one thread.
+ * first (median-threshold-bitmap translation, refined to sub-pixel as the median over
+ * up to three textured patches) and accumulated. Not thread-safe: feed frames from one
+ * thread.
+ *
+ * Night ([longExposure] = false): 12-bit sum, brightened and tone mapped in linear light.
+ * Long exposure: linear-light average (what one continuous exposure records) with
+ * light-trail recovery for clipped moving highlights. Both finish at 16 bits, sharpen once
+ * and dither to 8 bits (see [finish]).
  */
-class NightStacker(val width: Int, val height: Int) {
+class NightStacker(val width: Int, val height: Int, val longExposure: Boolean = false) {
 
-    private var ptr: Long = NativeVisionBridge.nativeNightCreate(width, height)
+    private var ptr: Long = NativeVisionBridge.nativeNightCreate(width, height, longExposure)
 
     val frameCount: Int
         get() = if (ptr != 0L) NativeVisionBridge.nativeNightFrameCount(ptr) else 0
@@ -32,10 +38,12 @@ class NightStacker(val width: Int, val height: Int) {
     }
 
     /**
-     * Produces the merged, upright image. [toneMap] lifts shadows (night); disable it
-     * for long-exposure motion blur. Returns null if no frame was accepted.
+     * Produces the merged, upright image. [minGain] is exposure the sensor settings could not
+     * reach, applied in linear light with a highlight roll-off. Night additionally brightens
+     * dark scenes automatically; Long exposure keeps the metered brightness. Returns null if no
+     * frame was accepted.
      */
-    fun finish(rotationDegrees: Int, toneMap: Boolean = true): Bitmap? {
+    fun finish(rotationDegrees: Int, minGain: Float = 1f): Bitmap? {
         if (ptr == 0L || frameCount == 0) return null
         val swap = rotationDegrees % 180 != 0
         val out = Bitmap.createBitmap(
@@ -43,7 +51,7 @@ class NightStacker(val width: Int, val height: Int) {
             if (swap) width else height,
             Bitmap.Config.ARGB_8888
         )
-        return if (NativeVisionBridge.nativeNightFinish(ptr, out, rotationDegrees, toneMap)) {
+        return if (NativeVisionBridge.nativeNightFinish(ptr, out, rotationDegrees, minGain)) {
             out
         } else {
             out.recycle()

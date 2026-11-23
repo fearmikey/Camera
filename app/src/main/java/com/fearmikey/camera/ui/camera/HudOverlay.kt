@@ -4,13 +4,15 @@ import androidx.compose.animation.core.*
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.fillMaxSize
-import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.background
 import androidx.compose.runtime.*
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.drawscope.Stroke
+import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.graphics.drawscope.rotate
 import androidx.compose.ui.graphics.drawscope.withTransform
 import androidx.compose.ui.graphics.nativeCanvas
@@ -24,15 +26,16 @@ import kotlin.math.abs
 fun HudOverlay(
     gridMode: GridMode,
     showLeveler: Boolean,
-    tiltFlow: StateFlow<Float>,
-    autoShowLevelerFlow: StateFlow<Boolean>,
+    levelFlow: StateFlow<LevelState>,
     focusFlow: StateFlow<FocusState?>,
     gestureFlow: StateFlow<GestureOverlayState>,
     isFrontCamera: Boolean = false,
     modifier: Modifier = Modifier
 ) {
-    val tilt by tiltFlow.collectAsState()
-    val autoShowLeveler by autoShowLevelerFlow.collectAsState()
+    // Read inside the levelers' draw phase, so ~50 Hz sensor updates don't recompose the HUD.
+    val level = levelFlow.collectAsState()
+    val isLandscape by remember { derivedStateOf { level.value.isLandscape } }
+    val isFacingDown by remember { derivedStateOf { level.value.isFacingDown } }
     val focusPoint by focusFlow.collectAsState()
     val gestureState by gestureFlow.collectAsState()
 
@@ -41,8 +44,13 @@ fun HudOverlay(
             CameraGrid(gridMode)
         }
         
-        if (showLeveler || autoShowLeveler) {
-            HorizonLeveler(tilt = tilt)
+        // Like Pixel's framing hints: a horizon line only in landscape, and a bubble level
+        // when shooting straight down.
+        LevelerFade(visible = showLeveler && isLandscape) {
+            HorizonLeveler(roll = { level.value.roll })
+        }
+        LevelerFade(visible = showLeveler && isFacingDown) {
+            TopDownLeveler(tilt = { Offset(level.value.downTiltX, level.value.downTiltY) })
         }
         
         focusPoint?.let { state ->
@@ -127,57 +135,114 @@ fun CameraGrid(mode: GridMode) {
 }
 
 @Composable
-fun HorizonLeveler(tilt: Float) {
+private fun LevelerFade(visible: Boolean, content: @Composable () -> Unit) {
+    val alpha by animateFloatAsState(if (visible) 1f else 0f, tween(200), label = "levelerFade")
+    if (alpha > 0f) {
+        Box(Modifier.fillMaxSize().graphicsLayer { this.alpha = alpha }) { content() }
+    }
+}
+
+/** Within this many degrees the levelers snap and turn the accent color. */
+private const val LEVEL_TOLERANCE_DEG = 1f
+
+/**
+ * Landscape horizon: fixed side marks for the frame and a center line that stays parallel to
+ * the real horizon. When level, the line snaps straight and everything turns the accent color.
+ * [roll] is the device roll (+-90 in landscape); it is read during drawing only.
+ */
+@Composable
+fun HorizonLeveler(roll: () -> Float) {
     val accent = CameraAccent
     Canvas(modifier = Modifier.fillMaxSize()) {
-        val centerX = size.width / 2
-        val centerY = size.height / 2
-        val lineLength = 100.dp.toPx()
-        
-        // Find the closest 90-degree reference point
-        val targetRotation = when {
+        val tilt = roll()
+        val center = Offset(size.width / 2, size.height / 2)
+        val half = 48.dp.toPx()
+        val gap = 10.dp.toPx()
+        val mark = 24.dp.toPx()
+
+        // Nearest landscape/portrait frame, then the remaining tilt within it.
+        val frameRotation = when {
             tilt > -45f && tilt <= 45f -> 0f
             tilt > 45f && tilt <= 135f -> 90f
             tilt > 135f || tilt <= -135f -> 180f
             else -> -90f
         }
-        
-        val relativeTilt = tilt - targetRotation
-        val isLevel = abs(relativeTilt) < 1.0f
+        val relative = tilt - frameRotation
+        val isLevel = abs(relative) < LEVEL_TOLERANCE_DEG
         val color = if (isLevel) accent else Color.White
-        val strokeWidth = if (isLevel) 2.dp.toPx() else 1.dp.toPx()
-        
-        withTransform({
-            // Rotate the entire leveler to match the device orientation
-            rotate(degrees = -targetRotation, pivot = Offset(centerX, centerY))
-            // Then rotate the line relative to that for precision
-            rotate(degrees = -relativeTilt, pivot = Offset(centerX, centerY))
-        }) {
-            val shadowColor = Color.Black.copy(alpha = 0.5f)
-            
-            // Draw shadow for visibility
-            drawLine(
-                color = shadowColor,
-                start = Offset(centerX - lineLength / 2 + 2f, centerY + 2f),
-                end = Offset(centerX + lineLength / 2 + 2f, centerY + 2f),
-                strokeWidth = strokeWidth
-            )
+        val shadow = Color.Black.copy(alpha = 0.35f)
+        val stroke = 2.dp.toPx()
+        val shadowOffset = Offset(0f, 1.dp.toPx())
 
-            // Main horizon line
-            drawLine(
-                color = color,
-                start = Offset(centerX - lineLength / 2, centerY),
-                end = Offset(centerX + lineLength / 2, centerY),
-                strokeWidth = strokeWidth
-            )
-            
-            // Subtle "notches" at ends
-            drawLine(color, Offset(centerX - lineLength / 2, centerY - 10f), Offset(centerX - lineLength / 2, centerY + 10f), strokeWidth)
-            drawLine(color, Offset(centerX + lineLength / 2, centerY - 10f), Offset(centerX + lineLength / 2, centerY + 10f), strokeWidth)
+        fun line(start: Offset, end: Offset, c: Color) {
+            drawLine(shadow, start + shadowOffset, end + shadowOffset, stroke, cap = StrokeCap.Round)
+            drawLine(c, start, end, stroke, cap = StrokeCap.Round)
         }
-        
-        // Static center reference
-        drawCircle(Color.White.copy(alpha = 0.5f), radius = 2.dp.toPx(), center = Offset(centerX, centerY))
+
+        rotate(degrees = -frameRotation, pivot = center) {
+            // Fixed marks show where "level" is for the photo frame.
+            val markColor = if (isLevel) accent else Color.White.copy(alpha = 0.7f)
+            line(Offset(center.x - half - gap - mark, center.y), Offset(center.x - half - gap, center.y), markColor)
+            line(Offset(center.x + half + gap, center.y), Offset(center.x + half + gap + mark, center.y), markColor)
+            // The center line follows the real horizon.
+            rotate(degrees = if (isLevel) 0f else -relative, pivot = center) {
+                line(Offset(center.x - half, center.y), Offset(center.x + half, center.y), color)
+            }
+        }
+    }
+}
+
+@androidx.compose.ui.tooling.preview.Preview(name = "Levelers", widthDp = 240, heightDp = 880)
+@Composable
+private fun LevelersPreview() {
+    com.fearmikey.camera.ui.theme.ViewfinderTheme {
+        val background = Modifier.background(Color(0xFF556B55))
+        androidx.compose.foundation.layout.Column(Modifier.fillMaxSize()) {
+            // Landscape, 4 degrees off / level.
+            Box(Modifier.weight(1f).fillMaxSize().then(background)) { HorizonLeveler(roll = { -86f }) }
+            Box(Modifier.weight(1f).fillMaxSize().then(background)) { HorizonLeveler(roll = { -90.4f }) }
+            // Pointing down, tilted / level.
+            Box(Modifier.weight(1f).fillMaxSize().then(background)) { TopDownLeveler(tilt = { Offset(6f, -3f) }) }
+            Box(Modifier.weight(1f).fillMaxSize().then(background)) { TopDownLeveler(tilt = { Offset(0.3f, 0.2f) }) }
+        }
+    }
+}
+
+/**
+ * Top-down bubble level: a fixed target circle in the center and a dot that drifts toward the
+ * raised edge. Level the phone to bring the dot into the circle; within
+ * [LEVEL_TOLERANCE_DEG] it snaps to the center and both turn the accent color.
+ * [tilt] is degrees away from straight down (x: right edge raised, y: top edge raised).
+ */
+@Composable
+fun TopDownLeveler(tilt: () -> Offset) {
+    val accent = CameraAccent
+    Canvas(modifier = Modifier.fillMaxSize()) {
+        val t = tilt()
+        val center = Offset(size.width / 2, size.height / 2)
+        val isLevel = t.getDistance() < LEVEL_TOLERANCE_DEG
+        val color = if (isLevel) accent else Color.White
+        val shadow = Color.Black.copy(alpha = 0.35f)
+        val ringRadius = 22.dp.toPx()
+        val dotRadius = 6.dp.toPx()
+        val shadowOffset = Offset(0f, 1.dp.toPx())
+
+        // 4dp per degree, kept inside a 20-degree radius (the leveler hides past 30).
+        val perDegree = 4.dp.toPx()
+        val maxOffset = 20f * perDegree
+        var offset = Offset(t.x * perDegree, -t.y * perDegree)
+        val distance = offset.getDistance()
+        if (distance > maxOffset) offset *= maxOffset / distance
+        if (isLevel) offset = Offset.Zero
+
+        val ringStroke = Stroke(width = 2.dp.toPx())
+        drawCircle(shadow, ringRadius, center + shadowOffset, style = ringStroke)
+        drawCircle(color, ringRadius, center, style = ringStroke)
+        if (isLevel) drawCircle(accent.copy(alpha = 0.25f), ringRadius, center)
+
+        val dotCenter = center + offset
+        drawCircle(shadow, dotRadius, dotCenter + shadowOffset)
+        drawCircle(color, dotRadius, dotCenter)
     }
 }
 

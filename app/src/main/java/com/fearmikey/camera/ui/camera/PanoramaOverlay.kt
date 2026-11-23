@@ -42,7 +42,7 @@ import kotlin.math.roundToInt
 private val GuideYellow = Color(0xFFF6C344)
 
 /**
- * Panorama guide drawn inside the viewfinder (centred on it).
+ * Panorama guide drawn inside the viewfinder (centered on it).
  *
  * A hollow target circle with a short yellow horizon line either side and a white arrow on
  * the line pointing the way to pan. While sweeping, a white dot marks where the next frame
@@ -68,7 +68,7 @@ fun PanoramaViewfinderGuide(
     val aligned = sweep?.aligned == true
     val step = sweep?.targetStep ?: 0.33f
     val dx = sweep?.keyframeDx ?: 0f
-    // Where the next dot is relative to the view centre (fraction of width); negative once
+    // Where the next dot is relative to the view center (fraction of width); negative once
     // the user has panned past it, so the arrow points back to it.
     val dotOffset = direction * step - dx
     val passedDot = direction != 0 && dotOffset * direction < -0.12f
@@ -153,7 +153,7 @@ fun PanoramaViewfinderGuide(
     }
 }
 
-/** Filled, slightly rounded triangle centred at [center]. */
+/** Filled, slightly rounded triangle centered at [center]. */
 private fun DrawScope.drawArrow(center: Offset, pointsRight: Boolean) {
     val half = 10.dp.toPx()
     val dir = if (pointsRight) 1f else -1f

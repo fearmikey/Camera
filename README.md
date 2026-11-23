@@ -5,12 +5,12 @@ A free and open-source Android camera app with computational photography that ru
 ## Features
 
 - **Photo**: GPU pixel binning for clean ~12 MP shots, or full sensor resolution.
-- **Night**: AE/AF warm-up, then a burst of longer manual exposures that are aligned (MTB) and averaged, with a shadow-lifting tone map.
+- **Night**: long-exposure metering, then a burst of 8–14 hand-holdable manual exposures (up to 1/8 s each with OIS, 1/15 s without) that are aligned to sub-pixel precision and averaged, brightened in linear light with highlights rolled off, cleaned of chroma noise, sharpened and dithered from a 16-bit merge (no banding). **Auto Night** (flash setting) uses it automatically for Photo-mode shots in the dark.
 - **HDR** (photo option): deterministic -2/0/+2 EV manual exposure bracket, aligned and merged with Mertens exposure fusion.
-- **Long exposure**: aligned multi-frame average for silky water and light trails, handheld.
+- **Long exposure**: handheld, ~2 s of back-to-back base-ISO frames (16–32) aligned and averaged in linear light for silky water, with bright light trails recovered from clipped highlights.
 - **Time lapse**: speeds up 15x (one frame every half second, played at 30 fps).
-- **Portrait**: the framework face detector seeds an OpenCV GrabCut segmentation, and the background gets a halo-free blur.
-- **Panorama**: tap and sweep; image-tracked cylindrical capture with a live 360° preview strip and level guide, auto-stop at a full circle, and a native C++ stitcher (focal self-calibration, pairwise refinement, drift levelling, gain matching, min-cost seams, multi-band blending).
+- **Portrait**: starts at a flattering 2x on the rear camera (1x/2x, pinch 1–3x) and at the full selfie view on the front (.7x/1x), live face brackets and framing hints in the viewfinder, face-priority focus/exposure, and an adjustable blur (ƒ/1.4–ƒ/16). Every face seeds an OpenCV GrabCut segmentation, a guided filter snaps the cut-out to hair and edges, and the background gets a lens-style disc blur with glowing highlights and matched grain. Optionally keeps the unblurred original.
+- **Panorama**: tap and sweep; image-tracked cylindrical capture with a live 360° preview strip and level guide, auto-stop at a full circle, and a native C++ stitcher (focal self-calibration, pairwise refinement, drift leveling, gain matching, min-cost seams, multi-band blending).
 - **Video** with audio, pause/resume and snapshots. **QuickTake**: long-press the shutter in Photo mode.
 - **Slow motion** on devices with constrained high-speed capture (files play back in slow motion in any player).
 - **Manual controls**: ISO and shutter (logarithmic sliders), manual focus, white-balance presets. Applied live without restarting the camera.
@@ -19,9 +19,11 @@ A free and open-source Android camera app with computational photography that ru
 - **Macro focus** mode.
 - **RAW + JPEG** (DNG) capture.
 - **Palm timer**: hold up an open hand next to your face to start a 3-second countdown (no ML models).
-- Grid overlays (3×3, 4×4, golden ratio), horizon leveler, pinch to zoom with live zoom readout, double-tap to switch camera, volume-key shutter, one-tap flash Off/Auto/On.
+- Zoom buttons that match the phone's actual lenses (e.g. .5 / 1x / 2x / 5x), with smooth glides between them.
+- Grid overlays (3×3, 4×4, golden ratio), horizon leveler (landscape) and top-down leveler, pinch to zoom with live zoom readout, double-tap to switch camera, volume-key shutter, one-tap flash Auto Night / Auto flash / On / Off.
 - Controls rotate with the device in landscape.
-- QR code suggestions (decoded on-device) and a low-light prompt to switch to Night.
+- **Code scanner** (on-device): QR codes and EAN/UPC barcodes, several at once, outlined live in the viewfinder. Smart actions join Wi-Fi, add contacts or calendar events, write email/SMS, dial or open maps. Can also scan a code from an image.
+- Low-light prompt to switch to Night (unless Auto Night is on, which handles it automatically).
 - Volume keys as shutter, zoom or volume; video frame rate (30/60 fps) and audio toggle.
 - Optional geotagging through the framework `LocationManager`.
 - Works as the lock-screen camera.

@@ -8,6 +8,7 @@ find_package(OpenCV REQUIRED CONFIG)
 
 add_library(panorama_engine SHARED
         PanoramaEngine.cpp
+        PortraitEngine.cpp
         panorama_jni.cpp
         vision_jni.cpp)
 

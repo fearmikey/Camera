@@ -2,10 +2,106 @@
 
 All notable changes to this project will be documented in this file.
 
+## [1.2.0] - 2026-11-22
+
+### Added
+- Code scanner: EAN-13/EAN-8/UPC-A/UPC-E barcodes and several codes in one frame (OpenCV `QRCodeDetectorAruco` + `barcode::BarcodeDetector`, still on-device).
+- Live outline of detected codes on the viewfinder (mapped with CameraX `CoordinateTransform`), with a short haptic tick for each new code.
+- Result sheet with smart actions: join Wi-Fi through the system "Add network" dialog (no Wi-Fi permissions), add contacts (vCard/MECARD), add calendar events (iCalendar), write email/SMS, dial, open maps, web-search product numbers, plus Copy and Share.
+- Scan a code from an image (top-bar button in Photo mode, and from the result sheet) via the system Photo Picker; tries an inverted pass for light-on-dark codes.
+- Unit tests for the payload parser (`CodePayloadTest`).
+- Portrait: adjustable background blur (ƒ/1.4–ƒ/16 aperture pill above the zoom buttons; remembered).
+- Portrait: live face brackets on the viewfinder showing who stays sharp, plus "No face found" / "Move closer" hints.
+- Portrait: "Keep original portraits" setting (Settings → Photo) also saves the unblurred photo.
+- Portrait zooms like a portrait lens (as in Google Camera): the rear camera starts at 2x with 1x/2x buttons and pinch from 1x to 3x; the front camera starts at its full view with .7x/1x buttons and pinch up to 2.9x.
+- Wide selfie cameras (e.g. Pixel) label their full view ".7x" and offer a "1x" crop, matching Google Camera.
+- Top-down leveler: after the camera points straight down for a second, a center circle and a bubble dot appear; level the phone to bring the dot into the circle (it turns the accent color).
+- Flash setting "Auto Night" (like Pixel's Auto Night Sight): no flash, and Photo-mode shots in a dark scene automatically use the Night pipeline. A moon appears on the shutter (and the top-bar icon turns the accent color) when the next shot will be a night shot. The flash options are now Auto Night / Auto flash / On / Off; a previously saved "Auto" becomes Auto flash.
+
+### Improved
+- Smoother UI: pinch zoom, zoom-preset glides and Panorama no longer redraw the whole camera screen every frame, pinch zoom no longer drops steps when several touch events arrive in one frame, and turning the phone or fading controls animates without recomposing the controls.
+- Links that hide their real host (`user@host`) or aren't https show a warning before opening.
+- QR text that isn't valid UTF-8 falls back to ISO-8859-1 instead of being passed to JNI as-is.
+- Wi-Fi passwords are copied as sensitive clipboard content; the copy toast only shows below Android 13.
+- Portrait rendering rebuilt (`PortraitEngine.cpp`): lens-style disc bokeh in linear light with glowing highlights instead of a Gaussian blur, guided-filter matte refinement for cleaner hair and edges, grain matched to the sharp subject, head-and-shoulders segmentation prior, small holes in the subject filled.
+- Portrait handles group shots: every prominent face is kept sharp (not just the largest).
+- Portrait blur is even around the head and shoulders: background next to the subject (chair backs, shelves behind dark hair or a dark shirt) no longer stays sharp in patches, hair and ears stay sharp, and the soft edge has a consistent width.
+- Portrait uses the camera's face-priority focus/exposure/white balance when available.
+- The horizon leveler only appears when the phone is held in landscape (like Pixel's framing hints), with fixed side marks and a line that follows the horizon.
+- Tap-to-focus holds on the subject until the phone is turned away (about 10°), instead of drifting back to continuous autofocus after 5 s. It also uses a smaller, more precise focus region.
+- Mode selector: swiping the mode row snaps the nearest mode to the center and switches to it (with a haptic tick as each mode passes the center); the selected mode always sits centered, including the first and last modes.
+- Zoom buttons follow the phone's actual lenses (e.g. .5 / 1x / 2x / 5x on a Pixel Pro). There are no digital-only stops like 10x; pinch still zooms all the way. Sensor-crop variants of the same lens, which Pixels list as extra cameras, no longer add a bogus 10x.
+- Zoom buttons (and Portrait's aperture pill) float inside the bottom of the viewfinder instead of straddling its edge.
+- UI orientation changes now use hysteresis, and the orientation no longer flips while the phone lies flat.
+- Faster, smoother mode switching: Video, Slow motion and Time lapse switch without reconfiguring the camera at all, and Photo ↔ Video keeps the camera open and the viewfinder streaming (only the capture session is reconfigured). Video stabilization and the frame-rate pin are now applied live, so changing them no longer restarts the camera.
+- Transitions: the viewfinder cross-fades from a blurred last frame instead of freezing or flashing black while the camera restarts (camera flip, Portrait/Panorama, after Night/HDR); the mode row cross-fades between photo and video modes; the selected mode pill and the photo/video toggle highlight animate.
+- Redesigned shutter: a white ring around a white (photo) or red (video) disc that springs into a small stop square while recording, shrinks when pressed and bounces back, sends a ring pulse on each photo, and turns into a progress ring during Night/HDR/Long exposure captures. Haptic feedback on tap and hold. The video-snapshot button is now a miniature photo shutter, and the side buttons cross-fade when recording starts or stops.
+- Smooth zoom presets: tapping .5x / 1x / 2x / 5x glides the zoom over ~0.2–0.4 s (evenly paced per doubling, so lens switches happen mid-move instead of as a cut) and the white highlight slides to the tapped preset while its label counts to the new value. Pinch stays immediate and interrupts a glide. Volume-key zoom glides too. Light haptic tick on preset taps.
+- The recording time moved to a pill at the top of the viewfinder with a blinking red dot (pause icon while paused).
+- Night mode rebuilt: AE meters with the slowest frame rate, frames use up to 4x the metered exposure time (max 1/8 s, less when zoomed in), darker scenes get more frames (8–14), white balance is locked across the burst, and the merge is brightened in linear light (auto gain from the scene's log-average luminance, black point, highlight roll-off instead of clipping, 12-bit averaging against banding) with chroma noise removal.
+- Night photos are sharper and free of banding: frames are aligned to a fraction of a pixel (previously to the nearest ~4 px, which smeared detail), captured with light noise reduction and OIS, and limited to 1/15 s on phones without OIS. The merge is processed at 16 bits, sharpened once and dithered, replacing the 8-bit local-contrast step that drew contour lines across smooth dark walls.
+- The shutter's progress ring (and the "Hold still" spinner) now fill as a Night, Auto Night, Long exposure or HDR shot meters, collects its frames, merges and saves. Previously the ring stayed empty, and Photo-mode HDR showed no ring at all.
+- Long exposure rebuilt for higher quality:
+  - Each frame is as long as hand-holding allows (up to 1/8 s with OIS) at the camera's lowest ISO, and frames run back to back. Motion now smears smoothly instead of leaving stepped copies, and noise is lower. Brightness still follows the metering and the brightness slider.
+  - 16–32 frames covering about 2 seconds, instead of a fixed 16.
+  - Frames are averaged in linear light, like one continuous exposure. Light trails and white water are no longer dimmed and muddied, and the result is kept at 16 bits and dithered, so skies don't band.
+  - Light trails: headlights and street lights moving through a dark scene come out as bright, saturated trails instead of faint gray streaks.
+  - Static parts of the scene are sharper. Frames are aligned against up to three detailed areas instead of one, so moving water or traffic can no longer pull the alignment off, and the merge is sharpened once (frames are captured without in-camera sharpening).
+  - Frames use light noise reduction, which keeps texture and avoids slowing the frame rate.
+- Night and Long exposure tolerate a lost frame: the shot is merged from the remaining frames instead of failing or timing out. If a capture does time out, its memory is freed.
+- The low-light detector accounts for the camera's post-RAW digital boost and needs two readings in a row to change, so it no longer flickers after the camera restarts.
+- Controls only appear where they work. One shared rule (`ModeCapabilities`) now decides both which pipeline a shot uses and which controls each mode shows:
+  - Flash offers only what the mode supports: Portrait has no Auto Night, video modes show torch on/off, and RAW + JPEG, Night, Long exposure and Panorama have no flash button.
+  - The 12MP/MAX chip hides when HDR or RAW + JPEG decides the resolution.
+  - The timer is not used in Panorama, and the MACRO chip only shows in Photo and Portrait.
+  - Holding the shutter acts as a tap where there's no QuickTake.
+  - Slow motion and Time lapse show no snapshot button or zoom row while recording.
+  - The quick settings sheet only lists rows that apply to the current mode, and explains when HDR isn't used (flash on, RAW + JPEG).
+- Manual controls (Tune) are dimmed in modes that ignore them (Night, Long exposure, Panorama, Slow motion, Time lapse, Photo with HDR). The panel closes when you switch to such a mode, and Auto Night stays off while manual ISO or shutter is set.
+- The torch now stays on while recording Slow motion and Time lapse.
+- While recording, the mode row, photo/video toggle, settings button and top-bar chips are locked and dimmed (changing them used to restart the camera and end the recording).
+- Switching mode or camera now starts fresh: brightness returns to 0, the tap-focus lock is released and the manual controls panel closes (its values are kept for next time). These used to carry over invisibly.
+- Panorama always starts at 1x instead of keeping the zoom from the previous mode.
+- On the front camera, Photo now says when HDR or RAW + JPEG is on but can't be used there, instead of quietly taking a normal photo.
+- Settings cleanup: the quick settings sheet and the full settings screen use the same names (HDR, Grid, Framing hints, Stabilization, 12MP), the grid is chosen with buttons like every other row, and photo resolution and file format can now also be set in the full settings.
+- Macro focus is simply Off or On. The old default "Auto" behaved exactly like Off and now loads as Off.
+- Removed settings that were stored but never did anything (Top Shot, Motion Photo, lens selection, Ultra HDR, HEIF, video codec and a few leftovers). Changing the photo resolution no longer restarts the camera.
+
+### Fixed
+- Night photos came out darker than the viewfinder: the manual exposure dropped the post-RAW sensitivity boost that auto-exposure adds in the dark (e.g. on Pixels), and the old tone map barely brightened. The boost is now carried over and the result is brightened. The HDR bracket's 0 EV frame had the same boost problem.
+- The shutter no longer jumps up when recording starts (the recording timer used to sit underneath it and push it up).
+- A shutter touch that turns into a swipe no longer counts as a long press and starts QuickTake.
+- Zoom no longer silently resets to 1x on the camera (while the zoom buttons still showed the old value) after a mode switch.
+- Switching between Photo and Video now clears stale code and low-light suggestions, and is ignored during a panorama sweep.
+- Portrait no longer processes full-sensor (e.g. 50 MP) bitmaps: input is capped at ~12.6 MP, avoiding very slow captures and out-of-memory failures.
+- Tap-to-focus focused and metered on the top-left corner of the frame instead of the tapped spot: normalized coordinates were passed to `PreviewView`'s pixel-based metering factory.
+- Opening the camera with the power-button double-press while the phone is unlocked no longer starts the restricted lock-screen camera (no gallery or image scan, closing as soon as you leave). Only the secure lock-screen launch is restricted now.
+- Pressing the shutter or volume key while a Night, HDR or Long exposure shot was still processing started a second capture.
+- With a timer set, tapping the shutter to stop a panorama sweep started a countdown instead of stopping.
+- Double-tap camera flip, pinch zoom and volume-key zoom could disrupt a panorama sweep.
+- Turning off manual controls didn't apply to RAW + JPEG shots, which kept the old manual ISO/shutter/focus. Setting only ISO or only shutter now fills in the other value the same way in the preview and the photo.
+- Night, HDR and RAW shots taken right after switching cameras could be cropped, using the previous camera's zoom.
+- The flash never fired with HDR on, because HDR shots can't use it. With Auto flash or On, Photo now takes a single flash shot and HDR applies when the flash is Off or Auto Night.
+- HDR on phones without manual sensor control ignored the brightness slider.
+- A failed Slow motion or Time lapse recording (e.g. stopped too quickly) gave no message and could leave QuickTake stuck in video mode.
+- Slow motion on the front camera could silently record from the rear camera; it now says it isn't available on the front camera.
+- The screen flash no longer blinks when a tap starts or cancels the timer, starts a Slow motion or Time lapse recording, or is ignored while a shot is processing.
+- Night, Long exposure, HDR and RAW + JPEG photos ignored the aspect ratio and always came out 4:3. They now match the viewfinder: 16:9 uses a 16:9 sensor size and Full is cropped to the screen's shape. The DNG still keeps the whole sensor.
+- With the Full ratio, photos showed much more than the viewfinder (the whole 4:3 frame). They are now cropped to what the screen showed.
+- Tap-to-focus was ignored by Night, Long exposure, HDR and RAW + JPEG shots, which refocused on the center. They now focus and meter on the tapped spot until the focus lock is released.
+- "Keep selfies as seen" was ignored by Night and Long exposure on the front camera and by front-camera videos.
+- The palm-timer face and hand boxes could stay on screen after switching modes or turning the palm timer off.
+- The palm timer rarely started: lowering your hand (or a missed frame) during the 1-second lock-on canceled the countdown. Once your palm is recognized, the timer now always starts.
+- Palm timer: works with the phone held sideways, finds people a few meters away (higher-resolution face search, hand search at full resolution around the face), and recognizes a raised hand when a bare forearm or shoulder is in view.
+- US English spelling throughout the app and docs (e.g. "blur centers on the subject").
+- Lock-screen camera: the thumbnail showed your newest gallery item (which could be a private photo) before you took anything. It now only shows photos from that session, and opening the photo or "All settings" asks you to unlock first.
+- Hold-to-record felt laggy: a hold now starts after 0.3 s instead of 0.5 s, and in Photo/Portrait the shutter switches to its recording state right away instead of waiting for the camera to switch to video.
+- The start-recording chime was picked up by the microphone at the beginning of videos. The audio stays muted while the chime plays, and the stop chime now plays after the recording has stopped.
+
 ## [1.1.0] - 2026-11-18
 
 ### Added
-- System theming: Material You dynamic colours from the wallpaper and automatic light/dark (`ui/theme/Theme.kt`). Settings and the quick-settings sheet follow the system theme; the viewfinder stays dark but uses the system accent.
+- System theming: Material You dynamic colors from the wallpaper and automatic light/dark (`ui/theme/Theme.kt`). Settings and the quick-settings sheet follow the system theme; the viewfinder stays dark but uses the system accent.
 - Proper monochrome launcher icon for Android 13+ themed icons.
 - Long exposure mode (aligned multi-frame average that blurs moving water/traffic).
 - Time lapse video mode (Camera2 + MediaRecorder, 2 fps capture played at 30 fps).
@@ -33,10 +129,10 @@ All notable changes to this project will be documented in this file.
 - About section in Settings.
 
 ### Improved
-- Mode rows now: Night · Portrait · Photo · Long exposure · Panorama, and Slow motion · Time lapse · Video (HDR removed from the row). Mode lists/labels centralised in `CameraModes`.
-- Settings reorganised into General / Composition / Fast access / Photo / Video / Advanced / About; quick-settings timer is Off/3/10 s.
+- Mode rows now: Night · Portrait · Photo · Long exposure · Panorama, and Slow motion · Time lapse · Video (HDR removed from the row). Mode lists/labels centralized in `CameraModes`.
+- Settings reorganized into General / Composition / Fast access / Photo / Video / Advanced / About; quick-settings timer is Off/3/10 s.
 - Volume-key auto-repeat no longer fires bursts of shots.
-- Layout: viewfinder anchored under the top bar so the shutter row never overlaps it; tighter bottom controls; centred mode carousel; live zoom value in the zoom pill; control icons rotate with the device; duplicate top flip button removed.
+- Layout: viewfinder anchored under the top bar so the shutter row never overlaps it; tighter bottom controls; centered mode carousel; live zoom value in the zoom pill; control icons rotate with the device; duplicate top flip button removed.
 - Manual controls redesigned (logarithmic ISO/shutter, Auto chips, Reset) and applied live instead of rebinding the camera on every slider move.
 - Full-screen processing overlay only for Night/HDR/Portrait; quick photos show a spinner on the thumbnail.
 - Settings sheet split into Photo / Video / More tabs.

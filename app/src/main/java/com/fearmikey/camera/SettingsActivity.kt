@@ -16,7 +16,6 @@ import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.tooling.preview.Preview
@@ -24,6 +23,8 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.fearmikey.camera.data.repository.UserPreferencesRepository
 import com.fearmikey.camera.domain.model.GridMode
+import com.fearmikey.camera.domain.model.ImageSaveMode
+import com.fearmikey.camera.domain.model.ResolutionMode
 import com.fearmikey.camera.domain.model.UserPreferences
 import com.fearmikey.camera.domain.model.VideoFrameRate
 import com.fearmikey.camera.domain.model.VideoResolution
@@ -32,11 +33,22 @@ import kotlinx.coroutines.launch
 
 import com.fearmikey.camera.ui.theme.CameraAppTheme
 
+/** On/off settings in [SettingsList]; [SettingsActions.onToggle] maps each to its repository update. */
+enum class SettingToggle {
+    LOCATION, LEVELER, CAMERA_SOUNDS, MIRROR_SELFIES, TIMER_LIGHT, PALM_TIMER, SCAN_CODES,
+    DOUBLE_TAP, LOW_LIGHT, HDR, PORTRAIT_ORIGINAL, STABILIZATION, AUDIO,
+}
+
+/** Choice dialogs in [SettingsList]. */
+private enum class SettingsDialog { GRID, VOLUME, PHOTO_RESOLUTION, FILE_FORMAT, VIDEO_RESOLUTION, FRAME_RATE }
+
 /** Every action the settings list can trigger; keeps the list composable previewable. */
 data class SettingsActions(
-    val onToggle: (String, Boolean) -> Unit = { _, _ -> },
+    val onToggle: (SettingToggle, Boolean) -> Unit = { _, _ -> },
     val onGridMode: (GridMode) -> Unit = {},
     val onVolumeKeyAction: (VolumeKeyAction) -> Unit = {},
+    val onPhotoResolution: (ResolutionMode) -> Unit = {},
+    val onSaveMode: (ImageSaveMode) -> Unit = {},
     val onVideoResolution: (VideoResolution) -> Unit = {},
     val onVideoFrameRate: (VideoFrameRate) -> Unit = {},
 )
@@ -57,23 +69,26 @@ class SettingsActivity : ComponentActivity() {
                     onToggle = { key, value ->
                         scope.launch {
                             when (key) {
-                                "location" -> repository.updateLocationTagging(value)
-                                "leveler" -> repository.updateShowLeveler(value)
-                                "camera_sounds" -> repository.updateCameraSounds(value)
-                                "mirror_selfies" -> repository.updateMirrorSelfies(value)
-                                "timer_light" -> repository.updateTimerLight(value)
-                                "palm_timer" -> repository.updateGestureTrigger(value)
-                                "scan_qr" -> repository.updateScanQrCodes(value)
-                                "double_tap" -> repository.updateDoubleTapSwitch(value)
-                                "low_light" -> repository.updateLowLightSuggestion(value)
-                                "hdr" -> repository.updateHdrPhoto(value)
-                                "stabilization" -> repository.updateVideoStabilization(value)
-                                "audio" -> repository.updateRecordAudio(value)
+                                SettingToggle.LOCATION -> repository.updateLocationTagging(value)
+                                SettingToggle.LEVELER -> repository.updateShowLeveler(value)
+                                SettingToggle.CAMERA_SOUNDS -> repository.updateCameraSounds(value)
+                                SettingToggle.MIRROR_SELFIES -> repository.updateMirrorSelfies(value)
+                                SettingToggle.TIMER_LIGHT -> repository.updateTimerLight(value)
+                                SettingToggle.PALM_TIMER -> repository.updateGestureTrigger(value)
+                                SettingToggle.SCAN_CODES -> repository.updateScanQrCodes(value)
+                                SettingToggle.DOUBLE_TAP -> repository.updateDoubleTapSwitch(value)
+                                SettingToggle.LOW_LIGHT -> repository.updateLowLightSuggestion(value)
+                                SettingToggle.HDR -> repository.updateHdrPhoto(value)
+                                SettingToggle.PORTRAIT_ORIGINAL -> repository.updatePortraitKeepOriginal(value)
+                                SettingToggle.STABILIZATION -> repository.updateVideoStabilization(value)
+                                SettingToggle.AUDIO -> repository.updateRecordAudio(value)
                             }
                         }
                     },
                     onGridMode = { scope.launch { repository.updateGridMode(it) } },
                     onVolumeKeyAction = { scope.launch { repository.updateVolumeKeyAction(it) } },
+                    onPhotoResolution = { scope.launch { repository.updateResolution(it) } },
+                    onSaveMode = { scope.launch { repository.updateSaveMode(it) } },
                     onVideoResolution = { scope.launch { repository.updateVideoResolution(it) } },
                     onVideoFrameRate = { scope.launch { repository.updateVideoFrameRate(it) } },
                 )
@@ -106,7 +121,7 @@ fun SettingsList(
     modifier: Modifier = Modifier,
 ) {
     val context = LocalContext.current
-    var dialog by remember { mutableStateOf<String?>(null) }
+    var dialog by remember { mutableStateOf<SettingsDialog?>(null) }
     val freeSpace = remember {
         runCatching {
             val stat = StatFs(Environment.getExternalStorageDirectory().path)
@@ -114,11 +129,15 @@ fun SettingsList(
         }.getOrDefault("Unknown")
     }
 
+    val close = { dialog = null }
     when (dialog) {
-        "grid" -> ChoiceDialog("Grid type", GridMode.entries, prefs.gridMode, { it.label }, { actions.onGridMode(it); dialog = null }) { dialog = null }
-        "volume" -> ChoiceDialog("Volume key action", VolumeKeyAction.entries, prefs.volumeKeyAction, { it.label }, { actions.onVolumeKeyAction(it); dialog = null }) { dialog = null }
-        "resolution" -> ChoiceDialog("Video resolution", VideoResolution.entries, prefs.videoResolution, { it.value }, { actions.onVideoResolution(it); dialog = null }) { dialog = null }
-        "fps" -> ChoiceDialog("Video frame rate", VideoFrameRate.entries, prefs.videoFrameRate, { it.label }, { actions.onVideoFrameRate(it); dialog = null }) { dialog = null }
+        SettingsDialog.GRID -> ChoiceDialog("Grid", GridMode.entries, prefs.gridMode, { it.label }, { actions.onGridMode(it); close() }, close)
+        SettingsDialog.VOLUME -> ChoiceDialog("Volume key action", VolumeKeyAction.entries, prefs.volumeKeyAction, { it.label }, { actions.onVolumeKeyAction(it); close() }, close)
+        SettingsDialog.PHOTO_RESOLUTION -> ChoiceDialog("Photo resolution", ResolutionMode.entries, prefs.resolution, { it.label }, { actions.onPhotoResolution(it); close() }, close)
+        SettingsDialog.FILE_FORMAT -> ChoiceDialog("File format", ImageSaveMode.entries, prefs.saveMode, { it.label }, { actions.onSaveMode(it); close() }, close)
+        SettingsDialog.VIDEO_RESOLUTION -> ChoiceDialog("Video resolution", VideoResolution.entries, prefs.videoResolution, { it.value }, { actions.onVideoResolution(it); close() }, close)
+        SettingsDialog.FRAME_RATE -> ChoiceDialog("Frame rate", VideoFrameRate.entries, prefs.videoFrameRate, { it.label }, { actions.onVideoFrameRate(it); close() }, close)
+        null -> Unit
     }
 
     val versionName = remember {
@@ -127,33 +146,37 @@ fun SettingsList(
     val toggle = actions.onToggle
     LazyColumn(modifier = modifier.fillMaxSize().padding(horizontal = 16.dp)) {
         item { SettingsHeader("General") }
-        item { SettingsItem("Save location", "Add GPS coordinates to photos and videos. Other apps may be able to view this information.", prefs.locationTagging, onCheckedChange = { toggle("location", it) }) }
-        item { SettingsItem("Camera sounds", "Shutter, timer and recording sounds", prefs.cameraSounds, onCheckedChange = { toggle("camera_sounds", it) }) }
+        // Setting names match the in-camera quick-settings sheet (SettingsSheet.kt).
+        item { SettingsItem("Save location", "Add GPS coordinates to photos and videos. Other apps may be able to view this information.", prefs.locationTagging, onCheckedChange = { toggle(SettingToggle.LOCATION, it) }) }
+        item { SettingsItem("Camera sounds", "Shutter, timer and recording sounds", prefs.cameraSounds, onCheckedChange = { toggle(SettingToggle.CAMERA_SOUNDS, it) }) }
         item { SettingsItem("Device storage", "$freeSpace · Saved to DCIM/Camera") }
-        item { SettingsItem("Scan QR codes", "Show a suggestion when a QR code is in view (Photo mode). Decoded on-device.", prefs.scanQrCodes, onCheckedChange = { toggle("scan_qr", it) }) }
+        item { SettingsItem("Scan QR codes & barcodes", "Outline codes in view and suggest an action (Photo mode). Also scan from an image. Decoded on-device.", prefs.scanQrCodes, onCheckedChange = { toggle(SettingToggle.SCAN_CODES, it) }) }
 
         item { SettingsHeader("Composition") }
-        item { SettingsItem("Framing hints", "Show a horizon leveler in the viewfinder", prefs.showLeveler, onCheckedChange = { toggle("leveler", it) }) }
-        item { SettingsItem("Grid type", prefs.gridMode.label, onClick = { dialog = "grid" }) }
-        item { SettingsItem("Keep selfies as seen", "Save selfies mirrored, as they appear on screen", prefs.mirrorSelfies, onCheckedChange = { toggle("mirror_selfies", it) }) }
+        item { SettingsItem("Framing hints", "Level in landscape and when shooting straight down", prefs.showLeveler, onCheckedChange = { toggle(SettingToggle.LEVELER, it) }) }
+        item { SettingsItem("Grid", prefs.gridMode.label, onClick = { dialog = SettingsDialog.GRID }) }
+        item { SettingsItem("Keep selfies as seen", "Save selfies and front-camera videos mirrored, as they appear on screen", prefs.mirrorSelfies, onCheckedChange = { toggle(SettingToggle.MIRROR_SELFIES, it) }) }
 
         item { SettingsHeader("Fast access") }
-        item { SettingsItem("Volume key action", prefs.volumeKeyAction.label, onClick = { dialog = "volume" }) }
-        item { SettingsItem("Double-tap to switch camera", "Double-tap the viewfinder to flip between front and back", prefs.doubleTapSwitch, onCheckedChange = { toggle("double_tap", it) }) }
-        item { SettingsItem("Palm timer", "Hold up an open hand next to your face to start a 3-second timer", prefs.gestureTrigger, onCheckedChange = { toggle("palm_timer", it) }) }
+        item { SettingsItem("Volume key action", prefs.volumeKeyAction.label, onClick = { dialog = SettingsDialog.VOLUME }) }
+        item { SettingsItem("Double-tap to switch camera", "Double-tap the viewfinder to flip between front and back", prefs.doubleTapSwitch, onCheckedChange = { toggle(SettingToggle.DOUBLE_TAP, it) }) }
+        item { SettingsItem("Palm timer", "Hold up an open hand next to your face to start a 3-second timer", prefs.gestureTrigger, onCheckedChange = { toggle(SettingToggle.PALM_TIMER, it) }) }
 
         item { SettingsHeader("Photo") }
-        item { SettingsItem("HDR", "Capture an exposure bracket and merge it for more detail in highlights and shadows (slower)", prefs.hdrPhoto, onCheckedChange = { toggle("hdr", it) }) }
-        item { SettingsItem("Low-light suggestions", "Offer Night mode when the scene is dark", prefs.lowLightSuggestion, onCheckedChange = { toggle("low_light", it) }) }
+        item { SettingsItem("HDR", "Capture an exposure bracket and merge it for more detail in highlights and shadows (slower). Rear camera, not with the flash or RAW + JPEG.", prefs.hdrPhoto, onCheckedChange = { toggle(SettingToggle.HDR, it) }) }
+        item { SettingsItem("Resolution", "${prefs.resolution.label} · rear camera, Photo mode", onClick = { dialog = SettingsDialog.PHOTO_RESOLUTION }) }
+        item { SettingsItem("File format", "${prefs.saveMode.label} · rear camera, Photo mode", onClick = { dialog = SettingsDialog.FILE_FORMAT }) }
+        item { SettingsItem("Low-light suggestions", "Offer Night mode when the scene is dark", prefs.lowLightSuggestion, onCheckedChange = { toggle(SettingToggle.LOW_LIGHT, it) }) }
+        item { SettingsItem("Keep original portraits", "Also save Portrait photos without the background blur", prefs.portraitKeepOriginal, onCheckedChange = { toggle(SettingToggle.PORTRAIT_ORIGINAL, it) }) }
 
         item { SettingsHeader("Video") }
-        item { SettingsItem("Resolution", prefs.videoResolution.value, onClick = { dialog = "resolution" }) }
-        item { SettingsItem("Frame rate", prefs.videoFrameRate.label, onClick = { dialog = "fps" }) }
-        item { SettingsItem("Video stabilization", "Reduce camera shake for smoother videos", prefs.videoStabilization, onCheckedChange = { toggle("stabilization", it) }) }
-        item { SettingsItem("Record audio", null, prefs.recordAudio, onCheckedChange = { toggle("audio", it) }) }
+        item { SettingsItem("Resolution", prefs.videoResolution.value, onClick = { dialog = SettingsDialog.VIDEO_RESOLUTION }) }
+        item { SettingsItem("Frame rate", prefs.videoFrameRate.label, onClick = { dialog = SettingsDialog.FRAME_RATE }) }
+        item { SettingsItem("Stabilization", "Reduce camera shake for smoother videos", prefs.videoStabilization, onCheckedChange = { toggle(SettingToggle.STABILIZATION, it) }) }
+        item { SettingsItem("Record audio", null, prefs.recordAudio, onCheckedChange = { toggle(SettingToggle.AUDIO, it) }) }
 
         item { SettingsHeader("Advanced") }
-        item { SettingsItem("Timer light", "Flash the rear light during the timer countdown", prefs.timerLight, onCheckedChange = { toggle("timer_light", it) }) }
+        item { SettingsItem("Timer light", "Flash the rear light during the timer countdown", prefs.timerLight, onCheckedChange = { toggle(SettingToggle.TIMER_LIGHT, it) }) }
 
         item { SettingsHeader("About") }
         item { SettingsItem("Version", versionName) }

@@ -1,7 +1,7 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
     <!-- Follows the system light/dark setting (Compose draws the content with
-         Material You colours; this only controls the window before Compose starts). -->
+         Material You colors; this only controls the window before Compose starts). -->
     <style name="Theme.Camera" parent="android:Theme.DeviceDefault.DayNight">
         <item name="android:windowActionBar">false</item>
         <item name="android:windowNoTitle">true</item>

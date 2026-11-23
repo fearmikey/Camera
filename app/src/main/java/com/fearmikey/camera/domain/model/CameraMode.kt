@@ -4,8 +4,7 @@ enum class CameraMode {
     PHOTO,
     VIDEO,
     NIGHT_SIGHT,
-    /** Not a mode-row entry anymore: PHOTO captures use the HDR pipeline when UserPreferences.hdrPhoto is on. */
-    HDR,
+    // HDR is not a mode: PHOTO uses the HDR pipeline when UserPreferences.hdrPhoto is on.
     SLOW_MO,
     PORTRAIT,
     PANORAMA,
@@ -24,7 +23,6 @@ object CameraModes {
         CameraMode.PHOTO -> "Photo"
         CameraMode.VIDEO -> "Video"
         CameraMode.NIGHT_SIGHT -> "Night"
-        CameraMode.HDR -> "HDR"
         CameraMode.SLOW_MO -> "Slow motion"
         CameraMode.PORTRAIT -> "Portrait"
         CameraMode.PANORAMA -> "Panorama"

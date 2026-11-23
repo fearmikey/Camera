@@ -13,7 +13,11 @@
 #include <opencv2/photo.hpp>
 #include <opencv2/objdetect.hpp>
 
+#include "PortraitEngine.hpp"
+
 #include <algorithm>
+#include <array>
+#include <climits>
 #include <cmath>
 #include <cstring>
 #include <vector>
@@ -108,97 +112,427 @@ bool yuv420ToRgb(const uint8_t* y, const uint8_t* u, const uint8_t* v,
     return false;
 }
 
-// Global tone curve used by night mode: lifts shadows based on mean luminance
-// and applies gentle local contrast via CLAHE on the L channel.
-void nightToneMap(cv::Mat& rgb) {
-    cv::Mat lab;
-    cv::cvtColor(rgb, lab, cv::COLOR_RGB2Lab);
-    std::vector<cv::Mat> ch;
-    cv::split(lab, ch);
+inline double srgbToLinear(double c) {
+    return c <= 0.04045 ? c / 12.92 : std::pow((c + 0.055) / 1.055, 2.4);
+}
 
-    double meanL = cv::mean(ch[0])[0] / 255.0;
-    if (meanL > 0.01 && meanL < 0.42) {
-        // gamma so that the mean maps to ~0.42, limited to avoid washing out.
-        double gamma = std::clamp(std::log(0.42) / std::log(meanL), 0.45, 1.0);
-        cv::Mat lut(1, 256, CV_8UC1);
-        for (int i = 0; i < 256; ++i) {
-            lut.at<uint8_t>(i) = cv::saturate_cast<uint8_t>(std::pow(i / 255.0, gamma) * 255.0);
+inline double linearToSrgb(double c) {
+    return c <= 0.0031308 ? c * 12.92 : 1.055 * std::pow(c, 1.0 / 2.4) - 0.055;
+}
+
+// Night tone mapping parameters (linear light).
+constexpr double kNightKey = 0.10;        // target log-average luminance of the result
+constexpr double kNightMaxAutoGain = 6.0; // auto brightening cap (~2.6 EV)
+constexpr double kNightMaxGain = 8.0;     // overall cap incl. the capture plan's shortfall
+constexpr double kNightMaxBlack = 0.004;  // black point never above this
+// Luma sharpening after the merge (the frames are captured with EDGE_MODE_OFF).
+constexpr double kNightSharpenSigma = 1.2;
+constexpr double kNightSharpenAmount = 0.8;
+constexpr int kNightSharpenCoring = 2 * 257;  // ~2 8-bit levels: leave residual noise alone
+
+// Long exposure merge parameters (see longExposureMerge).
+constexpr double kLongTrailClipLo = 0.90;  // brightest frame value (sRGB) where trail recovery starts
+constexpr double kLongTrailClipHi = 0.99;
+constexpr float kLongTrailExcessLo = 0.10f;  // linear peak-over-mean needed (static areas: ~0)
+constexpr float kLongTrailExcessHi = 0.35f;
+constexpr float kLongTrailDarkLo = 0.08f;    // linear mean where recovery starts fading out:
+constexpr float kLongTrailDarkHi = 0.30f;    // only emissive lights in dark surroundings saturate
+constexpr double kLongSharpenAmount = 0.6;
+constexpr double kLongMaxGain = 4.0;
+
+inline uint32_t hash32(uint32_t x) {
+    x ^= x >> 16;
+    x *= 0x7feb352dU;
+    x ^= x >> 15;
+    x *= 0x846ca68bU;
+    x ^= x >> 16;
+    return x;
+}
+
+inline float smoothstepf(float lo, float hi, float x) {
+    const float t = std::clamp((x - lo) / (hi - lo), 0.0f, 1.0f);
+    return t * t * (3.0f - 2.0f * t);
+}
+
+// 8-bit sRGB code value -> linear light.
+const std::array<float, 256>& srgb8ToLinear() {
+    static const std::array<float, 256> lut = [] {
+        std::array<float, 256> t{};
+        for (int i = 0; i < 256; ++i) t[i] = static_cast<float>(srgbToLinear(i / 255.0));
+        return t;
+    }();
+    return lut;
+}
+
+// Shared 16-bit finishing for merged stacks. Releases `rgb16` (CV_16UC3, display-encoded).
+//  1. YCrCb; optional chroma median at half resolution (gain amplifies color blotches).
+//  2. Cored unsharp mask on luma: frames are captured with EDGE_MODE_OFF, so this restores
+//     the detail the ISP's edge enhancement would add, once, without sharpening noise.
+//  3. Triangular dither to 8 bits. Staying at 16 bits until here keeps smooth gradients
+//     (dark walls, skies) free of contour bands.
+void finishRgb16(cv::Mat& rgb16, bool chromaDenoise, double sharpenAmount, cv::Mat& rgbOut) {
+    std::vector<cv::Mat> ch;
+    {
+        cv::Mat ycc;
+        cv::cvtColor(rgb16, ycc, cv::COLOR_RGB2YCrCb);
+        rgb16.release();
+        cv::split(ycc, ch);
+    }
+    const cv::Size full = ch[0].size();
+    if (chromaDenoise) {
+        const cv::Size halfSize(std::max(1, full.width / 2), std::max(1, full.height / 2));
+        for (int c = 1; c <= 2; ++c) {
+            cv::Mat small;
+            cv::resize(ch[c], small, halfSize, 0, 0, cv::INTER_AREA);
+            cv::medianBlur(small, small, 5);
+            cv::resize(small, ch[c], full, 0, 0, cv::INTER_LINEAR);
         }
-        cv::LUT(ch[0], lut, ch[0]);
+    }
+    if (sharpenAmount > 0.0) {
+        cv::Mat blur;
+        cv::GaussianBlur(ch[0], blur, cv::Size(0, 0), kNightSharpenSigma);
+        cv::Mat& luma = ch[0];
+        cv::parallel_for_(cv::Range(0, luma.rows), [&](const cv::Range& range) {
+            for (int r = range.start; r < range.end; ++r) {
+                auto* y = luma.ptr<uint16_t>(r);
+                const auto* b = blur.ptr<uint16_t>(r);
+                for (int c = 0; c < luma.cols; ++c) {
+                    const int d = static_cast<int>(y[c]) - static_cast<int>(b[c]);
+                    const int mag = std::max(std::abs(d) - kNightSharpenCoring, 0);
+                    if (mag == 0) continue;
+                    const double boost = sharpenAmount * (d > 0 ? mag : -mag);
+                    y[c] = cv::saturate_cast<uint16_t>(y[c] + boost);
+                }
+            }
+        });
+    }
+    cv::Mat ycc;
+    cv::merge(ch, ycc);
+    ch.clear();
+    cv::cvtColor(ycc, rgb16, cv::COLOR_YCrCb2RGB);
+    ycc.release();
+
+    // Triangular dither (+-1 level) down to 8 bits.
+    rgbOut.create(rgb16.rows, rgb16.cols, CV_8UC3);
+    cv::parallel_for_(cv::Range(0, rgb16.rows), [&](const cv::Range& range) {
+        for (int r = range.start; r < range.end; ++r) {
+            const auto* src = rgb16.ptr<uint16_t>(r);
+            auto* dst = rgbOut.ptr<uint8_t>(r);
+            const int n = rgb16.cols * 3;
+            const uint32_t rowSeed = static_cast<uint32_t>(r) * 0x9E3779B9U;
+            for (int i = 0; i < n; ++i) {
+                const uint32_t h = hash32(rowSeed ^ static_cast<uint32_t>(i));
+                // Sum of two uniform [0, 257) values minus 257: triangular in (-257, 257).
+                const int noise = static_cast<int>(((h & 0xFFFFU) + (h >> 16)) * 257U / 65536U) - 257;
+                dst[i] = cv::saturate_cast<uint8_t>((static_cast<int>(src[i]) + noise + 128) / 257);
+            }
+        }
+    });
+    rgb16.release();
+}
+
+// Night tone mapping of an accumulated stack (CV_16UC3 sum of `frames` 8-bit RGB frames).
+// Releases `acc`. The ISP output is display-encoded, so brightening it directly (the old
+// gamma lift) muddies and flattens the image. Everything below runs at 16 bits and is only
+// dithered down to 8 bits at the very end: a smooth dark wall spans just a few 8-bit levels,
+// and any 8-bit intermediate step turns the brightened gradient into visible contour bands.
+//  1. Measure the merged frame in linear light: log-average luminance and a low percentile
+//     (black point). Gain = kNightKey / log-average, never below 1 (never darker than the
+//     frames) or `minGain` (exposure the capture plan could not reach).
+//  2. One per-channel LUT indexed by the exact frame sum: linearize, subtract the black point,
+//     multiply by the gain, then extended Reinhard with white point = gain (identity at gain
+//     1; original white stays white) so street lights roll off instead of clipping; re-encode.
+//  3. YCrCb clean-up: chroma median at half resolution (the gain amplifies color blotches),
+//     cored unsharp mask on luma (restores the detail the ISP's edge enhancement would add).
+//  4. Triangular dither to 8 bits.
+void nightToneMap(cv::Mat& acc, int frames, double minGain, cv::Mat& rgbOut) {
+    const double toUnit = 1.0 / (255.0 * frames);
+
+    // --- 1. statistics on a small copy ---
+    cv::Mat small;
+    const int sw = std::max(1, acc.cols / 8);
+    const int sh = std::max(1, acc.rows / 8);
+    cv::resize(acc, small, cv::Size(sw, sh), 0, 0, cv::INTER_AREA);
+    std::vector<float> lum;
+    lum.reserve(static_cast<size_t>(sw) * sh);
+    double logSum = 0.0;
+    for (int r = 0; r < small.rows; ++r) {
+        const auto* p = small.ptr<uint16_t>(r);
+        for (int c = 0; c < small.cols; ++c, p += 3) {
+            const double y = 0.2126 * srgbToLinear(p[0] * toUnit) +
+                             0.7152 * srgbToLinear(p[1] * toUnit) +
+                             0.0722 * srgbToLinear(p[2] * toUnit);
+            lum.push_back(static_cast<float>(y));
+            logSum += std::log(1e-4 + y);
+        }
+    }
+    const double logAvg = std::exp(logSum / static_cast<double>(lum.size()));
+    auto nth = lum.begin() + static_cast<long>(lum.size() / 200);  // 0.5th percentile
+    std::nth_element(lum.begin(), nth, lum.end());
+    const double black = std::clamp(static_cast<double>(*nth), 0.0, kNightMaxBlack);
+
+    const double autoGain = std::clamp(kNightKey / std::max(logAvg - black, 1e-4), 1.0, kNightMaxAutoGain);
+    const double gain = std::clamp(std::max(autoGain, minGain), 1.0, kNightMaxGain);
+    LOGI("Night tone map: logAvg %.4f black %.4f minGain %.2f -> gain %.2f", logAvg, black, minGain, gain);
+
+    // --- 2. LUT indexed by the frame sum (exact; no intermediate rounding) ---
+    const int lutSize = 255 * frames + 1;
+    std::vector<uint16_t> lut(static_cast<size_t>(lutSize));
+    const double white = gain;  // the brightest input maps to exactly 1
+    for (int i = 0; i < lutSize; ++i) {
+        double x = srgbToLinear(i / static_cast<double>(lutSize - 1));
+        x = std::max(0.0, x - black) / (1.0 - black) * gain;
+        // Extended Reinhard: slope 1 in the shadows, white -> 1, identity when gain == 1.
+        const double y = x * (1.0 + x / (white * white)) / (1.0 + x);
+        lut[i] = cv::saturate_cast<uint16_t>(linearToSrgb(std::clamp(y, 0.0, 1.0)) * 65535.0 + 0.5);
+    }
+    cv::Mat rgb16(acc.rows, acc.cols, CV_16UC3);
+    cv::parallel_for_(cv::Range(0, acc.rows), [&](const cv::Range& range) {
+        for (int r = range.start; r < range.end; ++r) {
+            const auto* src = acc.ptr<uint16_t>(r);
+            auto* dst = rgb16.ptr<uint16_t>(r);
+            const int n = acc.cols * 3;
+            for (int i = 0; i < n; ++i) dst[i] = lut[std::min<int>(src[i], lutSize - 1)];
+        }
+    });
+    acc.release();
+
+    // --- 3./4. chroma denoise + luma sharpening at 16 bits, dither to 8 bits ---
+    finishRgb16(rgb16, true, kNightSharpenAmount, rgbOut);
+}
+
+// Long exposure merge. `sum` is the CV_32FC3 linear-light sum of `frames` aligned frames,
+// `peak` their per-pixel 8-bit maximum. Releases both.
+//  - The mean in linear light is what one continuous exposure records. Averaging the
+//    display-encoded values instead (the old merge) darkens and muddies light trails and
+//    white water, and truncating that to 8 bits banded smooth skies.
+//  - Light-trail recovery: a headlight that crosses a pixel clips in the frame(s) it appears
+//    in, so the mean (1/N of the clipped value) leaves it as a faint gray trail, while a real
+//    long exposure would saturate it. Where the brightest frame clipped, stands well above
+//    the mean (moving, not a static highlight) and the surroundings are dark (an emissive
+//    light, not a white car in daylight), the result blends toward the peak.
+//  - `gain` (exposure the capture plan could not reach) is applied in linear light with an
+//    extended-Reinhard roll-off (identity at gain 1), then finishRgb16 sharpens and dithers.
+void longExposureMerge(cv::Mat& sum, cv::Mat& peak, int frames, double gain, cv::Mat& rgbOut) {
+    gain = std::clamp(gain, 1.0, kLongMaxGain);
+    const float invFrames = 1.0f / static_cast<float>(frames);
+    const auto& toLinear = srgb8ToLinear();
+
+    std::array<float, 256> clipWeight{};
+    for (int i = 0; i < 256; ++i) {
+        clipWeight[i] = smoothstepf(static_cast<float>(kLongTrailClipLo), static_cast<float>(kLongTrailClipHi),
+                                    static_cast<float>(i / 255.0));
+    }
+    // Linear [0, 1] (before gain) -> gain + roll-off -> 16-bit sRGB. 1/65535 linear steps are
+    // ~0.05 8-bit levels even in the deepest shadows.
+    constexpr int kEncSize = 65536;
+    std::vector<uint16_t> encode(kEncSize);
+    const double white = gain;
+    for (int i = 0; i < kEncSize; ++i) {
+        const double x = i / static_cast<double>(kEncSize - 1) * gain;
+        const double y = x * (1.0 + x / (white * white)) / (1.0 + x);
+        encode[i] = cv::saturate_cast<uint16_t>(linearToSrgb(std::clamp(y, 0.0, 1.0)) * 65535.0 + 0.5);
     }
 
-    auto clahe = cv::createCLAHE(1.6, cv::Size(8, 8));
-    clahe->apply(ch[0], ch[0]);
+    cv::Mat rgb16(sum.rows, sum.cols, CV_16UC3);
+    cv::parallel_for_(cv::Range(0, sum.rows), [&](const cv::Range& range) {
+        for (int r = range.start; r < range.end; ++r) {
+            const auto* s = sum.ptr<float>(r);
+            const auto* p = peak.ptr<uint8_t>(r);
+            auto* d = rgb16.ptr<uint16_t>(r);
+            for (int c = 0; c < sum.cols; ++c, s += 3, p += 3, d += 3) {
+                float mean[3];
+                float top[3];
+                float excess = 0.0f;
+                float meanMax = 0.0f;
+                for (int k = 0; k < 3; ++k) {
+                    mean[k] = s[k] * invFrames;
+                    top[k] = toLinear[p[k]];
+                    excess = std::max(excess, top[k] - mean[k]);
+                    meanMax = std::max(meanMax, mean[k]);
+                }
+                float w = clipWeight[std::max({p[0], p[1], p[2]})];
+                if (w > 0.0f) {
+                    w *= smoothstepf(kLongTrailExcessLo, kLongTrailExcessHi, excess) *
+                         (1.0f - smoothstepf(kLongTrailDarkLo, kLongTrailDarkHi, meanMax));
+                }
+                for (int k = 0; k < 3; ++k) {
+                    const float v = std::clamp(mean[k] + w * (top[k] - mean[k]), 0.0f, 1.0f);
+                    d[k] = encode[static_cast<int>(v * (kEncSize - 1) + 0.5f)];
+                }
+            }
+        }
+    });
+    sum.release();
+    peak.release();
+    LOGI("Long exposure merge: %d frames, gain %.2f", frames, gain);
 
-    cv::merge(ch, lab);
-    cv::cvtColor(lab, rgb, cv::COLOR_Lab2RGB);
+    finishRgb16(rgb16, gain > 2.0, kLongSharpenAmount, rgbOut);
 }
 
 // ---------------------------------------------------------------------------
-// Night stacker: aligned temporal averaging of a YUV burst.
+// Stacker: aligned temporal merge of a YUV burst (Night and Long exposure).
 // ---------------------------------------------------------------------------
+
+double median(std::vector<double>& v) {
+    std::sort(v.begin(), v.end());
+    const size_t n = v.size();
+    return n % 2 ? v[n / 2] : 0.5 * (v[n / 2 - 1] + v[n / 2]);
+}
 
 struct NightStacker {
+    struct Patch {
+        cv::Point2f center;  // full-resolution center in the reference frame
+        cv::Mat ref;         // CV_32F full-resolution luma patch of the reference frame
+    };
+
     int width;
     int height;
+    bool longExposure;
     int frames = 0;
     static constexpr int kAlignScale = 4;
+    static constexpr int kPatch = 512;  // full-resolution patch for sub-pixel refinement
+    static constexpr int kMaxPatches = 3;
     cv::Mat refSmall;      // downscaled luma of the reference frame
-    cv::Mat accumulator;   // CV_16UC3 running sum (fits up to 257 frames)
+    std::vector<Patch> patches;
+    cv::Mat hann;          // window for phase correlation
+    cv::Mat accumulator;   // Night: CV_16UC3 running sum of 8-bit frames (fits up to 257 frames)
+    cv::Mat linearSum;     // Long exposure: CV_32FC3 running sum in linear light
+    cv::Mat peak;          // Long exposure: CV_8UC3 per-pixel maximum (light trails)
     cv::Ptr<cv::AlignMTB> mtb = cv::createAlignMTB(5, 4, true);
 
-    NightStacker(int w, int h) : width(w), height(h) {}
+    NightStacker(int w, int h, bool longExp) : width(w), height(h), longExposure(longExp) {}
+
+    // Picks up to kMaxPatches well-textured kPatch x kPatch regions in different parts of the
+    // frame (the center may be a blank wall) as references for sub-pixel refinement. With
+    // several patches a median outvotes one that sits on a moving subject (the most textured
+    // region of a waterfall shot is often the water itself), which would otherwise drag every
+    // frame along with the motion and smear the static scene.
+    void setReference(const cv::Mat& y, const cv::Mat& small) {
+        refSmall = small.clone();
+        patches.clear();
+        std::vector<cv::Point2f> centers;
+        const int win = kPatch / kAlignScale;
+        if (small.cols > win * 2 && small.rows > win * 2) {
+            cv::Mat lap;
+            cv::Laplacian(small, lap, CV_32F, 3);
+            lap = cv::abs(lap);
+            cv::Mat energy;
+            cv::boxFilter(lap, energy, CV_32F, cv::Size(win, win));
+            // Centers whose window stays inside the frame, with a margin for the shake.
+            const cv::Rect valid(win, win, small.cols - 2 * win, small.rows - 2 * win);
+            const cv::Mat e = energy(valid);
+            // Strongest center in each cell of a 3x3 grid, then the strongest cells first.
+            std::vector<std::pair<double, cv::Point>> cand;
+            for (int gy = 0; gy < 3; ++gy) {
+                for (int gx = 0; gx < 3; ++gx) {
+                    const int x0 = gx * e.cols / 3, x1 = (gx + 1) * e.cols / 3;
+                    const int y0 = gy * e.rows / 3, y1 = (gy + 1) * e.rows / 3;
+                    if (x1 <= x0 || y1 <= y0) continue;
+                    double mx = 0.0;
+                    cv::Point loc;
+                    cv::minMaxLoc(e(cv::Rect(x0, y0, x1 - x0, y1 - y0)), nullptr, &mx, nullptr, &loc);
+                    cand.emplace_back(mx, loc + cv::Point(x0 + valid.x, y0 + valid.y));
+                }
+            }
+            std::sort(cand.begin(), cand.end(), [](const auto& a, const auto& b) { return a.first > b.first; });
+            for (const auto& [en, pt] : cand) {
+                if (static_cast<int>(centers.size()) == kMaxPatches) break;
+                // Flat regions: phase correlation would only lock onto noise.
+                if (en < 0.25 * cand.front().first) break;
+                const cv::Point2f c(static_cast<float>(pt.x * kAlignScale), static_cast<float>(pt.y * kAlignScale));
+                const bool apart = std::all_of(centers.begin(), centers.end(), [&](const cv::Point2f& o) {
+                    return std::abs(o.x - c.x) >= kPatch || std::abs(o.y - c.y) >= kPatch;
+                });
+                if (apart) centers.push_back(c);
+            }
+        }
+        if (centers.empty()) centers.emplace_back(width / 2.0f, height / 2.0f);
+        for (const cv::Point2f& c : centers) {
+            Patch p;
+            p.center = c;
+            cv::getRectSubPix(y, cv::Size(kPatch, kPatch), c, p.ref, CV_32F);
+            patches.push_back(std::move(p));
+        }
+        cv::createHanningWindow(hann, cv::Size(kPatch, kPatch), CV_32F);
+    }
+
+    // Mean absolute difference between patch `p` and frame `y` shifted by `t`
+    // (aligned(x) = y(x - t)).
+    static double patchError(const cv::Mat& y, const Patch& p, const cv::Point2d& t) {
+        cv::Mat patch;
+        cv::getRectSubPix(y, p.ref.size(),
+                          cv::Point2f(p.center.x - static_cast<float>(t.x), p.center.y - static_cast<float>(t.y)),
+                          patch, CV_32F);
+        return cv::norm(patch, p.ref, cv::NORM_L1) / static_cast<double>(p.ref.total());
+    }
+
+    // Sub-pixel shift for one patch: phase correlation around the coarse shift. Each candidate
+    // is checked against the reference, so a failed correlation (no texture, motion) falls
+    // back to the coarse shift.
+    cv::Point2d refinePatch(const cv::Mat& y, const Patch& p, const cv::Point2d& coarse) const {
+        cv::Mat patch;
+        cv::getRectSubPix(y, p.ref.size(),
+                          cv::Point2f(p.center.x - static_cast<float>(coarse.x),
+                                      p.center.y - static_cast<float>(coarse.y)),
+                          patch, CV_32F);
+        const cv::Point2d pc = cv::phaseCorrelate(p.ref, patch, hann);
+        if (std::abs(pc.x) > 2.0 * kAlignScale || std::abs(pc.y) > 2.0 * kAlignScale) return coarse;
+        cv::Point2d best = coarse;
+        double bestErr = patchError(y, p, coarse);
+        for (const cv::Point2d& cand : {coarse + pc, coarse - pc}) {
+            const double err = patchError(y, p, cand);
+            if (err < bestErr) {
+                bestErr = err;
+                best = cand;
+            }
+        }
+        return best;
+    }
+
+    // Refines the coarse (4-pixel-step) MTB shift to sub-pixel precision: the per-axis median
+    // of the per-patch refinements.
+    cv::Point2d refineShift(const cv::Mat& y, const cv::Point2d& coarse) const {
+        if (patches.empty()) return coarse;
+        std::vector<double> xs;
+        std::vector<double> ys;
+        for (const Patch& p : patches) {
+            const cv::Point2d s = refinePatch(y, p, coarse);
+            xs.push_back(s.x);
+            ys.push_back(s.y);
+        }
+        return {median(xs), median(ys)};
+    }
+
+    // Adds an aligned 8-bit RGB frame. Night sums the display-encoded values (its tone map
+    // linearizes the exact sum through a LUT); Long exposure sums linear light, as a single
+    // continuous exposure would, and tracks the per-pixel peak for light-trail recovery.
+    void accumulate(const cv::Mat& rgb) {
+        if (!longExposure) {
+            if (accumulator.empty()) {
+                rgb.convertTo(accumulator, CV_16UC3);
+            } else {
+                cv::add(accumulator, rgb, accumulator, cv::noArray(), CV_16UC3);
+            }
+            return;
+        }
+        if (linearSum.empty()) {
+            linearSum = cv::Mat::zeros(rgb.size(), CV_32FC3);
+            peak = rgb.clone();
+        } else {
+            cv::max(peak, rgb, peak);
+        }
+        const auto& toLinear = srgb8ToLinear();
+        cv::parallel_for_(cv::Range(0, rgb.rows), [&](const cv::Range& range) {
+            for (int r = range.start; r < range.end; ++r) {
+                const auto* src = rgb.ptr<uint8_t>(r);
+                auto* dst = linearSum.ptr<float>(r);
+                const int n = rgb.cols * 3;
+                for (int i = 0; i < n; ++i) dst[i] += toLinear[src[i]];
+            }
+        });
+    }
 };
-
-// ---------------------------------------------------------------------------
-// Portrait helpers
-// ---------------------------------------------------------------------------
-
-// Keeps only connected components that overlap the seed rectangle (or the
-// largest component if there is no seed).
-void keepSubjectComponents(cv::Mat& mask, const cv::Rect& seed) {
-    cv::Mat labels, stats, centroids;
-    int n = cv::connectedComponentsWithStats(mask, labels, stats, centroids, 8, CV_32S);
-    if (n <= 1) return;
-
-    std::vector<uint8_t> keep(static_cast<size_t>(n), 0);
-    if (seed.area() > 0) {
-        for (int i = 1; i < n; ++i) {
-            cv::Rect r(stats.at<int>(i, cv::CC_STAT_LEFT), stats.at<int>(i, cv::CC_STAT_TOP),
-                       stats.at<int>(i, cv::CC_STAT_WIDTH), stats.at<int>(i, cv::CC_STAT_HEIGHT));
-            if ((r & seed).area() > 0) keep[i] = 1;
-        }
-    }
-    bool any = std::any_of(keep.begin(), keep.end(), [](uint8_t k) { return k != 0; });
-    if (!any) {
-        int best = 1;
-        for (int i = 2; i < n; ++i) {
-            if (stats.at<int>(i, cv::CC_STAT_AREA) > stats.at<int>(best, cv::CC_STAT_AREA)) best = i;
-        }
-        keep[best] = 1;
-    }
-    for (int r = 0; r < mask.rows; ++r) {
-        const int* l = labels.ptr<int>(r);
-        uint8_t* m = mask.ptr<uint8_t>(r);
-        for (int c = 0; c < mask.cols; ++c) m[c] = keep[l[c]] ? 255 : 0;
-    }
-}
-
-// Normalized-convolution blur: blurs only background pixels so the subject's
-// colours do not bleed into the bokeh halo.
-cv::Mat backgroundBlur(const cv::Mat& rgbF, const cv::Mat& bgWeight, double sigma) {
-    cv::Mat w3;
-    cv::Mat wch[] = {bgWeight, bgWeight, bgWeight};
-    cv::merge(wch, 3, w3);
-    cv::Mat num, den;
-    cv::GaussianBlur(rgbF.mul(w3), num, cv::Size(0, 0), sigma);
-    cv::GaussianBlur(bgWeight, den, cv::Size(0, 0), sigma);
-    den = cv::max(den, 1e-3);
-    cv::Mat den3;
-    cv::Mat dch[] = {den, den, den};
-    cv::merge(dch, 3, den3);
-    return num / den3;
-}
 
 // ---------------------------------------------------------------------------
 // Palm detection helpers
@@ -217,13 +551,13 @@ double angleBetween(const cv::Point& s, const cv::Point& f, const cv::Point& e) 
 extern "C" {
 
 // ===========================================================================
-// Night mode
+// Night mode / Long exposure
 // ===========================================================================
 
 JNIEXPORT jlong JNICALL
 Java_com_fearmikey_camera_data_engine_processing_NativeVisionBridge_nativeNightCreate(
-        JNIEnv*, jobject, jint width, jint height) {
-    return reinterpret_cast<jlong>(new NightStacker(width, height));
+        JNIEnv*, jobject, jint width, jint height, jboolean longExposure) {
+    return reinterpret_cast<jlong>(new NightStacker(width, height, longExposure == JNI_TRUE));
 }
 
 JNIEXPORT jboolean JNICALL
@@ -249,24 +583,27 @@ Java_com_fearmikey_camera_data_engine_processing_NativeVisionBridge_nativeNightA
                    0, 0, cv::INTER_AREA);
 
         if (s->frames == 0) {
-            s->refSmall = small.clone();
-            rgb.convertTo(s->accumulator, CV_16UC3);
+            s->setReference(yMat, small);
+            s->accumulate(rgb);
         } else {
-            cv::Point shift = s->mtb->calculateShift(s->refSmall, small);
+            const cv::Point coarse = s->mtb->calculateShift(s->refSmall, small);
             const double maxShift = 0.04 * small.cols;
-            if (std::abs(shift.x) > maxShift || std::abs(shift.y) > maxShift) {
-                LOGI("Night: rejecting frame with shift %d,%d", shift.x, shift.y);
+            if (std::abs(coarse.x) > maxShift || std::abs(coarse.y) > maxShift) {
+                LOGI("Night: rejecting frame with shift %d,%d", coarse.x, coarse.y);
                 return JNI_FALSE;
             }
+            // MTB works on the 1/4-scale frame, so on its own it is only accurate to ~4 px,
+            // which smears fine detail across the stack. Refine to sub-pixel.
+            const cv::Point2d shift = s->refineShift(
+                    yMat, cv::Point2d(coarse.x * NightStacker::kAlignScale, coarse.y * NightStacker::kAlignScale));
             cv::Mat aligned;
-            if (shift.x != 0 || shift.y != 0) {
-                cv::Mat m = (cv::Mat_<double>(2, 3) << 1, 0, shift.x * NightStacker::kAlignScale,
-                                                       0, 1, shift.y * NightStacker::kAlignScale);
-                cv::warpAffine(rgb, aligned, m, rgb.size(), cv::INTER_LINEAR, cv::BORDER_REFLECT);
+            if (std::abs(shift.x) > 0.05 || std::abs(shift.y) > 0.05) {
+                cv::Mat m = (cv::Mat_<double>(2, 3) << 1, 0, shift.x, 0, 1, shift.y);
+                cv::warpAffine(rgb, aligned, m, rgb.size(), cv::INTER_CUBIC, cv::BORDER_REFLECT);
             } else {
                 aligned = rgb;
             }
-            cv::add(s->accumulator, aligned, s->accumulator, cv::noArray(), CV_16UC3);
+            s->accumulate(aligned);
         }
         s->frames++;
         return JNI_TRUE;
@@ -285,7 +622,7 @@ Java_com_fearmikey_camera_data_engine_processing_NativeVisionBridge_nativeNightF
 
 JNIEXPORT jboolean JNICALL
 Java_com_fearmikey_camera_data_engine_processing_NativeVisionBridge_nativeNightFinish(
-        JNIEnv* env, jobject, jlong ptr, jobject outBitmap, jint rotationDegrees, jboolean toneMap) {
+        JNIEnv* env, jobject, jlong ptr, jobject outBitmap, jint rotationDegrees, jfloat minGain) {
     auto* s = reinterpret_cast<NightStacker*>(ptr);
     if (!s || s->frames == 0) return JNI_FALSE;
     LockedBitmap out(env, outBitmap);
@@ -293,16 +630,19 @@ Java_com_fearmikey_camera_data_engine_processing_NativeVisionBridge_nativeNightF
 
     try {
         cv::Mat rgb;
-        s->accumulator.convertTo(rgb, CV_8UC3, 1.0 / s->frames);
+        if (s->longExposure) {
+            longExposureMerge(s->linearSum, s->peak, s->frames, static_cast<double>(minGain), rgb);
+        } else {
+            nightToneMap(s->accumulator, s->frames, static_cast<double>(minGain), rgb);
+        }
         s->accumulator.release();
-        if (toneMap) nightToneMap(rgb);
         rotateInPlace(rgb, rotationDegrees);
         if (rgb.cols != out.mat().cols || rgb.rows != out.mat().rows) {
             LOGE("Night: output bitmap size mismatch");
             return JNI_FALSE;
         }
         writeRgbToRgba(rgb, out.mat());
-        LOGI("Night: merged %d frames", s->frames);
+        LOGI("%s: merged %d frames", s->longExposure ? "Long exposure" : "Night", s->frames);
         return JNI_TRUE;
     } catch (const cv::Exception& e) {
         LOGE("Night finish failed: %s", e.what());
@@ -366,129 +706,31 @@ Java_com_fearmikey_camera_data_engine_processing_NativeVisionBridge_nativeFuseEx
 }
 
 // ===========================================================================
-// Portrait: face-seeded GrabCut segmentation + background bokeh (in place)
+// Portrait: face-seeded segmentation + lens bokeh, in place (PortraitEngine.cpp)
 // ===========================================================================
 
 JNIEXPORT jboolean JNICALL
 Java_com_fearmikey_camera_data_engine_processing_NativeVisionBridge_nativePortraitBokeh(
-        JNIEnv* env, jobject, jobject bitmap, jfloat faceL, jfloat faceT, jfloat faceR, jfloat faceB,
-        jfloat strength) {
+        JNIEnv* env, jobject, jobject bitmap, jfloatArray faceBoxes, jfloat strength) {
+    std::vector<cv::Rect2f> faces;
+    if (faceBoxes) {
+        const jsize n = env->GetArrayLength(faceBoxes) / 4;
+        std::vector<jfloat> v(static_cast<size_t>(n) * 4);
+        if (n > 0) env->GetFloatArrayRegion(faceBoxes, 0, n * 4, v.data());
+        for (jsize i = 0; i < n; ++i) {
+            const float l = v[i * 4], t = v[i * 4 + 1], r = v[i * 4 + 2], b = v[i * 4 + 3];
+            if (r > l && b > t) faces.emplace_back(l, t, r - l, b - t);
+        }
+    }
+
     LockedBitmap bmp(env, bitmap);
     if (!bmp.ok()) return JNI_FALSE;
-    cv::Mat& rgba = bmp.mat();
-
     try {
-        const int fullW = rgba.cols;
-        const int fullH = rgba.rows;
-        const double scale = 640.0 / std::max(fullW, fullH);
-        cv::Size smallSize(std::max(1, static_cast<int>(fullW * scale)), std::max(1, static_cast<int>(fullH * scale)));
-
-        cv::Mat smallRgb;
-        {
-            cv::Mat smallRgba;
-            cv::resize(rgba, smallRgba, smallSize, 0, 0, cv::INTER_AREA);
-            cv::cvtColor(smallRgba, smallRgb, cv::COLOR_RGBA2RGB);
-        }
-        const int w = smallRgb.cols;
-        const int h = smallRgb.rows;
-
-        cv::Mat gcMask(h, w, CV_8UC1, cv::Scalar(cv::GC_BGD));
-        cv::Mat bgdModel, fgdModel;
-        cv::Rect seed;
-        const bool hasFace = faceR > faceL && faceB > faceT;
-
-        if (hasFace) {
-            cv::Rect face(static_cast<int>(faceL * w), static_cast<int>(faceT * h),
-                          static_cast<int>((faceR - faceL) * w), static_cast<int>((faceB - faceT) * h));
-            face &= cv::Rect(0, 0, w, h);
-            const int fw = face.width;
-            const int fh = face.height;
-
-            // Probable person region: head + shoulders/torso down to the bottom.
-            cv::Rect person(face.x - static_cast<int>(1.4 * fw), face.y - static_cast<int>(0.6 * fh),
-                            static_cast<int>(3.8 * fw), h);
-            person &= cv::Rect(0, 0, w, h);
-            gcMask.setTo(cv::Scalar(cv::GC_PR_BGD));
-            gcMask(person).setTo(cv::Scalar(cv::GC_PR_FGD));
-
-            // Definite background: a thin frame border away from the subject.
-            const int border = std::max(2, w / 40);
-            cv::Mat borderMask(h, w, CV_8UC1, cv::Scalar(0));
-            borderMask(cv::Rect(0, 0, w, border)).setTo(255);
-            borderMask(cv::Rect(0, 0, border, h)).setTo(255);
-            borderMask(cv::Rect(w - border, 0, border, h)).setTo(255);
-            borderMask(person).setTo(0);
-            gcMask.setTo(cv::Scalar(cv::GC_BGD), borderMask);
-
-            // Definite foreground: the inner face and a neck/chest strip.
-            cv::Rect innerFace(face.x + fw / 5, face.y + fh / 6, fw * 3 / 5, fh * 2 / 3);
-            cv::Rect chest(face.x + fw / 4, face.y + fh, fw / 2, static_cast<int>(0.8 * fh));
-            innerFace &= cv::Rect(0, 0, w, h);
-            chest &= cv::Rect(0, 0, w, h);
-            if (innerFace.area() > 0) gcMask(innerFace).setTo(cv::Scalar(cv::GC_FGD));
-            if (chest.area() > 0) gcMask(chest).setTo(cv::Scalar(cv::GC_FGD));
-
-            seed = face;
-            cv::grabCut(smallRgb, gcMask, cv::Rect(), bgdModel, fgdModel, 5, cv::GC_INIT_WITH_MASK);
-        } else {
-            // No face found: assume a centered subject.
-            cv::Rect rect(w / 6, h / 10, w * 2 / 3, h * 9 / 10 - 1);
-            seed = cv::Rect(w * 2 / 5, h * 2 / 5, w / 5, h / 5);
-            cv::grabCut(smallRgb, gcMask, rect, bgdModel, fgdModel, 5, cv::GC_INIT_WITH_RECT);
-        }
-
-        cv::Mat fg = (gcMask == cv::GC_FGD) | (gcMask == cv::GC_PR_FGD);
-        cv::morphologyEx(fg, fg, cv::MORPH_OPEN, cv::getStructuringElement(cv::MORPH_ELLIPSE, cv::Size(5, 5)));
-        cv::morphologyEx(fg, fg, cv::MORPH_CLOSE, cv::getStructuringElement(cv::MORPH_ELLIPSE, cv::Size(9, 9)));
-        keepSubjectComponents(fg, seed);
-
-        // Soft alpha at preview scale, then upscale to full resolution.
-        cv::Mat alphaSmall;
-        fg.convertTo(alphaSmall, CV_32F, 1.0 / 255.0);
-        cv::GaussianBlur(alphaSmall, alphaSmall, cv::Size(0, 0), std::max(1.5, w / 300.0));
-
-        // Blurred background is computed at reduced resolution (cheap, and the
-        // upscale adds extra softness) then blended at full resolution.
-        const double blurScale = 0.25;
-        cv::Size blurSize(std::max(1, static_cast<int>(fullW * blurScale)), std::max(1, static_cast<int>(fullH * blurScale)));
-        cv::Mat midRgb;
-        {
-            cv::Mat midRgba;
-            cv::resize(rgba, midRgba, blurSize, 0, 0, cv::INTER_AREA);
-            cv::cvtColor(midRgba, midRgb, cv::COLOR_RGBA2RGB);
-        }
-        cv::Mat midF;
-        midRgb.convertTo(midF, CV_32FC3);
-        cv::Mat alphaMid;
-        cv::resize(alphaSmall, alphaMid, blurSize, 0, 0, cv::INTER_LINEAR);
-        cv::Mat bgWeight = 1.0 - alphaMid;
-        const double sigma = std::max(2.0, blurSize.width * 0.012 * std::clamp(static_cast<double>(strength), 0.2, 2.0));
-        cv::Mat blurredMid = backgroundBlur(midF, bgWeight, sigma);
-
-        cv::Mat blurred8;
-        blurredMid.convertTo(blurred8, CV_8UC3);
-        cv::Mat blurredFull;
-        cv::resize(blurred8, blurredFull, rgba.size(), 0, 0, cv::INTER_LINEAR);
-        cv::Mat alphaFull;
-        cv::resize(alphaSmall, alphaFull, rgba.size(), 0, 0, cv::INTER_LINEAR);
-
-        // Blend row by row to avoid allocating full-resolution float images.
-        for (int r = 0; r < fullH; ++r) {
-            uint8_t* dst = rgba.ptr<uint8_t>(r);
-            const uint8_t* bg = blurredFull.ptr<uint8_t>(r);
-            const float* a = alphaFull.ptr<float>(r);
-            for (int c = 0; c < fullW; ++c) {
-                const float al = a[c];
-                const float ib = 1.0f - al;
-                dst[c * 4 + 0] = cv::saturate_cast<uint8_t>(dst[c * 4 + 0] * al + bg[c * 3 + 0] * ib);
-                dst[c * 4 + 1] = cv::saturate_cast<uint8_t>(dst[c * 4 + 1] * al + bg[c * 3 + 1] * ib);
-                dst[c * 4 + 2] = cv::saturate_cast<uint8_t>(dst[c * 4 + 2] * al + bg[c * 3 + 2] * ib);
-                dst[c * 4 + 3] = 255;
-            }
-        }
-        LOGI("Portrait: segmented (face=%d)", hasFace ? 1 : 0);
+        portrait::Stats stats;
+        portrait::renderBokeh(bmp.mat(), faces, strength, &stats);
+        LOGI("Portrait: faces=%d noise=%.2f subject=%.2f", stats.faces, stats.noiseSigma, stats.subjectArea);
         return JNI_TRUE;
-    } catch (const cv::Exception& e) {
+    } catch (const std::exception& e) {  // cv::Exception, std::bad_alloc
         LOGE("Portrait failed: %s", e.what());
         return JNI_FALSE;
     }
@@ -525,8 +767,9 @@ Java_com_fearmikey_camera_data_engine_processing_NativeVisionBridge_nativeDetect
         cv::Rect sample(face.x + face.width / 4, face.y + face.height / 4, face.width / 2, face.height / 2);
         cv::Scalar mean, stddev;
         cv::meanStdDev(ycrcb(sample), mean, stddev);
-        const double crTol = std::max(2.5 * stddev[1], 8.0);
-        const double cbTol = std::max(2.5 * stddev[2], 8.0);
+        // Palms are usually a little paler/pinker than the face: keep some slack.
+        const double crTol = std::max(2.5 * stddev[1], 11.0);
+        const double cbTol = std::max(2.5 * stddev[2], 11.0);
 
         cv::Mat skin;
         cv::inRange(ycrcb,
@@ -539,22 +782,50 @@ Java_com_fearmikey_camera_data_engine_processing_NativeVisionBridge_nativeDetect
         faceAndNeck &= cv::Rect(0, 0, w, h);
         skin(faceAndNeck).setTo(0);
 
-        cv::morphologyEx(skin, skin, cv::MORPH_OPEN, cv::getStructuringElement(cv::MORPH_ELLIPSE, cv::Size(3, 3)));
-        cv::morphologyEx(skin, skin, cv::MORPH_CLOSE, cv::getStructuringElement(cv::MORPH_ELLIPSE, cv::Size(7, 7)));
+        // Scale the clean-up to the face size: a fixed 7 px close fills the gaps between the
+        // fingers of a smaller (farther) hand, which is then no longer recognized.
+        auto oddKernel = [](int k) { k = std::max(3, k); return k | 1; };
+        const int openK = oddKernel(face.width / 27);
+        const int closeK = oddKernel(face.width / 12);
+        cv::morphologyEx(skin, skin, cv::MORPH_OPEN,
+                         cv::getStructuringElement(cv::MORPH_ELLIPSE, cv::Size(openK, openK)));
+        cv::morphologyEx(skin, skin, cv::MORPH_CLOSE,
+                         cv::getStructuringElement(cv::MORPH_ELLIPSE, cv::Size(closeK, closeK)));
 
         std::vector<std::vector<cv::Point>> contours;
         cv::findContours(skin, contours, cv::RETR_EXTERNAL, cv::CHAIN_APPROX_SIMPLE);
 
         const double faceArea = face.area();
+        // A hand (wrist to fingertips) is about as long as the face box is tall.
+        const int maxHandH = std::max(8, static_cast<int>(1.5 * face.height));
         double bestScore = 0;
         cv::Rect bestBox;
 
-        for (const auto& contour : contours) {
-            const double area = cv::contourArea(contour);
-            if (area < 0.35 * faceArea || area > 5.0 * faceArea) continue;
+        for (size_t ci = 0; ci < contours.size(); ++ci) {
+            if (cv::contourArea(contours[ci]) < 0.3 * faceArea) continue;
+            std::vector<cv::Point> contour = contours[ci];
             cv::Rect box = cv::boundingRect(contour);
+
+            // A bare forearm, or arm + shoulder, merges with the hand into one tall blob that
+            // failed the size/aspect checks. Fingers point up, so keep only the top of it.
+            if (box.height > maxHandH) {
+                const cv::Rect top(box.x, box.y, box.width, maxHandH);
+                cv::Mat blob = cv::Mat::zeros(top.size(), CV_8UC1);
+                cv::drawContours(blob, contours, static_cast<int>(ci), cv::Scalar(255), cv::FILLED,
+                                 cv::LINE_8, cv::noArray(), INT_MAX, -top.tl());
+                std::vector<std::vector<cv::Point>> parts;
+                cv::findContours(blob, parts, cv::RETR_EXTERNAL, cv::CHAIN_APPROX_SIMPLE, top.tl());
+                if (parts.empty()) continue;
+                contour = *std::max_element(parts.begin(), parts.end(), [](const auto& a, const auto& b) {
+                    return cv::contourArea(a) < cv::contourArea(b);
+                });
+                box = cv::boundingRect(contour);
+            }
+
+            const double area = cv::contourArea(contour);
+            if (area < 0.3 * faceArea || area > 3.5 * faceArea) continue;
             const double aspect = static_cast<double>(box.height) / std::max(1, box.width);
-            if (aspect < 0.7 || aspect > 2.6) continue;
+            if (aspect < 0.6 || aspect > 2.4) continue;
 
             std::vector<int> hullIdx;
             cv::convexHull(contour, hullIdx, false, false);
@@ -605,26 +876,127 @@ Java_com_fearmikey_camera_data_engine_processing_NativeVisionBridge_nativeDetect
 }
 
 // ===========================================================================
-// QR code decoding (OpenCV QRCodeDetector). Returns the payload or null.
+// QR code + 1-D barcode decoding (OpenCV objdetect).
+//
+// Returns an interleaved array {format0, payload0, format1, payload1, ...} of raw
+// bytes (payloads are not guaranteed to be valid UTF-8, so Kotlin decodes them),
+// or null when nothing was decoded. For code i, cornersOut[8i..8i+7] receives the
+// four (x, y) corners normalized to the bitmap size. At most cornersOut.length / 8
+// codes are returned. tryHarder adds an inverted-image pass (for still images).
 // ===========================================================================
 
-JNIEXPORT jstring JNICALL
-Java_com_fearmikey_camera_data_engine_processing_NativeVisionBridge_nativeDecodeQr(
-        JNIEnv* env, jobject, jobject bitmap) {
-    LockedBitmap bmp(env, bitmap);
-    if (!bmp.ok()) return nullptr;
-    try {
-        cv::Mat gray;
+JNIEXPORT jobjectArray JNICALL
+Java_com_fearmikey_camera_data_engine_processing_NativeVisionBridge_nativeDecodeCodes(
+        JNIEnv* env, jobject, jobject bitmap, jfloatArray cornersOut, jboolean tryHarder) {
+    struct Found {
+        std::string format;
+        std::string text;
+        float corners[8];
+    };
+    const size_t maxCodes = cornersOut ? static_cast<size_t>(env->GetArrayLength(cornersOut) / 8) : 0;
+    if (maxCodes == 0) return nullptr;
+
+    cv::Mat gray;
+    {
+        LockedBitmap bmp(env, bitmap);
+        if (!bmp.ok()) return nullptr;
         cv::cvtColor(bmp.mat(), gray, cv::COLOR_RGBA2GRAY);
-        static thread_local cv::QRCodeDetector detector;
-        cv::Mat points;
-        std::string text = detector.detectAndDecode(gray, points);
-        if (text.empty()) return nullptr;
-        return env->NewStringUTF(text.c_str());
-    } catch (const cv::Exception& e) {
-        LOGE("QR decode failed: %s", e.what());
-        return nullptr;
     }
+    if (gray.empty()) return nullptr;
+    const float w = static_cast<float>(gray.cols);
+    const float h = static_cast<float>(gray.rows);
+
+    std::vector<Found> found;
+    // Detector point outputs are N x 4 CV_32FC2 (layout varies); flatten to (4N) x 2 floats.
+    auto toQuads = [](const cv::Mat& pts) -> cv::Mat {
+        if (pts.empty()) return {};
+        cv::Mat f;
+        pts.convertTo(f, CV_32F);
+        f = f.reshape(1, static_cast<int>(f.total() * f.channels() / 2));
+        return f.cols == 2 ? f : cv::Mat();
+    };
+    auto add = [&](const std::string& format, const std::string& text, const cv::Mat& quads, size_t index) {
+        if (text.empty() || found.size() >= maxCodes) return;
+        for (const auto& f : found) if (f.text == text) return;
+        Found f{format, text, {}};
+        const int row = static_cast<int>(index * 4);
+        if (quads.rows >= row + 4) {
+            for (int i = 0; i < 4; ++i) {
+                f.corners[2 * i] = std::clamp(quads.at<float>(row + i, 0) / w, 0.f, 1.f);
+                f.corners[2 * i + 1] = std::clamp(quads.at<float>(row + i, 1) / h, 0.f, 1.f);
+            }
+        }
+        found.push_back(std::move(f));
+    };
+    auto decodeQr = [&](const cv::Mat& img) {
+        try {
+            // Aruco-based detector: more robust to blur/perspective and finds several codes.
+            static thread_local cv::QRCodeDetectorAruco aruco;
+            std::vector<std::string> texts;
+            cv::Mat pts;
+            if (aruco.detectAndDecodeMulti(img, texts, pts)) {
+                cv::Mat quads = toQuads(pts);
+                for (size_t i = 0; i < texts.size(); ++i) add("QR_CODE", texts[i], quads, i);
+            }
+        } catch (const cv::Exception& e) {
+            LOGE("QR (aruco) decode failed: %s", e.what());
+        }
+        if (!found.empty()) return;
+        try {
+            // The classic detector still wins on some small, sharp codes.
+            static thread_local cv::QRCodeDetector classic;
+            cv::Mat pts;
+            std::string text = classic.detectAndDecode(img, pts);
+            add("QR_CODE", text, toQuads(pts), 0);
+        } catch (const cv::Exception& e) {
+            LOGE("QR decode failed: %s", e.what());
+        }
+    };
+    auto decodeBarcodes = [&](const cv::Mat& img) {
+        try {
+            static thread_local cv::barcode::BarcodeDetector barcode;
+            std::vector<std::string> texts, types;
+            cv::Mat pts;
+            if (barcode.detectAndDecodeWithType(img, texts, types, pts)) {
+                cv::Mat quads = toQuads(pts);
+                for (size_t i = 0; i < texts.size(); ++i) {
+                    add(i < types.size() && !types[i].empty() ? types[i] : "BARCODE", texts[i], quads, i);
+                }
+            }
+        } catch (const cv::Exception& e) {
+            LOGE("Barcode decode failed: %s", e.what());
+        }
+    };
+
+    decodeQr(gray);
+    decodeBarcodes(gray);
+    if (found.empty() && tryHarder) {
+        // Light-on-dark (inverted) QR codes.
+        cv::Mat inverted;
+        cv::bitwise_not(gray, inverted);
+        decodeQr(inverted);
+    }
+    if (found.empty()) return nullptr;
+
+    jclass byteArrayClass = env->FindClass("[B");
+    if (!byteArrayClass) return nullptr;
+    jobjectArray result = env->NewObjectArray(static_cast<jsize>(found.size() * 2), byteArrayClass, nullptr);
+    if (!result) return nullptr;
+    std::vector<float> corners(found.size() * 8, 0.f);
+    for (size_t i = 0; i < found.size(); ++i) {
+        const std::string* parts[2] = {&found[i].format, &found[i].text};
+        for (int p = 0; p < 2; ++p) {
+            const auto len = static_cast<jsize>(parts[p]->size());
+            jbyteArray bytes = env->NewByteArray(len);
+            if (!bytes) return nullptr;
+            env->SetByteArrayRegion(bytes, 0, len, reinterpret_cast<const jbyte*>(parts[p]->data()));
+            env->SetObjectArrayElement(result, static_cast<jsize>(i * 2 + p), bytes);
+            env->DeleteLocalRef(bytes);
+        }
+        std::copy(found[i].corners, found[i].corners + 8, corners.begin() + static_cast<long>(i * 8));
+    }
+    env->SetFloatArrayRegion(cornersOut, 0, static_cast<jsize>(corners.size()), corners.data());
+    return result;
 }
 
 }  // extern "C"

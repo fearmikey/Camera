@@ -1,0 +1,6 @@
+• Code scanner: QR + EAN/UPC barcodes, live outlines, smart actions (Wi-Fi, contacts, events), scan from image
+• Portrait: lens-style bokeh, adjustable blur, group shots, face brackets, 2x portrait zoom
+• Auto Night flash setting; sharper, banding-free Night and Long exposure
+• Redesigned shutter, smooth zoom presets that follow your lenses, faster mode switching
+• Top-down leveler, better tap-to-focus
+• Controls only show where they work; many fixes

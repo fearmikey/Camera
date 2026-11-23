@@ -13,7 +13,7 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalInspectionMode
 
 /**
- * App theme that follows the system: Material You dynamic colours from the
+ * App theme that follows the system: Material You dynamic colors from the
  * wallpaper (minSdk 31 guarantees support) and the system light/dark setting.
  *
  * Previews use a fixed fallback palette so renders are deterministic.
@@ -34,7 +34,7 @@ fun CameraAppTheme(
 
 /**
  * The viewfinder is always dark (like every camera app, so the preview isn't
- * washed out), but it still picks up the system accent colour.
+ * washed out), but it still picks up the system accent color.
  */
 @Composable
 fun ViewfinderTheme(content: @Composable () -> Unit) = CameraAppTheme(darkTheme = true, content = content)

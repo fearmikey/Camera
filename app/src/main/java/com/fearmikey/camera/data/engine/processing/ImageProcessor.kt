@@ -13,7 +13,7 @@ import java.io.InputStreamReader
  *  - GPU pixel binning (GLSL, [GpuImageProcessor])
  *  - Night mode stacking ([NightStacker], OpenCV)
  *  - HDR exposure fusion (OpenCV Mertens)
- *  - Portrait background blur ([PortraitSegmenter], OpenCV GrabCut)
+ *  - Portrait background blur ([PortraitSegmenter], OpenCV GrabCut + lens bokeh)
  */
 class ImageProcessor(
     private val context: Context,
@@ -43,7 +43,8 @@ class ImageProcessor(
         gpuProcessor.performPixelBinning(imageProxy, imageProxy.imageInfo.rotationDegrees)
     }
 
-    fun createNightStacker(width: Int, height: Int): NightStacker = NightStacker(width, height)
+    fun createNightStacker(width: Int, height: Int, longExposure: Boolean = false): NightStacker =
+        NightStacker(width, height, longExposure)
 
     /**
      * Aligns and fuses an exposure bracket (any order) into a single image using
@@ -65,8 +66,12 @@ class ImageProcessor(
         return out
     }
 
-    /** Applies portrait background blur. Returns the processed bitmap (may be [baseBitmap]). */
-    fun processPortrait(baseBitmap: Bitmap): Bitmap = portraitSegmenter.applyBokeh(baseBitmap)
+    /**
+     * Applies portrait background blur at [strength] (1.0 ~ f/2.8, see PortraitAperture).
+     * Returns the processed bitmap, which may be [baseBitmap] itself (modified in place).
+     */
+    fun processPortrait(baseBitmap: Bitmap, strength: Float = 1f): Bitmap =
+        portraitSegmenter.applyBokeh(baseBitmap, strength)
 
     private companion object {
         const val TAG = "ImageProcessor"

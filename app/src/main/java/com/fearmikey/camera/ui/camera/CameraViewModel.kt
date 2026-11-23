@@ -10,7 +10,13 @@ import androidx.lifecycle.LifecycleOwner
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import androidx.core.net.toUri
+import android.content.ContentResolver
+import android.net.Uri
 import com.fearmikey.camera.data.engine.CaptureEngine
+import com.fearmikey.camera.data.engine.MeteringPointProvider
+import com.fearmikey.camera.data.engine.analysis.CodeDecoder
+import com.fearmikey.camera.data.engine.analysis.CodeScanFrame
+import com.fearmikey.camera.data.engine.analysis.PortraitFaceFrame
 import com.fearmikey.camera.data.engine.processing.PanoramaTooShortException
 import com.fearmikey.camera.data.repository.MediaRepository
 import com.fearmikey.camera.data.repository.UserPreferencesRepository
@@ -21,7 +27,12 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.flow.*
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.suspendCancellableCoroutine
+import kotlin.coroutines.resume
 import kotlin.math.abs
+import kotlin.math.ln
+import kotlin.math.pow
+import kotlin.math.asin
 import kotlin.math.atan2
 import kotlin.math.sqrt
 import kotlin.time.Duration.Companion.milliseconds
@@ -36,13 +47,30 @@ class CameraViewModel(
     private val captureEngine: CaptureEngine,
     private val mediaRepository: MediaRepository,
     private val userPreferencesRepository: UserPreferencesRepository,
+    /** Lock-screen camera: the thumbnail only shows what was captured in this session. */
+    secureSession: Boolean = false,
 ) : ViewModel(), SensorEventListener {
 
     private val _uiState = MutableStateFlow(CameraUiState())
     val uiState: StateFlow<CameraUiState> = _uiState.asStateFlow()
 
-    private val _tiltState = MutableStateFlow(0f)
-    val tiltState: StateFlow<Float> = _tiltState.asStateFlow()
+    /**
+     * Live zoom, separate from [uiState] because it changes every frame while pinching or
+     * gliding (collecting it doesn't recompose the whole screen). Read `.value` for the latest.
+     */
+    private val _zoomState = MutableStateFlow(ZoomUiState())
+    val zoomState: StateFlow<ZoomUiState> = _zoomState.asStateFlow()
+
+    /**
+     * Panorama corner preview / sweep progress (one update per analysis frame in Panorama),
+     * separate from [uiState] for the same reason. Null outside Panorama and between sweeps.
+     */
+    private val _panoramaProgress = MutableStateFlow<PanoramaProgress?>(null)
+    val panoramaProgress: StateFlow<PanoramaProgress?> = _panoramaProgress.asStateFlow()
+
+    /** Device attitude for the horizon (landscape) and top-down levelers. */
+    private val _levelState = MutableStateFlow(LevelState())
+    val levelState: StateFlow<LevelState> = _levelState.asStateFlow()
 
     private val _gestureState = MutableStateFlow(GestureOverlayState())
     val gestureState: StateFlow<GestureOverlayState> = _gestureState.asStateFlow()
@@ -53,18 +81,30 @@ class CameraViewModel(
     private val _focusState = MutableStateFlow<FocusState?>(null)
     val focusState: StateFlow<FocusState?> = _focusState.asStateFlow()
 
-    private val _autoShowLeveler = MutableStateFlow(false)
-    val autoShowLeveler: StateFlow<Boolean> = _autoShowLeveler.asStateFlow()
+    /** Latest live-scan frame while a code is in view (outline overlay); null otherwise. */
+    private val _codeScanFrame = MutableStateFlow<CodeScanFrame?>(null)
+    val codeScanFrame: StateFlow<CodeScanFrame?> = _codeScanFrame.asStateFlow()
+    private val dismissedCodes = mutableSetOf<String>()
+
+    /** Live face boxes in Portrait mode (viewfinder overlay); EMPTY outside Portrait. */
+    private val _portraitFaces = MutableStateFlow(PortraitFaceFrame.EMPTY)
+    val portraitFaces: StateFlow<PortraitFaceFrame> = _portraitFaces.asStateFlow()
 
     private var sensorManager: SensorManager? = null
     private var rotationSensor: Sensor? = null
     
-    // Low-pass filter variables
-    private var currentTilt = 0f
-    private val alpha = 0.3f // Increased for more responsiveness
-    
-    private var currentYaw = 0f
-    private var currentPitch = 0f
+    // Sensor state (main thread). "Up" is the gravity direction in device coordinates,
+    // low-passed as a vector so angles never wrap around.
+    private val rotationMatrix = FloatArray(9)
+    private val smoothUp = FloatArray(3)
+    private var hasUp = false
+    /** Camera viewing direction in world coordinates (accelerometer fallback: "up"). */
+    private val lookDir = FloatArray(3)
+    private var hasLookDir = false
+    /** Viewing direction when focus was tapped; moving away from it drops the lock. */
+    private var focusAnchor: FloatArray? = null
+    /** Sensor timestamp (ns) since the camera has pointed down, 0 when it isn't. */
+    private var faceDownSinceNs = 0L
     
     private var focusJob: Job? = null
     private var recordingTimerJob: Job? = null
@@ -88,16 +128,73 @@ class CameraViewModel(
     private var messageJob: Job? = null
 
     init {
-        refreshThumbnail()
+        // The newest gallery item may be a private photo: never show it over the lock screen.
+        if (!secureSession) refreshThumbnail()
         observePreferences()
         setupGestureTrigger()
         setupPanoramaListener()
         captureEngine.setOnCameraReadyListener { onCameraReady() }
-        captureEngine.setOnLowLightListener { dark -> _uiState.update { it.copy(lowLightSuggested = dark) } }
-        captureEngine.setOnQrCodeListener { text -> _uiState.update { it.copy(qrCode = text) } }
+        captureEngine.setOnLowLightListener { dark -> onLowLight(dark) }
+        captureEngine.setOnCaptureProgressListener { p ->
+            // Ignore stragglers from a capture that already finished or timed out.
+            _uiState.update { if (it.isProcessing && p > it.captureProgress) it.copy(captureProgress = p) else it }
+        }
+        captureEngine.setOnCodeScanListener { frame -> onCodeScanFrame(frame) }
+        captureEngine.setOnPortraitFacesListener { frame -> _portraitFaces.value = frame }
     }
 
-    fun dismissQrCode() = _uiState.update { it.copy(qrCode = null) }
+    private fun onCodeScanFrame(frame: CodeScanFrame) {
+        _codeScanFrame.value = frame.takeIf { it.inView.isNotEmpty() }
+        // A dismissed code stays hidden until it has left the view for a while.
+        dismissedCodes.retainAll(frame.codes.mapTo(HashSet()) { it.text })
+        val shown = frame.codes.filter { it.text !in dismissedCodes }
+        val current = _uiState.value.scannedCodes
+        // Only push when the set of codes changes; corner updates go through codeScanFrame.
+        if (shown.map { it.text } != current.map { it.text }) {
+            _uiState.update { it.copy(scannedCodes = shown) }
+        }
+    }
+
+    /** Hides the current scan suggestion (until those codes leave the view). */
+    fun dismissScannedCodes() {
+        dismissedCodes += _uiState.value.scannedCodes.map { it.text }
+        _uiState.update { it.copy(scannedCodes = emptyList()) }
+    }
+
+    /** Opens the result sheet for the codes currently suggested. */
+    fun openScannedCodes() {
+        val codes = _uiState.value.scannedCodes
+        if (codes.isEmpty()) return
+        dismissScannedCodes()
+        _uiState.update { it.copy(codeSheet = codes) }
+    }
+
+    fun closeCodeSheet() = _uiState.update { it.copy(codeSheet = null) }
+
+    /** Decodes QR codes/barcodes in a picked image (Photo Picker) and shows them in the result sheet. */
+    fun scanCodesInImage(resolver: ContentResolver, uri: Uri) {
+        if (_uiState.value.isScanningImage) return
+        _uiState.update { it.copy(isScanningImage = true) }
+        viewModelScope.launch {
+            val codes = withContext(Dispatchers.Default) { CodeDecoder.decodeImage(resolver, uri) }
+            _uiState.update { it.copy(isScanningImage = false, codeSheet = codes.ifEmpty { null }) }
+            if (codes.isEmpty()) showMessage("No QR code or barcode found")
+        }
+    }
+
+    /**
+     * Scene brightness from the engine. With "Auto Night" the dark state switches the next
+     * Photo shot to the Night pipeline (no chip); otherwise it offers Night mode if enabled.
+     */
+    private fun onLowLight(dark: Boolean) {
+        _uiState.update {
+            val prefs = it.userPreferences
+            it.copy(
+                isLowLight = dark,
+                lowLightSuggested = dark && prefs.lowLightSuggestion && prefs.lightMode != LightMode.AUTO_NIGHT_SIGHT,
+            )
+        }
+    }
 
     fun acceptNightSuggestion() {
         _uiState.update { it.copy(lowLightSuggested = false) }
@@ -110,8 +207,9 @@ class CameraViewModel(
     fun onVolumeKey(up: Boolean): Boolean = when (_uiState.value.userPreferences.volumeKeyAction) {
         VolumeKeyAction.SHUTTER -> { toggleCapture(); true }
         VolumeKeyAction.ZOOM -> {
-            val z = _uiState.value.zoomLevel
-            setZoom(if (up) z * 1.25f else z / 1.25f)
+            // Step from where a running glide is heading so repeated presses accumulate.
+            val z = _zoomState.value.let { it.target ?: it.level }
+            animateZoomTo(if (up) z * 1.25f else z / 1.25f)
             true
         }
         VolumeKeyAction.VOLUME -> false
@@ -120,14 +218,20 @@ class CameraViewModel(
     fun updateHdrPhoto(enabled: Boolean) = viewModelScope.launch { userPreferencesRepository.updateHdrPhoto(enabled) }
     fun updateVideoFrameRate(rate: VideoFrameRate) = viewModelScope.launch { userPreferencesRepository.updateVideoFrameRate(rate) }
     fun updateRecordAudio(enabled: Boolean) = viewModelScope.launch { userPreferencesRepository.updateRecordAudio(enabled) }
+    fun updatePortraitAperture(fNumber: Float) = viewModelScope.launch { userPreferencesRepository.updatePortraitAperture(fNumber) }
 
     private fun onCameraReady() {
         val capabilities = captureEngine.getCapabilities()
         _uiState.update {
-            it.copy(
-                capabilities = capabilities,
-                zoomPresets = capabilities?.zoomPresets ?: listOf(1.0f)
+            val withCaps = it.copy(capabilities = capabilities)
+            withCaps.copy(
+                zoomPresets = zoomPolicy(withCaps).presets,
+                zoomLabelScale = capabilities?.zoomLabelScale ?: 1f,
             )
+        }
+        if (pendingDefaultZoom && capabilities != null) {
+            pendingDefaultZoom = false
+            applyZoom(zoomPolicy().defaultRatio)
         }
         if (quickTakePending) {
             quickTakePending = false
@@ -137,22 +241,30 @@ class CameraViewModel(
         applyTorch()
     }
 
-    /** In video, "Flash On" means a continuous torch. */
+    /** In video modes, "Flash On" means a continuous torch (rear camera only). */
     private fun applyTorch() {
-        val state = _uiState.value
-        val torch = state.captureType == CaptureType.VIDEO &&
-            state.userPreferences.lightMode == LightMode.FLASH && !state.isFrontCamera
-        captureEngine.setTorchEnabled(torch)
+        val caps = _uiState.value.modeCaps
+        captureEngine.setTorchEnabled(caps.flashIsTorch && caps.effectiveLightMode == LightMode.FLASH)
     }
 
-    /** Quick flash toggle in the top bar: Off -> Auto -> On (Auto is skipped in video). */
-    fun cycleFlash() {
+    /**
+     * Keeps state consistent with what the current mode supports: the manual controls panel
+     * closes where the capture path ignores it (Night, Long exposure, HDR, Panorama, Camera2
+     * video), and the torch follows the mode.
+     */
+    private fun enforceModeCapabilities() {
         val state = _uiState.value
-        val next = when (state.userPreferences.lightMode) {
-            LightMode.NONE -> if (state.captureType == CaptureType.VIDEO) LightMode.FLASH else LightMode.AUTO_NIGHT_SIGHT
-            LightMode.AUTO_NIGHT_SIGHT -> LightMode.FLASH
-            LightMode.FLASH -> LightMode.NONE
-        }
+        if (state.isProMode && !state.modeCaps.supportsManualControls) setProModeEnabled(false)
+        applyTorch()
+    }
+
+    /**
+     * Quick flash toggle in the top bar, cycling through what this mode offers
+     * (ModeCapabilities.lightModes): Photo Off -> Auto Night -> Auto flash -> On, Portrait
+     * without Auto Night, video modes torch Off <-> On.
+     */
+    fun cycleFlash() {
+        val next = _uiState.value.modeCaps.nextLightMode() ?: return
         updateLightMode(next)
     }
 
@@ -211,14 +323,13 @@ class CameraViewModel(
         viewModelScope.launch {
             userPreferencesRepository.userPreferencesFlow.collect { prefs ->
                 val prevShowLeveler = _uiState.value.userPreferences.showLeveler
-                _uiState.update { it.copy(
-                    userPreferences = prefs,
-                    flashMode = prefs.flashMode,
-                ) }
+                _uiState.update { it.copy(userPreferences = prefs) }
                 captureEngine.applySettings(prefs)
                 captureEngine.setFlashMode(prefs.effectiveFlashMode)
-                applyTorch()
+                enforceModeCapabilities()
                 captureEngine.setGestureTriggerEnabled(prefs.gestureTrigger)
+                // No more detections arrive once the palm timer is off: drop the last boxes.
+                if (!prefs.gestureTrigger) clearGestureOverlay()
                 
                 if (prefs.showLeveler && !prevShowLeveler) {
                     startLeveler()
@@ -245,14 +356,6 @@ class CameraViewModel(
         viewModelScope.launch { userPreferencesRepository.updateMacroFocus(mode) }
     }
 
-    fun updateTopShot(enabled: Boolean) {
-        viewModelScope.launch { userPreferencesRepository.updateTopShot(enabled) }
-    }
-
-    fun updateMotionPhoto(mode: MotionPhotoMode) {
-        viewModelScope.launch { userPreferencesRepository.updateMotionPhoto(mode) }
-    }
-
     fun updateResolution(resolution: ResolutionMode) {
         viewModelScope.launch { userPreferencesRepository.updateResolution(resolution) }
     }
@@ -261,39 +364,13 @@ class CameraViewModel(
         viewModelScope.launch { userPreferencesRepository.updateSaveMode(saveMode) }
     }
 
-    fun updateLensSelection(mode: LensSelectionMode) {
-        viewModelScope.launch { userPreferencesRepository.updateLensSelection(mode) }
-    }
-
-    fun toggleGridLines() {
-        viewModelScope.launch {
-            val currentMode = _uiState.value.userPreferences.gridMode
-            val modes = GridMode.entries
-            val nextMode = modes[(modes.indexOf(currentMode) + 1) % modes.size]
-            userPreferencesRepository.updateGridMode(nextMode)
-        }
+    fun updateGridMode(mode: GridMode) {
+        viewModelScope.launch { userPreferencesRepository.updateGridMode(mode) }
     }
 
     fun toggleLeveler() {
         viewModelScope.launch {
             userPreferencesRepository.updateShowLeveler(!_uiState.value.userPreferences.showLeveler)
-        }
-    }
-
-    fun toggleFlashMode() {
-        viewModelScope.launch {
-            val nextMode = when (_uiState.value.flashMode) {
-                FlashMode.OFF -> FlashMode.AUTO
-                FlashMode.AUTO -> FlashMode.ON
-                FlashMode.ON -> FlashMode.OFF
-            }
-            userPreferencesRepository.updateFlashMode(nextMode)
-        }
-    }
-
-    fun toggleVolumeKeyShutter() {
-        viewModelScope.launch {
-            userPreferencesRepository.updateVolumeKeyShutter(!_uiState.value.userPreferences.volumeKeyShutter)
         }
     }
 
@@ -303,13 +380,10 @@ class CameraViewModel(
         }
     }
 
-    fun toggleGestureTrigger() {
-        viewModelScope.launch {
-            userPreferencesRepository.updateGestureTrigger(!_uiState.value.userPreferences.gestureTrigger)
-        }
-    }
-
     fun setShowSettingsSheet(show: Boolean) {
+        // Settings can rebind the camera, which would end a recording or a sweep.
+        val state = _uiState.value
+        if (show && (state.isRecording || state.isPanoramaCapturing)) return
         _uiState.update { it.copy(showSettingsSheet = show) }
     }
 
@@ -319,7 +393,7 @@ class CameraViewModel(
     fun bindToLifecycle(
         lifecycleOwner: LifecycleOwner, 
         surfaceProvider: Preview.SurfaceProvider,
-        meteringPointFactoryProvider: () -> androidx.camera.core.MeteringPointFactory? = { null }
+        meteringPointProvider: MeteringPointProvider = { _, _, _ -> null }
     ) {
         currentLifecycleOwner = lifecycleOwner
         currentSurfaceProvider = surfaceProvider
@@ -330,18 +404,24 @@ class CameraViewModel(
             CameraSelector.DEFAULT_BACK_CAMERA
         }
         
-        currentMeteringFactoryProvider = meteringPointFactoryProvider
+        currentMeteringPointProvider = meteringPointProvider
         // Capabilities are refreshed in onCameraReady() once binding completes.
-        captureEngine.bindToLifecycle(lifecycleOwner, surfaceProvider, selector, meteringPointFactoryProvider)
+        captureEngine.bindToLifecycle(lifecycleOwner, surfaceProvider, selector, meteringPointProvider)
     }
 
-    private var currentMeteringFactoryProvider: () -> androidx.camera.core.MeteringPointFactory? = { null }
+    private var currentMeteringPointProvider: MeteringPointProvider = { _, _, _ -> null }
 
     fun toggleCamera() {
-        if (_uiState.value.isRecording || _uiState.value.isProcessing) return
+        val state = _uiState.value
+        if (state.isRecording || state.isProcessing || state.isPanoramaCapturing) return
         val nextIsFront = !_uiState.value.isFrontCamera
-        _uiState.update { it.copy(isFrontCamera = nextIsFront, zoomLevel = 1.0f, exposureIndex = 0) }
-        captureEngine.setExposureCompensation(0)
+        zoomJob?.cancel()
+        zoomJob = null
+        _uiState.update { it.copy(isFrontCamera = nextIsFront) }
+        _zoomState.value = ZoomUiState()
+        // The other camera opens at 1x; onCameraReady moves it to the mode's starting zoom.
+        pendingDefaultZoom = true
+        resetPerModeState()
         
         val lifecycleOwner = currentLifecycleOwner
         val surfaceProvider = currentSurfaceProvider
@@ -352,34 +432,142 @@ class CameraViewModel(
             } else {
                 CameraSelector.DEFAULT_BACK_CAMERA
             }
-            captureEngine.bindToLifecycle(lifecycleOwner, surfaceProvider, selector, currentMeteringFactoryProvider)
+            captureEngine.bindToLifecycle(lifecycleOwner, surfaceProvider, selector, currentMeteringPointProvider)
         }
     }
 
     fun setCaptureType(type: CaptureType) {
-        if (_uiState.value.isRecording) return
-        _uiState.update { 
-            val nextMode = if (type == CaptureType.PHOTO) CameraMode.PHOTO else CameraMode.VIDEO
-            it.copy(captureType = type, currentMode = nextMode) 
+        val state = _uiState.value
+        if (state.isRecording || state.isPanoramaCapturing) return
+        val nextMode = if (type == CaptureType.PHOTO) CameraMode.PHOTO else CameraMode.VIDEO
+        if (state.captureType == type && state.currentMode == nextMode) return
+        _uiState.update {
+            it.copy(
+                captureType = type, currentMode = nextMode,
+                lowLightSuggested = false, scannedCodes = emptyList(),
+            )
         }
-        captureEngine.setMode(if (type == CaptureType.PHOTO) CameraMode.PHOTO else CameraMode.VIDEO)
-        applyTorch()
+        _panoramaProgress.value = null
+        captureEngine.setMode(nextMode)
+        onModeZoomChanged(state.currentMode)
+        resetPerModeState()
+        enforceModeCapabilities()
     }
 
     fun setMode(mode: CameraMode) {
         if (_uiState.value.isRecording || _uiState.value.isPanoramaCapturing) return
-        _uiState.update { it.copy(currentMode = mode, lowLightSuggested = false, qrCode = null, panoramaProgress = null) }
+        val previous = _uiState.value.currentMode
+        if (mode == previous) return
+        _uiState.update { it.copy(currentMode = mode, lowLightSuggested = false, scannedCodes = emptyList()) }
+        _panoramaProgress.value = null
         captureEngine.setMode(mode)
+        onModeZoomChanged(previous)
+        resetPerModeState()
+        enforceModeCapabilities()
     }
+
+    /**
+     * Settings that belong to what you were just shooting don't follow you into another mode or
+     * camera (they used to carry over invisibly): brightness back to 0, the tap-focus lock
+     * released, the manual controls panel closed (its values are kept for when it is reopened),
+     * and the palm-timer boxes cleared. Also explains HDR/RAW being off on the front camera.
+     */
+    private fun resetPerModeState() {
+        if (_uiState.value.exposureIndex != 0) {
+            _uiState.update { it.copy(exposureIndex = 0) }
+            captureEngine.setExposureCompensation(0)
+        }
+        if (_focusState.value != null || focusAnchor != null) {
+            focusJob?.cancel()
+            focusAnchor = null
+            _focusState.value = null
+            captureEngine.cancelFocus()
+        }
+        if (_uiState.value.isProMode) setProModeEnabled(false)
+        clearGestureOverlay()
+        showFrontCameraHint()
+    }
+
+    /** Front camera in Photo: HDR and RAW + JPEG don't apply there (ModeCapabilities). Say so once per flip. */
+    private var frontHintShown = false
+
+    private fun showFrontCameraHint() {
+        val state = _uiState.value
+        if (!state.isFrontCamera) {
+            frontHintShown = false
+            return
+        }
+        if (frontHintShown || state.currentMode != CameraMode.PHOTO) return
+        val prefs = state.userPreferences
+        val raw = prefs.saveMode == ImageSaveMode.RAW_JPEG
+        val unavailable = when {
+            prefs.hdrPhoto && raw -> "HDR and RAW aren't"
+            prefs.hdrPhoto -> "HDR isn't"
+            raw -> "RAW isn't"
+            else -> return
+        }
+        frontHintShown = true
+        showMessage("$unavailable available on the front camera")
+    }
+
+    /** Drops the palm-timer hand/face boxes (they otherwise stay on screen once analysis stops). */
+    private fun clearGestureOverlay() {
+        boxClearJob?.cancel()
+        boxClearJob = null
+        gestureTriggerJob?.cancel()
+        gestureTriggerJob = null
+        smoothedHandBox = null
+        smoothedFaceBox = null
+        _gestureState.value = GestureOverlayState()
+    }
+
+    /**
+     * Portrait has its own zoom range, presets and starting zoom (ZoomPolicy: 2x on the rear
+     * camera, like Google Camera): glide there on entry, and back to the default on exit.
+     * Panorama always starts at the default (1x): a sweep at 5x needs dozens of frames.
+     */
+    private fun onModeZoomChanged(previous: CameraMode) {
+        val state = _uiState.value
+        val zoom = _zoomState.value.level
+        val policy = zoomPolicy(state)
+        _uiState.update { it.copy(zoomPresets = policy.presets) }
+        val portraitChanged = (previous == CameraMode.PORTRAIT) != (state.currentMode == CameraMode.PORTRAIT)
+        val enteredPanorama = state.currentMode == CameraMode.PANORAMA && previous != CameraMode.PANORAMA
+        when {
+            state.capabilities == null -> pendingDefaultZoom = true
+            portraitChanged || (enteredPanorama && zoom != policy.defaultRatio) ->
+                animateZoomTo(policy.defaultRatio)
+            policy.clamp(zoom) != zoom -> applyZoom(zoom)
+        }
+    }
+
+    /** Zoom limits, presets and starting zoom for the current mode and camera. */
+    private fun zoomPolicy(state: CameraUiState = _uiState.value): ZoomPolicy {
+        val caps = state.capabilities
+        return ZoomPolicy.forMode(
+            mode = state.currentMode,
+            isFront = state.isFrontCamera,
+            minZoom = caps?.zoomRange?.lower ?: 0.5f,
+            maxZoom = caps?.zoomRange?.upper ?: 10f,
+            lensPresets = caps?.zoomPresets ?: listOf(1f),
+            labelScale = caps?.zoomLabelScale ?: 1f,
+        )
+    }
+
+    /** Apply the mode's starting zoom once the camera reports its capabilities. */
+    private var pendingDefaultZoom = true
 
     fun takePicture() {
         if (timerJob != null) {
             cancelTimer()
             return
         }
+        val state = _uiState.value
+        if (state.isProcessing) return
 
-        val timerMode = _uiState.value.userPreferences.timer
-        if (timerMode != TimerMode.OFF) {
+        // No timer where it makes no sense (Panorama: the same tap also stops a sweep).
+        val timerMode = state.userPreferences.timer
+        if (timerMode != TimerMode.OFF && state.modeCaps.supportsTimer) {
             startTimer(timerMode.seconds)
         } else {
             performCapture()
@@ -422,12 +610,15 @@ class CameraViewModel(
             return
         }
 
-        _uiState.update { it.copy(isProcessing = true) }
+        // One capture at a time (shutter, volume key, palm timer).
+        if (_uiState.value.isProcessing) return
+        // Snapshot the pipeline now: the scene state may change while the burst runs.
+        _uiState.update { it.copy(isProcessing = true, capturePipeline = it.modeCaps.pipeline, captureProgress = 0f) }
         captureEngine.playShutterSound()
         captureEngine.capturePhoto(
             onSuccess = { uriString ->
                 val uri = uriString.toUri()
-                _uiState.update { it.copy(lastCapturedUri = uri, isProcessing = false) }
+                _uiState.update { it.copy(lastCapturedUri = uri, isProcessing = false, capturePipeline = null, captureProgress = 0f) }
                 // Delay refresh to allow MediaStore to index the new file
                 viewModelScope.launch {
                     delay(500.milliseconds)
@@ -436,7 +627,7 @@ class CameraViewModel(
             },
             onError = { error ->
                 android.util.Log.e("CameraViewModel", "Capture failed", error)
-                _uiState.update { it.copy(isProcessing = false) }
+                _uiState.update { it.copy(isProcessing = false, capturePipeline = null, captureProgress = 0f) }
                 showMessage("Capture failed")
             }
         )
@@ -451,13 +642,15 @@ class CameraViewModel(
             showMessage("Still stitching the last panorama")
             return
         }
-        _uiState.update { it.copy(isPanoramaCapturing = true, panoramaProgress = null) }
+        _uiState.update { it.copy(isPanoramaCapturing = true) }
+        _panoramaProgress.value = null
         captureEngine.playStartRecordingSound()
         captureEngine.startPanorama(
             onSuccess = {},
             onError = { error ->
                 android.util.Log.e("CameraViewModel", "Panorama start failed", error)
-                _uiState.update { it.copy(isPanoramaCapturing = false, panoramaProgress = null) }
+                _uiState.update { it.copy(isPanoramaCapturing = false) }
+                _panoramaProgress.value = null
                 showMessage("Panorama unavailable")
             }
         )
@@ -468,8 +661,9 @@ class CameraViewModel(
         panoramaStitching = true
         captureEngine.playStopRecordingSound()
         _uiState.update {
-            it.copy(isPanoramaCapturing = false, panoramaProgress = null, backgroundTaskMessage = "Stitching panorama...")
+            it.copy(isPanoramaCapturing = false, backgroundTaskMessage = "Stitching panorama...")
         }
+        _panoramaProgress.value = null
         captureEngine.stopPanorama(
             onSuccess = { uriString ->
                 panoramaStitching = false
@@ -534,13 +728,26 @@ class CameraViewModel(
 
     fun stopVideo() {
         stopRecordingTimer()
-        captureEngine.playStopRecordingSound()
         // Update UI immediately; the URI arrives once the file is finalized.
         _uiState.update { it.copy(isRecording = false, isPaused = false) }
-        captureEngine.stopSlowMoVideo { uriString ->
-            _uiState.update { it.copy(lastCapturedUri = uriString.toUri()) }
+        if (quickTakePending) {
+            // Released (or paused) while the camera was still switching to video: nothing recorded.
             endQuickTake()
+            return
         }
+        captureEngine.stopSlowMoVideo(
+            onSuccess = { uriString ->
+                _uiState.update { it.copy(lastCapturedUri = uriString.toUri()) }
+                endQuickTake()
+            },
+            onError = { error ->
+                android.util.Log.e("CameraViewModel", "Stopping the recording failed", error)
+                endQuickTake()
+                showMessage(error.message ?: "Recording failed")
+            },
+        )
+        // After stopping, so the chime can't end up in the clip.
+        captureEngine.playStopRecordingSound()
     }
 
     private fun endQuickTake() {
@@ -568,6 +775,7 @@ class CameraViewModel(
     }
 
     fun takePhotoDuringVideo() {
+        if (!_uiState.value.modeCaps.supportsVideoSnapshot) return
         captureEngine.playShutterSound()
         captureEngine.captureVideoSnapshot(
             onSuccess = { uriString -> _uiState.update { it.copy(lastCapturedUri = uriString.toUri()) } },
@@ -602,13 +810,16 @@ class CameraViewModel(
 
     fun quickTakeStart() {
         val state = _uiState.value
-        if (state.isRecording || state.isProcessing || timerJob != null) return
+        if (state.isRecording || state.isProcessing || timerJob != null || !state.modeCaps.supportsQuickTake) return
         when (state.currentMode) {
             CameraMode.VIDEO -> startVideo()
             CameraMode.PHOTO, CameraMode.PORTRAIT -> {
                 // Temporarily switch the engine to video; recording starts in onCameraReady().
+                // Show the recording state right away so the hold feels instant while the
+                // session reconfigures (the timer starts with the actual recording).
                 quickTakeReturnMode = state.currentMode
                 quickTakePending = true
+                _uiState.update { it.copy(isRecording = true, isPaused = false, recordingDuration = "00:00") }
                 captureEngine.setMode(CameraMode.VIDEO)
             }
             else -> Unit
@@ -616,10 +827,8 @@ class CameraViewModel(
     }
 
     fun quickTakeStop() {
-        when {
-            quickTakePending -> endQuickTake() // released before the camera was ready
-            _uiState.value.isRecording -> stopVideo()
-        }
+        // stopVideo() also handles a release before the camera was ready (quickTakePending).
+        if (_uiState.value.isRecording) stopVideo()
     }
 
     private fun setupGestureTrigger() {
@@ -659,24 +868,23 @@ class CameraViewModel(
                     }
                     _gestureState.update { it.copy(handBox = smoothedHandBox) }
                     
-                    // 3. Manage the "ghosting" timeout
+                    // 3. Hide the hand box after a detection gap. This only clears the overlay:
+                    // a trigger that already fired must still start the timer once the hand is
+                    // lowered (canceling it here meant the timer almost never started).
                     boxClearJob?.cancel()
                     boxClearJob = launch {
                         delay(600) // Bridge detection gaps
                         smoothedHandBox = null
-                        _gestureState.update { it.copy(
-                            handBox = null,
-                            isTimerPending = false
-                        ) }
-                        gestureTriggerJob?.cancel()
-                        gestureTriggerJob = null
+                        _gestureState.update { it.copy(handBox = null) }
                     }
 
                     // 4. Trigger timer with a 1s delay
+                    val state = _uiState.value
                     if (result.isTriggered && timerJob == null && gestureTriggerJob == null &&
-                        !_uiState.value.isRecording && _uiState.value.captureType == CaptureType.PHOTO) {
+                        !state.isRecording && !state.isProcessing && state.modeCaps.supportsTimer &&
+                        state.captureType == CaptureType.PHOTO) {
                         
-                        gestureTriggerJob = launch {
+                        gestureTriggerJob = viewModelScope.launch {
                             _gestureState.update { it.copy(isTimerPending = true) }
                             delay(1000) // 1s lock-on delay
                             _gestureState.update { it.copy(isTimerPending = false) }
@@ -696,19 +904,78 @@ class CameraViewModel(
             if (state.currentMode != CameraMode.PANORAMA) return@setOnPanoramaProgressListener
             // Idle thumbnails only before a sweep, sweep progress only during one.
             if (progress.isIdlePreview == state.isPanoramaCapturing) return@setOnPanoramaProgressListener
-            _uiState.update { it.copy(panoramaProgress = progress) }
+            _panoramaProgress.value = progress
             if (!progress.isIdlePreview && progress.hint == PanoramaHint.COMPLETE) stopPanoramaCapture()
         }
     }
 
+    /** Immediate zoom (pinch). Cancels a running preset glide. */
     fun setZoom(ratio: Float) {
-        val capabilities = _uiState.value.capabilities
-        val minZoom = capabilities?.zoomRange?.lower ?: 0.5f
-        val maxZoom = capabilities?.zoomRange?.upper ?: 10.0f
-        val clampedRatio = ratio.coerceIn(minZoom, maxZoom)
-        
-        if (abs(clampedRatio - _uiState.value.zoomLevel) > 0.001f) {
-            _uiState.update { it.copy(zoomLevel = clampedRatio) }
+        // Zooming mid-sweep would break panorama tracking.
+        if (_uiState.value.isPanoramaCapturing) return
+        if (zoomJob != null) {
+            zoomJob?.cancel()
+            zoomJob = null
+            _zoomState.update { it.copy(target = null) }
+        }
+        applyZoom(ratio)
+    }
+
+    private var zoomJob: Job? = null
+    /** Material standard easing (same curve as Compose's FastOutSlowInEasing). */
+    private val zoomEasing = android.view.animation.PathInterpolator(0.4f, 0f, 0.2f, 1f)
+
+    /**
+     * Glides the zoom to [ratio] (zoom presets, volume keys), one step per display frame.
+     * Interpolated in log space so every doubling takes equal time (0.5x -> 1x feels like
+     * 1x -> 2x); the duration grows with the distance (about 200 ms + 90 ms per doubling,
+     * capped at 420 ms). On multi-lens phones the camera HAL switches lenses mid-glide, which
+     * reads as one continuous move instead of a cut.
+     */
+    fun animateZoomTo(ratio: Float) {
+        if (_uiState.value.isPanoramaCapturing) return
+        val target = clampZoom(ratio)
+        val start = _zoomState.value.level
+        zoomJob?.cancel()
+        zoomJob = null
+        if (abs(target - start) < 0.001f || start <= 0f) {
+            _zoomState.update { it.copy(target = null) }
+            applyZoom(target)
+            return
+        }
+        val doublings = abs(ln(target / start)) / ln(2f)
+        val durationMs = (200f + 90f * doublings).coerceAtMost(420f)
+        _zoomState.update { it.copy(target = target) }
+        zoomJob = viewModelScope.launch {
+            val choreographer = android.view.Choreographer.getInstance()
+            val startNanos = awaitFrame(choreographer)
+            var now = startNanos
+            while (true) {
+                val t = ((now - startNanos) / 1_000_000f / durationMs).coerceIn(0f, 1f)
+                applyZoom(start * (target / start).pow(zoomEasing.getInterpolation(t)))
+                if (t >= 1f) break
+                now = awaitFrame(choreographer)
+            }
+            applyZoom(target)
+            _zoomState.update { it.copy(target = null) }
+            zoomJob = null
+        }
+    }
+
+    /** Suspends until the next display frame (vsync-aligned steps; viewModelScope is Main). */
+    private suspend fun awaitFrame(choreographer: android.view.Choreographer): Long =
+        suspendCancellableCoroutine { cont ->
+            val callback = android.view.Choreographer.FrameCallback { nanos -> cont.resume(nanos) }
+            choreographer.postFrameCallback(callback)
+            cont.invokeOnCancellation { choreographer.removeFrameCallback(callback) }
+        }
+
+    private fun clampZoom(ratio: Float): Float = zoomPolicy().clamp(ratio)
+
+    private fun applyZoom(ratio: Float) {
+        val clampedRatio = clampZoom(ratio)
+        if (abs(clampedRatio - _zoomState.value.level) > 0.001f) {
+            _zoomState.update { it.copy(level = clampedRatio) }
             captureEngine.setZoom(clampedRatio)
         }
     }
@@ -723,14 +990,22 @@ class CameraViewModel(
     }
 
     fun toggleProMode() {
-        _uiState.update { 
-            val newState = !it.isProMode
-            captureEngine.setProMode(newState)
-            if (newState) {
-                captureEngine.updateManualConfig(it.proConfig)
-            }
-            it.copy(isProMode = newState)
+        val state = _uiState.value
+        if (!state.isProMode && !state.modeCaps.supportsManualControls) {
+            // In Photo the only path that ignores them is HDR.
+            showMessage(
+                if (state.currentMode == CameraMode.PHOTO) "Turn off HDR to use manual controls"
+                else "Manual controls aren't available in ${CameraModes.label(state.currentMode)}"
+            )
+            return
         }
+        setProModeEnabled(!state.isProMode)
+    }
+
+    private fun setProModeEnabled(enabled: Boolean) {
+        if (enabled) captureEngine.updateManualConfig(_uiState.value.proConfig)
+        captureEngine.setProMode(enabled)
+        _uiState.update { it.copy(isProMode = enabled) }
     }
 
     fun updateProConfig(config: ProConfig) {
@@ -746,9 +1021,16 @@ class CameraViewModel(
         }
     }
 
+    /** Visible viewfinder width / height (photos are cropped to what it shows). */
+    fun onViewfinderAspect(widthOverHeight: Float) {
+        captureEngine.setViewfinderAspectRatio(widthOverHeight)
+    }
+
     fun focusAt(x: Float, y: Float) {
         val offset = androidx.compose.ui.geometry.Offset(x, y)
         _focusState.value = FocusState(offset, isLocked = false)
+        // The lock holds until the camera turns away from this direction (see onSensorChanged).
+        focusAnchor = if (hasLookDir) lookDir.copyOf() else null
         // A new tap starts from neutral brightness, as on most camera apps.
         if (_uiState.value.exposureIndex != 0) {
             _uiState.update { it.copy(exposureIndex = 0) }
@@ -784,7 +1066,8 @@ class CameraViewModel(
 
     private fun startLeveler() {
         rotationSensor?.let {
-            sensorManager?.registerListener(this, it, SensorManager.SENSOR_DELAY_UI)
+            // GAME rate (~50 Hz) keeps the bubble of the top-down leveler fluid.
+            sensorManager?.registerListener(this, it, SensorManager.SENSOR_DELAY_GAME)
         }
     }
 
@@ -795,88 +1078,117 @@ class CameraViewModel(
     }
 
     override fun onSensorChanged(event: SensorEvent?) {
-        val sensorType = event?.sensor?.type ?: return
-        
-        if (sensorType == Sensor.TYPE_ROTATION_VECTOR || sensorType == Sensor.TYPE_GAME_ROTATION_VECTOR) {
-            val rotationMatrix = FloatArray(9)
-            SensorManager.getRotationMatrixFromVector(rotationMatrix, event.values)
-            
-            // Pro-Level Fix: Remap the coordinate system for Portrait orientation
-            // This ensures that 'Azimuth' (Yaw) is calculated correctly even when the 
-            // phone is tilted (Pitch/Roll), preventing the dots from "drifting" non-linearly.
-            val remappedMatrix = FloatArray(9)
-            SensorManager.remapCoordinateSystem(
-                rotationMatrix, 
-                SensorManager.AXIS_X, 
-                SensorManager.AXIS_Z, 
-                remappedMatrix
-            )
-            
-            val orientation = FloatArray(3)
-            SensorManager.getOrientation(remappedMatrix, orientation)
-            
-            val azimuth = Math.toDegrees(orientation[0].toDouble()).toFloat()
-            val pitch = Math.toDegrees(orientation[1].toDouble()).toFloat()
-            val roll = Math.toDegrees(orientation[2].toDouble()).toFloat()
-
-            // Apply Low-Pass Filter (Exponential Smoothing)
-            val smoothFactor = 0.15f // Slightly smoother for higher precision
-            
-            // 1. Smooth Pitch
-            currentPitch += smoothFactor * (pitch - currentPitch)
-            
-            // 2. Smooth Yaw (with wrap-around protection)
-            var yawDiff = azimuth - currentYaw
-            while (yawDiff > 180) yawDiff -= 360f
-            while (yawDiff < -180) yawDiff += 360f
-            
-            currentYaw += smoothFactor * yawDiff
-            
-            // Normalize currentYaw to -180..180
-            while (currentYaw > 180) currentYaw -= 360f
-            while (currentYaw < -180) currentYaw += 360f
-            
-            updateOrientationFromRoll(roll)
-
-            // Auto leveler logic
-            if (abs(currentPitch) < 60) {
-                currentTilt += alpha * (roll - currentTilt)
-                _tiltState.value = currentTilt
-            } else {
-                _tiltState.value = 0f
+        event ?: return
+        val type = event.sensor.type
+        val ux: Float
+        val uy: Float
+        val uz: Float
+        val smoothing: Float
+        when (type) {
+            Sensor.TYPE_ROTATION_VECTOR, Sensor.TYPE_GAME_ROTATION_VECTOR -> {
+                SensorManager.getRotationMatrixFromVector(rotationMatrix, event.values)
+                // Device->world matrix: its third row is world "up" in device axes, its third
+                // column the screen normal (opposite the camera) in world axes.
+                ux = rotationMatrix[6]; uy = rotationMatrix[7]; uz = rotationMatrix[8]
+                lookDir[0] = rotationMatrix[2]; lookDir[1] = rotationMatrix[5]; lookDir[2] = rotationMatrix[8]
+                hasLookDir = true
+                smoothing = 0.25f
             }
-        } else if (sensorType == Sensor.TYPE_ACCELEROMETER) {
-            val ax = event.values[0]
-            val ay = event.values[1]
-            val az = event.values[2]
-            
-            val roll = Math.toDegrees(atan2(-ax.toDouble(), ay.toDouble())).toFloat()
-            val pitch = Math.toDegrees(atan2(az.toDouble(), sqrt((ax * ax + ay * ay).toDouble()))).toFloat()
-            
-            updateOrientationFromRoll(roll)
-
-            if (abs(pitch) < 60) {
-                currentTilt += alpha * (roll - currentTilt)
-                _tiltState.value = currentTilt
-            } else {
-                _tiltState.value = 0f
+            Sensor.TYPE_ACCELEROMETER -> {
+                // At rest the accelerometer reads +g along "up".
+                ux = event.values[0]; uy = event.values[1]; uz = event.values[2]
+                smoothing = 0.12f
             }
+            else -> return
         }
+        if (hasUp) {
+            smoothUp[0] += smoothing * (ux - smoothUp[0])
+            smoothUp[1] += smoothing * (uy - smoothUp[1])
+            smoothUp[2] += smoothing * (uz - smoothUp[2])
+        } else {
+            smoothUp[0] = ux; smoothUp[1] = uy; smoothUp[2] = uz
+            hasUp = true
+        }
+        val norm = sqrt(smoothUp[0] * smoothUp[0] + smoothUp[1] * smoothUp[1] + smoothUp[2] * smoothUp[2])
+        if (norm < 1e-3f) return
+        val x = smoothUp[0] / norm
+        val y = smoothUp[1] / norm
+        val z = smoothUp[2] / norm
+        if (type == Sensor.TYPE_ACCELEROMETER) {
+            // Without a gyro, panning is invisible; tilting still releases a focus lock.
+            lookDir[0] = x; lookDir[1] = y; lookDir[2] = z
+            hasLookDir = true
+        }
+        releaseFocusIfMoved()
+
+        // Roll in the screen plane: + when the phone is turned clockwise.
+        val roll = Math.toDegrees(atan2(-x, y).toDouble()).toFloat()
+        // Elevation of the screen normal: +90 = lying flat with the camera facing down.
+        val screenUp = degreesAsin(z)
+        // Roll is meaningless near flat, so the orientation keeps its last value there.
+        val upright = abs(screenUp) < FLAT_ANGLE_DEG
+        if (upright) updateOrientation(roll)
+
+        val facingDown = updateFacingDown(tiltFromDown = 90f - screenUp, timestampNs = event.timestamp)
+        val orientation = _orientationState.value
+        _levelState.value = LevelState(
+            roll = roll,
+            isLandscape = upright && !facingDown && (orientation == 90 || orientation == 270),
+            isFacingDown = facingDown,
+            downTiltX = degreesAsin(x),
+            downTiltY = degreesAsin(y),
+        )
     }
 
-    private fun updateOrientationFromRoll(roll: Float) {
-        val newOrientation = when {
+    private fun degreesAsin(v: Float): Float = Math.toDegrees(asin(v.coerceIn(-1f, 1f).toDouble())).toFloat()
+
+    /** Icon/UI orientation with hysteresis so it doesn't flicker around 45 degrees. */
+    private fun updateOrientation(roll: Float) {
+        val current = _orientationState.value
+        val currentRoll = when (current) {
+            270 -> 90f
+            90 -> -90f
+            180 -> 180f
+            else -> 0f
+        }
+        var delta = roll - currentRoll
+        if (delta > 180f) delta -= 360f else if (delta < -180f) delta += 360f
+        if (abs(delta) < ORIENTATION_HYSTERESIS_DEG) return
+        _orientationState.value = when {
             roll > -45 && roll <= 45 -> 0
             roll > 45 && roll <= 135 -> 270
             roll > -135 && roll <= -45 -> 90
             else -> 180
         }
-        
-        val shouldAutoShowLeveler = false 
-        
-        if (newOrientation != _orientationState.value || shouldAutoShowLeveler != _autoShowLeveler.value) {
-            _orientationState.value = newOrientation
-            _autoShowLeveler.value = shouldAutoShowLeveler
+    }
+
+    /**
+     * The top-down leveler appears once the camera has pointed within [FACE_DOWN_ENTER_DEG] of
+     * straight down for [FACE_DOWN_DELAY_NS], and hides past [FACE_DOWN_EXIT_DEG].
+     */
+    private fun updateFacingDown(tiltFromDown: Float, timestampNs: Long): Boolean {
+        if (_levelState.value.isFacingDown) {
+            if (tiltFromDown < FACE_DOWN_EXIT_DEG) return true
+            faceDownSinceNs = 0L
+            return false
+        }
+        if (tiltFromDown >= FACE_DOWN_ENTER_DEG) {
+            faceDownSinceNs = 0L
+            return false
+        }
+        if (faceDownSinceNs == 0L) faceDownSinceNs = timestampNs
+        return timestampNs - faceDownSinceNs >= FACE_DOWN_DELAY_NS
+    }
+
+    /** Moving the camera away from a tap-focused subject returns to continuous AF (as on Pixel). */
+    private fun releaseFocusIfMoved() {
+        val anchor = focusAnchor ?: return
+        val dot = anchor[0] * lookDir[0] + anchor[1] * lookDir[1] + anchor[2] * lookDir[2]
+        if (dot < FOCUS_RELEASE_COS) {
+            focusAnchor = null
+            focusJob?.cancel()
+            _focusState.value = null
+            captureEngine.cancelFocus()
         }
     }
 
@@ -885,5 +1197,17 @@ class CameraViewModel(
     override fun onCleared() {
         super.onCleared()
         sensorManager?.unregisterListener(this)
+    }
+
+    private companion object {
+        /** Beyond this elevation the phone counts as pointing up/down: no horizon or orientation change. */
+        const val FLAT_ANGLE_DEG = 60f
+        /** Roll must pass 45 + 10 degrees before the UI orientation flips. */
+        const val ORIENTATION_HYSTERESIS_DEG = 55f
+        const val FACE_DOWN_ENTER_DEG = 20f
+        const val FACE_DOWN_EXIT_DEG = 30f
+        const val FACE_DOWN_DELAY_NS = 1_000_000_000L
+        /** cos(10 degrees): turning the camera further away drops a tap-focus lock. */
+        const val FOCUS_RELEASE_COS = 0.985f
     }
 }
