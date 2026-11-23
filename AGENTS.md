@@ -16,7 +16,7 @@ Any change to the app **MUST** include a matching update to `.agent_manifest.jso
 When updating, also bump `manifest_meta.last_updated` (and `manifest_meta.app_version` on releases). Keep paths repo-relative and accurate. A change is not complete until the manifest reflects it. If a change truly has no effect on the map (e.g., a pure logic fix inside an existing function), still bump `last_updated` and update any description that changed.
 
 ### GIT COMMIT ATTRIBUTION
-AI co-author trailers (e.g., `Co-Authored-By:`) are permitted in commit messages.
+Do **NOT** add AI attribution to commits or PRs: no `Co-Authored-By: Claude ...` (or any AI co-author) trailers and no "Generated with Claude Code" lines. Commits are authored by the repository owner only.
 
 ## PROJECT CONVENTIONS
 
