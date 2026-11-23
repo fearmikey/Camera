@@ -26,6 +26,8 @@ class ModeCapabilitiesTest {
         assertTrue(c.supportsTimer)
         assertTrue(c.supportsQuickTake)
         assertTrue(c.supportsManualControls)
+        assertTrue(c.offersAdjustments)
+        assertFalse(c.supportsSlowMotionSpeed)
         assertFalse(c.supportsVideoSnapshot)
     }
 
@@ -65,6 +67,7 @@ class ModeCapabilitiesTest {
         assertEquals(CapturePipeline.HDR, c.pipeline)
         assertFalse(c.showsResolutionChip)
         assertFalse(c.supportsManualControls)
+        assertFalse(c.offersAdjustments)
         assertEquals(LightMode.entries.toList(), c.lightModes)
         assertFalse(c.hdrPausedByFlash)
     }
@@ -127,6 +130,9 @@ class ModeCapabilitiesTest {
             assertFalse(c.supportsVideoSnapshot)
             assertFalse(c.supportsZoomWhileRecording)
             assertFalse(c.supportsManualControls)
+            // Exposure compensation still applies: the adjustments row opens (without ISO etc.).
+            assertTrue(c.offersAdjustments)
+            assertEquals(mode == CameraMode.SLOW_MO, c.supportsSlowMotionSpeed)
             assertFalse(c.supportsQuickTake)
             assertFalse(c.showsVideoQualitySettings)
             assertTrue(c.flashIsTorch)
@@ -153,6 +159,7 @@ class ModeCapabilitiesTest {
         assertFalse(c.supportsTimer)
         assertTrue(c.lightModes.isEmpty())
         assertFalse(c.supportsManualControls)
+        assertFalse(c.offersAdjustments)
         assertFalse(c.supportsQuickTake)
     }
 }

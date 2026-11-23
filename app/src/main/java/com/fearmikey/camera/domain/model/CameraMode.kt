@@ -16,8 +16,8 @@ enum class CameraMode {
 
 /** Mode rows shown under the shutter. Single source of truth for the UI. */
 object CameraModes {
-    val photo = listOf(CameraMode.NIGHT_SIGHT, CameraMode.PORTRAIT, CameraMode.PHOTO, CameraMode.LONG_EXPOSURE, CameraMode.PANORAMA)
-    val video = listOf(CameraMode.SLOW_MO, CameraMode.TIME_LAPSE, CameraMode.VIDEO)
+    val photo = listOf(CameraMode.LONG_EXPOSURE, CameraMode.PORTRAIT, CameraMode.PHOTO, CameraMode.NIGHT_SIGHT, CameraMode.PANORAMA)
+    val video = listOf(CameraMode.SLOW_MO, CameraMode.VIDEO, CameraMode.TIME_LAPSE)
 
     fun label(mode: CameraMode): String = when (mode) {
         CameraMode.PHOTO -> "Photo"

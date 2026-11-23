@@ -14,6 +14,7 @@ import android.content.ContentResolver
 import android.net.Uri
 import com.fearmikey.camera.data.engine.CaptureEngine
 import com.fearmikey.camera.data.engine.MeteringPointProvider
+import com.fearmikey.camera.data.engine.RecordingPreviewTarget
 import com.fearmikey.camera.data.engine.analysis.CodeDecoder
 import com.fearmikey.camera.data.engine.analysis.CodeScanFrame
 import com.fearmikey.camera.data.engine.analysis.PortraitFaceFrame
@@ -219,16 +220,34 @@ class CameraViewModel(
     fun updateVideoFrameRate(rate: VideoFrameRate) = viewModelScope.launch { userPreferencesRepository.updateVideoFrameRate(rate) }
     fun updateRecordAudio(enabled: Boolean) = viewModelScope.launch { userPreferencesRepository.updateRecordAudio(enabled) }
     fun updatePortraitAperture(fNumber: Float) = viewModelScope.launch { userPreferencesRepository.updatePortraitAperture(fNumber) }
+    fun updateSlowMotionFps(fps: Int) = viewModelScope.launch { userPreferencesRepository.updateSlowMotionFps(fps) }
+
+    /** Live view for Camera2 recordings (Slow motion, Time lapse), from the UI's TextureView. */
+    fun setRecordingPreview(target: RecordingPreviewTarget?) = captureEngine.setRecordingPreview(target)
+
+    /** Slow motion on a camera without high-speed video: say so on entering the mode, not only on record. */
+    private fun showSlowMotionHint() {
+        val state = _uiState.value
+        if (state.currentMode == CameraMode.SLOW_MO && state.slowMotionRates.isEmpty()) {
+            showMessage(
+                if (state.isFrontCamera) "Slow motion isn't available on the front camera"
+                else "This device does not support slow motion"
+            )
+        }
+    }
 
     private fun onCameraReady() {
         val capabilities = captureEngine.getCapabilities()
+        val slowMotionRates = captureEngine.getSlowMotionFrameRates()
+        val ratesChanged = slowMotionRates != _uiState.value.slowMotionRates
         _uiState.update {
-            val withCaps = it.copy(capabilities = capabilities)
+            val withCaps = it.copy(capabilities = capabilities, slowMotionRates = slowMotionRates)
             withCaps.copy(
                 zoomPresets = zoomPolicy(withCaps).presets,
                 zoomLabelScale = capabilities?.zoomLabelScale ?: 1f,
             )
         }
+        if (ratesChanged) showSlowMotionHint()
         if (pendingDefaultZoom && capabilities != null) {
             pendingDefaultZoom = false
             applyZoom(zoomPolicy().defaultRatio)
@@ -254,7 +273,11 @@ class CameraViewModel(
      */
     private fun enforceModeCapabilities() {
         val state = _uiState.value
-        if (state.isProMode && !state.modeCaps.supportsManualControls) setProModeEnabled(false)
+        if (state.isProMode) {
+            // The row stays open where it still offers something (e.g. Video -> Slow motion keeps
+            // exposure and speed); manual ISO/shutter/focus/WB only reach the engine where honored.
+            if (!state.modeCaps.offersAdjustments) setProModeEnabled(false) else syncEngineProMode()
+        }
         applyTorch()
     }
 
@@ -464,6 +487,7 @@ class CameraViewModel(
         onModeZoomChanged(previous)
         resetPerModeState()
         enforceModeCapabilities()
+        showSlowMotionHint()
     }
 
     /**
@@ -709,12 +733,14 @@ class CameraViewModel(
 
     fun startVideo() {
         _uiState.update { it.copy(isRecording = true, isPaused = false, recordingDuration = "00:00") }
-        secondsRecorded = 0
-        startRecordingTimer()
+        stopRecordingTimer()
         captureEngine.playStartRecordingSound()
         captureEngine.startSlowMoVideo(
             onSuccess = {
-                // Recording actually started
+                // The timer counts recorded time: Slow motion and Time lapse first have to open
+                // the camera (a second or so), so it starts when frames really reach the file.
+                val state = _uiState.value
+                if (state.isRecording && !state.isPaused) startRecordingTimer()
             },
             onError = { error ->
                 android.util.Log.e("CameraViewModel", "Recording failed", error)
@@ -991,7 +1017,7 @@ class CameraViewModel(
 
     fun toggleProMode() {
         val state = _uiState.value
-        if (!state.isProMode && !state.modeCaps.supportsManualControls) {
+        if (!state.isProMode && !state.modeCaps.offersAdjustments) {
             // In Photo the only path that ignores them is HDR.
             showMessage(
                 if (state.currentMode == CameraMode.PHOTO) "Turn off HDR to use manual controls"
@@ -1003,9 +1029,20 @@ class CameraViewModel(
     }
 
     private fun setProModeEnabled(enabled: Boolean) {
-        if (enabled) captureEngine.updateManualConfig(_uiState.value.proConfig)
-        captureEngine.setProMode(enabled)
         _uiState.update { it.copy(isProMode = enabled) }
+        syncEngineProMode()
+    }
+
+    /**
+     * The engine applies the manual config only while the adjustments row is open in a mode
+     * whose capture path honors it (ModeCapabilities.supportsManualControls); in Slow motion /
+     * Time lapse the row only offers exposure compensation and speed.
+     */
+    private fun syncEngineProMode() {
+        val state = _uiState.value
+        val engineOn = state.isProMode && state.modeCaps.supportsManualControls
+        if (engineOn) captureEngine.updateManualConfig(state.proConfig)
+        captureEngine.setProMode(engineOn)
     }
 
     fun updateProConfig(config: ProConfig) {

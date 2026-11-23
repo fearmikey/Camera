@@ -1,8 +1,9 @@
 // Portrait background blur ("bokeh") built only on OpenCV core/imgproc, so it can be
 // compiled and tested on a desktop host as well as in the app (see vision_jni.cpp).
 //
-// Pipeline: face-seeded GrabCut subject mask (tight core / wide reach prior, plus a
-// per-head pass with its own color models) -> hole filling + outline smoothing ->
+// Pipeline: face-seeded GrabCut subject mask (tight core / wide reach prior, a shoulder
+// prior where clothes and background share colors, and a per-head pass with its own
+// color models) -> hole filling + outline smoothing ->
 // guided-filter matte refinement in a narrow edge band where color explains the edge
 // -> lens-style disc blur in linear light with highlight bloom -> grain
 // matching -> full-resolution blend.

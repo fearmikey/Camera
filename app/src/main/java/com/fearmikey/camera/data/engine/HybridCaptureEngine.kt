@@ -133,12 +133,30 @@ class HybridCaptureEngine(
             return
         }
         slowMoActive = false
+        // Camera2 finalizes the file and closes the device on its own thread; CameraX comes back
+        // only after that, so the two never compete for the camera.
         camera2Provider.stopSlowMoVideo(
-            onSuccess = { uri -> onMain { onSuccess(uri) } },
-            onError = { error -> onMain { onError(error) } },
+            onSuccess = { uri ->
+                onMain {
+                    cameraXProvider.restore()
+                    onSuccess(uri)
+                }
+            },
+            onError = { error ->
+                onMain {
+                    cameraXProvider.restore()
+                    onError(error)
+                }
+            },
         )
-        cameraXProvider.restore()
     }
+
+    override fun setRecordingPreview(target: RecordingPreviewTarget?) {
+        cameraXProvider.setRecordingPreview(target)
+        camera2Provider.setRecordingPreview(target)
+    }
+
+    override fun getSlowMotionFrameRates(): List<Int> = camera2Provider.getSlowMotionFrameRates()
 
     override fun pauseVideo() {
         if (slowMoActive) camera2Provider.pauseVideo() else cameraXProvider.pauseVideo()

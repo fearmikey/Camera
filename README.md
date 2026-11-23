@@ -12,8 +12,8 @@ A free and open-source Android camera app with computational photography that ru
 - **Portrait**: starts at a flattering 2x on the rear camera (1x/2x, pinch 1–3x) and at the full selfie view on the front (.7x/1x), live face brackets and framing hints in the viewfinder, face-priority focus/exposure, and an adjustable blur (ƒ/1.4–ƒ/16). Every face seeds an OpenCV GrabCut segmentation, a guided filter snaps the cut-out to hair and edges, and the background gets a lens-style disc blur with glowing highlights and matched grain. Optionally keeps the unblurred original.
 - **Panorama**: tap and sweep; image-tracked cylindrical capture with a live 360° preview strip and level guide, auto-stop at a full circle, and a native C++ stitcher (focal self-calibration, pairwise refinement, drift leveling, gain matching, min-cost seams, multi-band blending).
 - **Video** with audio, pause/resume and snapshots. **QuickTake**: long-press the shutter in Photo mode.
-- **Slow motion** on devices with constrained high-speed capture (files play back in slow motion in any player).
-- **Manual controls**: ISO and shutter (logarithmic sliders), manual focus, white-balance presets. Applied live without restarting the camera.
+- **Slow motion** on devices with constrained high-speed capture: 1/4x (120 fps) or 1/8x (240 fps) where supported, with a live viewfinder while recording; files play back in slow motion in any player.
+- **Manual controls**: a tool row with exposure compensation, ISO and shutter (logarithmic dials), manual focus and white-balance presets; each tool opens a sliding tick dial above the shutter. Applied live without restarting the camera.
 - **Brightness slider**: tap to focus, then drag the sun icon up or down.
 - **Video options**: 1080p or 4K, stabilization, torch.
 - **Macro focus** mode.
@@ -35,6 +35,10 @@ Compose UI -> `CameraViewModel` (StateFlow) -> `HybridCaptureEngine`, which rout
 - `Camera2Provider`: Night, HDR, RAW and slow motion. CameraX is released for these and restored afterwards.
 
 Native code (`app/src/main/cpp`) uses OpenCV from the official Maven Central AAR via prefab.
+
+## Support
+
+Camera is free, has no ads and never will. If you enjoy it, you can support development at [buymeacoffee.com/ximw7nxi1j](https://buymeacoffee.com/ximw7nxi1j). Bug reports and feature requests are welcome in the [issue tracker](https://github.com/fearmikey/Camera/issues).
 
 ## License
 

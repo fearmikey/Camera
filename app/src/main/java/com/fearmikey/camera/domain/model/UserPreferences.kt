@@ -32,6 +32,8 @@ data class UserPreferences(
     val portraitAperture: Float = PortraitAperture.DEFAULT,
     /** Portrait mode also saves the unprocessed photo. */
     val portraitKeepOriginal: Boolean = false,
+    /** Slow-motion capture rate (fps); the closest rate the camera offers is used (see [SlowMotion]). */
+    val slowMotionFps: Int = SlowMotion.DEFAULT_FPS,
 ) {
     /** Flash behavior for CameraX captures (Auto Night never fires the flash). */
     val effectiveFlashMode: FlashMode

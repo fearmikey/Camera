@@ -85,6 +85,8 @@ data class CameraUiState(
     val codeSheet: List<ScannedCode>? = null,
     /** Decoding a picked image is in progress. */
     val isScanningImage: Boolean = false,
+    /** Slow-motion capture rates of the current camera (CaptureEngine.getSlowMotionFrameRates); empty = none. */
+    val slowMotionRates: List<Int> = emptyList(),
 ) {
     /**
      * What the current mode, camera and settings support, and which pipeline the next shot

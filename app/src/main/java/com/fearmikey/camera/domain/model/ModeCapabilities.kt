@@ -64,6 +64,15 @@ data class ModeCapabilities(
     val supportsVideoSnapshot: Boolean,
     /** Manual ISO / shutter / focus / white balance are honored by this capture path. */
     val supportsManualControls: Boolean,
+    /**
+     * The adjustments tool row (Tune) opens here: everywhere manual controls work, plus Slow
+     * motion and Time lapse, whose recordings honor exposure compensation (and Slow motion's
+     * speed) but not manual ISO / shutter / focus / white balance (high-speed sessions require
+     * auto 3A).
+     */
+    val offersAdjustments: Boolean,
+    /** The slow-motion speed (capture rate) can be chosen. */
+    val supportsSlowMotionSpeed: Boolean,
     /** Zoom can still change while recording (Camera2 recordings fix zoom at the start). */
     val supportsZoomWhileRecording: Boolean,
 ) {
@@ -78,6 +87,9 @@ data class ModeCapabilities(
 
     companion object {
         private val FLASH_FIRES = setOf(LightMode.AUTO_FLASH, LightMode.FLASH)
+        private val MANUAL_PIPELINES = setOf(
+            CapturePipeline.PHOTO, CapturePipeline.RAW_STILL, CapturePipeline.PORTRAIT, CapturePipeline.VIDEO,
+        )
 
         /**
          * @param sceneIsDark the low-light monitor's state (drives Auto Night).
@@ -125,9 +137,10 @@ data class ModeCapabilities(
                 supportsTimer = !CameraModes.isVideo(mode) && mode != CameraMode.PANORAMA,
                 supportsQuickTake = mode == CameraMode.PHOTO || mode == CameraMode.PORTRAIT || mode == CameraMode.VIDEO,
                 supportsVideoSnapshot = mode == CameraMode.VIDEO,
-                supportsManualControls = staticPipeline in setOf(
-                    CapturePipeline.PHOTO, CapturePipeline.RAW_STILL, CapturePipeline.PORTRAIT, CapturePipeline.VIDEO,
-                ),
+                supportsManualControls = staticPipeline in MANUAL_PIPELINES,
+                offersAdjustments = staticPipeline in MANUAL_PIPELINES ||
+                    staticPipeline == CapturePipeline.SLOW_MO || staticPipeline == CapturePipeline.TIME_LAPSE,
+                supportsSlowMotionSpeed = mode == CameraMode.SLOW_MO,
                 supportsZoomWhileRecording = !CameraModes.isCamera2Video(mode),
             )
         }

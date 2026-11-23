@@ -43,6 +43,7 @@ class UserPreferencesRepository(private val context: Context) {
         val LOW_LIGHT_SUGGESTION = booleanPreferencesKey("low_light_suggestion")
         val PORTRAIT_APERTURE = floatPreferencesKey("portrait_aperture")
         val PORTRAIT_KEEP_ORIGINAL = booleanPreferencesKey("portrait_keep_original")
+        val SLOW_MOTION_FPS = intPreferencesKey("slow_motion_fps")
     }
 
     private inline fun <reified T : Enum<T>> enumOr(value: String?, default: T): T =
@@ -96,6 +97,7 @@ class UserPreferencesRepository(private val context: Context) {
                     preferences[PreferencesKeys.PORTRAIT_APERTURE] ?: PortraitAperture.DEFAULT
                 ),
                 portraitKeepOriginal = preferences[PreferencesKeys.PORTRAIT_KEEP_ORIGINAL] ?: false,
+                slowMotionFps = preferences[PreferencesKeys.SLOW_MOTION_FPS] ?: SlowMotion.DEFAULT_FPS,
             )
         }
 
@@ -198,6 +200,7 @@ class UserPreferencesRepository(private val context: Context) {
     suspend fun updatePortraitAperture(fNumber: Float) =
         put(PreferencesKeys.PORTRAIT_APERTURE, PortraitAperture.nearest(fNumber))
     suspend fun updatePortraitKeepOriginal(enabled: Boolean) = put(PreferencesKeys.PORTRAIT_KEEP_ORIGINAL, enabled)
+    suspend fun updateSlowMotionFps(fps: Int) = put(PreferencesKeys.SLOW_MOTION_FPS, fps)
 
     suspend fun updateVideoStabilization(enabled: Boolean) {
         context.dataStore.edit { preferences ->

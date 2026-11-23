@@ -76,6 +76,16 @@ const Silhouette kCore{0.40, 0.50, 0.62, {{0.28, 0.85}, {0.28, 1.30}, {0.95, 1.7
 const Silhouette kReach{0.38, 0.80, 0.78, {{0.55, 0.92}, {1.60, 1.22}, {2.50, 1.45}}, 2.80};
 // Head core plus a margin for temple hair and ears (refineHeads; only the head is used).
 const Silhouette kHeadTrust{0.40, 0.62, 0.68, {}, 0.0};
+// Typical shoulders (resolveBody): where clothes and background share colors, the outline
+// leans toward this shape instead of GrabCut's shortest cut (a straight vertical edge).
+const Silhouette kShoulders{0.40, 0.50, 0.62, {{0.30, 0.88}, {0.75, 1.08}, {1.30, 1.28}, {1.60, 1.55}}, 1.80};
+
+constexpr int kGmmComponents = 5;     // OpenCV GrabCut's model layout
+constexpr double kEvidenceClip = 8.0; // |log likelihood ratio| cap per pixel
+constexpr double kDecisive = 3.0;     // local mean evidence above which color decides alone
+constexpr double kPriorGain = 2.5;    // shoulder prior log-odds at full strength
+constexpr double kPriorReach = 0.4;   // ... reached this many face widths from its outline
+constexpr double kMirrorGain = 2.0;   // log-odds borrowed from a decided mirror-image pixel
 
 void drawHead(cv::Mat& dst, const cv::Rect& f, const Silhouette& s) {
     cv::ellipse(dst, cv::Point(cvRound(f.x + f.width / 2.0), cvRound(f.y + s.headY * f.height)),
@@ -142,6 +152,126 @@ void refineHeads(const cv::Mat& rgb, const std::vector<cv::Rect>& faces, const c
     }
 }
 
+// GrabCut's Gaussian mixture color model, read back from the model array it returns
+// (weights, then RGB means, then 3x3 covariances).
+class ColorModel {
+public:
+    explicit ColorModel(const cv::Mat& model) {
+        if (model.type() != CV_64FC1 || static_cast<int>(model.total()) != 13 * kGmmComponents) return;
+        const double* c = model.ptr<double>(0);
+        for (int k = 0; k < kGmmComponents; ++k) {
+            if (c[k] <= 0) continue;
+            const cv::Matx33d cov(c + 4 * kGmmComponents + 9 * k);
+            const double det = cv::determinant(cov);
+            if (det <= 1e-9) continue;
+            comps_.push_back({cv::Vec3d(c + kGmmComponents + 3 * k), cov.inv(),
+                              std::log(c[k]) - 0.5 * std::log(det)});
+        }
+    }
+    bool empty() const { return comps_.empty(); }
+    double logLikelihood(const cv::Vec3b& px) const {
+        double best = -1e30;
+        double terms[kGmmComponents];
+        int n = 0;
+        for (const auto& g : comps_) {
+            const cv::Vec3d d = cv::Vec3d(px[0], px[1], px[2]) - g.mean;
+            const double v = g.logNorm - 0.5 * d.dot(g.inv * d);
+            terms[n++] = v;
+            best = std::max(best, v);
+        }
+        double sum = 0;
+        for (int i = 0; i < n; ++i) sum += std::exp(terms[i] - best);
+        return best + std::log(sum);
+    }
+
+private:
+    struct Component {
+        cv::Vec3d mean;
+        cv::Matx33d inv;
+        double logNorm;
+    };
+    std::vector<Component> comps_;
+};
+
+// Below each head, GrabCut's color models can't tell a black shirt from a dark wall; the
+// smoothness term then cuts the shoulders off along the shortest (vertical) line. Where
+// the local color evidence is weak, a typical shoulder shape plus the mirror image of the
+// other shoulder (when that one is clearly subject, against a lighter wall say) add the
+// missing shoulder back. Only adds: wide shoulders GrabCut kept stay, and a mistake here
+// keeps background that looks like the clothes next to it.
+void resolveBody(const cv::Mat& rgb, const std::vector<cv::Rect>& faces, const cv::Mat& definite,
+                 const cv::Mat& bgdModel, const cv::Mat& fgdModel, cv::Mat& fg) {
+    const ColorModel fgColor(fgdModel), bgColor(bgdModel);
+    if (fgColor.empty() || bgColor.empty()) return;
+    const cv::Mat decided = fg.clone();
+    for (const auto& f : faces) {
+        const int top = std::clamp(cvRound(f.y + 0.98 * f.height), 0, rgb.rows);
+        cv::Mat zone(rgb.size(), CV_8UC1, cv::Scalar(0));
+        drawSilhouette(zone, f, kReach);
+        zone.rowRange(0, top).setTo(0);
+        zone.setTo(0, definite);
+        const cv::Rect area = cv::boundingRect(zone);
+        if (area.area() == 0) continue;
+
+        // Local color evidence: clipped log likelihood ratio, averaged over a patch.
+        cv::Mat ratio(rgb.size(), CV_32F, cv::Scalar(0));
+        for (int y = area.y; y < area.br().y; ++y) {
+            const auto* px = rgb.ptr<cv::Vec3b>(y);
+            auto* out = ratio.ptr<float>(y);
+            for (int x = area.x; x < area.br().x; ++x) {
+                const double v = fgColor.logLikelihood(px[x]) - bgColor.logLikelihood(px[x]);
+                out[x] = static_cast<float>(std::clamp(v, -kEvidenceClip, kEvidenceClip));
+            }
+        }
+        // A fine scale too, so pixels right beside a clear edge (where the coarse patch
+        // straddles both sides and averages out) still count as decided.
+        const int r = std::max(1, cvRound(f.width / 10.0));
+        const int rFine = std::max(1, r / 3);
+        cv::Mat evidence, fine;
+        cv::boxFilter(ratio, evidence, -1, cv::Size(2 * r + 1, 2 * r + 1));
+        cv::boxFilter(ratio, fine, -1, cv::Size(2 * rFine + 1, 2 * rFine + 1));
+
+        // Shoulder prior: signed distance to the typical outline, in face widths.
+        cv::Mat shape(rgb.size(), CV_8UC1, cv::Scalar(0));
+        drawSilhouette(shape, f, kShoulders);
+        cv::Mat dIn, dOut;
+        cv::distanceTransform(shape, dIn, cv::DIST_L2, 3);
+        cv::distanceTransform(~shape, dOut, cv::DIST_L2, 3);
+        const double unit = 1.0 / (kPriorReach * f.width);
+
+        // Log-odds per pixel: GrabCut's decision where color is decisive (or outside the
+        // zone), else evidence + shoulder prior + mirror. Smoothed before thresholding so
+        // the added outline is a clean curve rather than following patch-to-patch noise.
+        const float sure = static_cast<float>(kDecisive + kPriorGain + kMirrorGain);
+        cv::Mat score(rgb.size(), CV_32F, cv::Scalar(-sure));
+        score.setTo(cv::Scalar(sure), decided);
+        cv::Mat open(rgb.size(), CV_8UC1, cv::Scalar(0));  // zone pixels color can't decide
+        const double cx2 = 2.0 * (f.x + f.width / 2.0);
+        for (int y = area.y; y < area.br().y; ++y) {
+            const auto* z = zone.ptr<uint8_t>(y);
+            const auto* e = evidence.ptr<float>(y);
+            const auto* ef = fine.ptr<float>(y);
+            const auto* in = dIn.ptr<float>(y);
+            const auto* out = dOut.ptr<float>(y);
+            const auto* d = decided.ptr<uint8_t>(y);
+            auto* s = score.ptr<float>(y);
+            auto* o = open.ptr<uint8_t>(y);
+            for (int x = area.x; x < area.br().x; ++x) {
+                if (!z[x] || std::fabs(e[x]) >= kDecisive || std::fabs(ef[x]) >= kDecisive) continue;
+                double v = e[x] + kPriorGain * std::clamp((in[x] - out[x]) * unit, -1.0, 1.0);
+                const int xm = cvRound(cx2 - x);
+                if (xm >= 0 && xm < rgb.cols && d[xm] && e[xm] > 0) {
+                    v += kMirrorGain * std::min(e[xm] / kDecisive, 1.0);
+                }
+                s[x] = static_cast<float>(v);
+                o[x] = 255;
+            }
+        }
+        cv::GaussianBlur(score, score, cv::Size(0, 0), std::max(1.0, f.width / 12.0));
+        fg.setTo(cv::Scalar(255), open & (score > 0));
+    }
+}
+
 // GrabCut seeded with person-shaped priors per face (plus a per-head pass), or a centered
 // rectangle when no face was found. Returns a binary (0/255) subject mask.
 cv::Mat segmentSubject(const cv::Mat& rgb, const std::vector<cv::Rect>& faces) {
@@ -182,6 +312,7 @@ cv::Mat segmentSubject(const cv::Mat& rgb, const std::vector<cv::Rect>& faces) {
         }
         cv::grabCut(rgb, gc, cv::Rect(), bgdModel, fgdModel, 5, cv::GC_INIT_WITH_MASK);
         cv::Mat fg = (gc == cv::GC_FGD) | (gc == cv::GC_PR_FGD);
+        resolveBody(rgb, faces, gc == cv::GC_FGD, bgdModel, fgdModel, fg);
         refineHeads(rgb, faces, core, reach, fg);
         return fg;
     }

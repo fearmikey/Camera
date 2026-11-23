@@ -27,3 +27,6 @@ A fully free and open-source camera app with computational photography that runs
 
 <b>Privacy</b>
 No ads, no analytics, no Google Play Services and no internet permission. All image processing uses OpenCV and the Android camera APIs on your device.
+
+<b>Support</b>
+Camera is free and always will be. If you enjoy it, you can support development at <a href="https://buymeacoffee.com/ximw7nxi1j">buymeacoffee.com/ximw7nxi1j</a>. Source code and issue tracker: <a href="https://github.com/fearmikey/Camera">github.com/fearmikey/Camera</a>.

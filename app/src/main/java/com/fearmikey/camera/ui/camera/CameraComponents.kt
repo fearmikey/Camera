@@ -11,6 +11,10 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.gestures.detectVerticalDragGestures
 import androidx.compose.material.icons.filled.FlashAuto
+import androidx.compose.material.icons.filled.LocalFlorist
+import androidx.compose.material.icons.filled.Timer
+import androidx.compose.material.icons.filled.Timer10
+import androidx.compose.material.icons.filled.Timer3
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.NightsStay
 import androidx.compose.material.icons.filled.QrCode2
@@ -61,6 +65,44 @@ val OnCameraAccent: Color
 /** Round control buttons on the dark camera UI (tinted by the system palette). */
 val ControlBackground: Color
     @Composable @ReadOnlyComposable get() = MaterialTheme.colorScheme.surfaceContainerHigh
+
+/** Pale accent behind the selected mode, zoom preset and dial value (lighter than [CameraAccent]). */
+val CameraHighlight: Color
+    @Composable @ReadOnlyComposable get() = MaterialTheme.colorScheme.onPrimaryContainer
+
+/** Text and icons on [CameraHighlight]. */
+val OnCameraHighlight: Color
+    @Composable @ReadOnlyComposable get() = MaterialTheme.colorScheme.onPrimary
+
+/** Shape of the square side buttons (thumbnail, flip) and unselected option buttons. */
+val ControlSquareShape = RoundedCornerShape(16.dp)
+
+/**
+ * Small filled label glyph such as "12/MP", "MAX", "FHD" or "4K" ([lines] stacked), drawn in
+ * [color] with the text punched out in [contentColor].
+ */
+@Composable
+fun TextBadge(lines: List<String>, color: Color, contentColor: Color, modifier: Modifier = Modifier) {
+    val stacked = lines.size > 1
+    val style = androidx.compose.ui.text.TextStyle(
+        color = contentColor,
+        fontSize = if (stacked) 8.5.sp else 10.sp,
+        lineHeight = if (stacked) 8.5.sp else 10.sp,
+        fontWeight = FontWeight.Black,
+        letterSpacing = 0.sp,
+        platformStyle = androidx.compose.ui.text.PlatformTextStyle(includeFontPadding = false),
+    )
+    Column(
+        modifier
+            .defaultMinSize(minWidth = 20.dp, minHeight = 20.dp)
+            .background(color, RoundedCornerShape(3.dp))
+            .padding(horizontal = 3.dp, vertical = 2.dp),
+        horizontalAlignment = Alignment.CenterHorizontally,
+        verticalArrangement = Arrangement.Center,
+    ) {
+        lines.forEach { Text(it, style = style, maxLines = 1, softWrap = false) }
+    }
+}
 
 /** Icon button whose glyph rotates with the device so it stays upright in landscape. */
 @Composable
@@ -200,8 +242,8 @@ fun PermissionRequiredScreen(onRequest: () -> Unit, modifier: Modifier = Modifie
 }
 
 /**
- * Top bar: resolution chip, flash toggle, timer and macro indicators.
- * (Camera switching lives next to the shutter.) Glyphs rotate with [rotation].
+ * Top bar: status glyphs on the left (resolution badge, flash, timer, macro, video resolution),
+ * the scan-from-image button on the right. Glyphs rotate with [rotation].
  */
 @Composable
 fun CameraTopBar(
@@ -226,6 +268,9 @@ fun CameraTopBar(
      * that rebind the camera, which would end the recording. (Flash stays: in video it is the torch.)
      */
     chipsEnabled: Boolean = true,
+    /** Non-null shows the video resolution badge ("FHD" / "4K"); tapping it switches. */
+    videoResolutionLabel: String? = null,
+    onVideoResolutionClick: () -> Unit = {},
 ) {
     val animatedRotation by animateFloatAsState(
         targetValue = rotation.toFloat(),
@@ -239,44 +284,67 @@ fun CameraTopBar(
     Row(
         modifier = modifier.fillMaxWidth().height(TopBarHeight),
         verticalAlignment = Alignment.CenterVertically,
-        horizontalArrangement = Arrangement.spacedBy(8.dp, Alignment.CenterHorizontally)
     ) {
-        if (showResolution) {
-            TopBarChip(
-                text = if (isFullResolution) "MAX" else "12MP",
-                active = isFullResolution,
-                rotation = rotationProvider,
-                onClick = onResolutionClick,
-                description = if (isFullResolution) "Full resolution" else "12 megapixel",
-                enabled = chipsEnabled,
-            )
-        }
-        if (showFlash) {
-            IconButton(onClick = onFlashClick, modifier = Modifier.size(40.dp)) {
-                Icon(
-                    flashIcon,
-                    contentDescription = "Flash $flashLabel",
-                    tint = if (flashActive) CameraAccent else Color.White,
-                    modifier = Modifier.size(22.dp).then(rotate)
+        Row(
+            modifier = Modifier.weight(1f),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(4.dp),
+        ) {
+            if (showResolution) {
+                TopBarBadge(
+                    lines = if (isFullResolution) listOf("MAX") else listOf("12", "MP"),
+                    rotation = rotationProvider,
+                    onClick = onResolutionClick,
+                    description = if (isFullResolution) "Full resolution" else "12 megapixel",
+                    enabled = chipsEnabled,
                 )
             }
-        }
-        if (timerSeconds > 0) {
-            TopBarChip(
-                text = "${timerSeconds}s",
-                active = true,
-                rotation = rotationProvider,
-                onClick = onTimerClick,
-                description = "Timer $timerSeconds seconds",
-                enabled = chipsEnabled,
-            )
-        }
-        if (macroOn) {
-            // Opens the quick settings sheet (macro is set there), like the timer chip.
-            TopBarChip(
-                text = "MACRO", active = true, rotation = rotationProvider, onClick = onTimerClick,
-                description = "Macro focus on", enabled = chipsEnabled,
-            )
+            if (videoResolutionLabel != null) {
+                TopBarBadge(
+                    lines = listOf(videoResolutionLabel),
+                    rotation = rotationProvider,
+                    onClick = onVideoResolutionClick,
+                    description = "Video resolution $videoResolutionLabel",
+                    enabled = chipsEnabled,
+                )
+            }
+            if (showFlash) {
+                IconButton(onClick = onFlashClick, modifier = Modifier.size(40.dp)) {
+                    Icon(
+                        flashIcon,
+                        contentDescription = "Flash $flashLabel",
+                        tint = if (flashActive) CameraAccent else Color.White,
+                        modifier = Modifier.size(24.dp).then(rotate)
+                    )
+                }
+            }
+            if (timerSeconds > 0) {
+                // Opens the quick settings sheet, where the timer is set.
+                IconButton(onClick = onTimerClick, enabled = chipsEnabled, modifier = Modifier.size(40.dp)) {
+                    val timerIcon = when (timerSeconds) {
+                        3 -> Icons.Default.Timer3
+                        10 -> Icons.Default.Timer10
+                        else -> Icons.Default.Timer
+                    }
+                    Icon(
+                        timerIcon,
+                        contentDescription = "Timer $timerSeconds seconds",
+                        tint = Color.White,
+                        modifier = Modifier.size(24.dp).then(rotate)
+                    )
+                }
+            }
+            if (macroOn) {
+                // Opens the quick settings sheet (macro is set there), like the timer.
+                IconButton(onClick = onTimerClick, enabled = chipsEnabled, modifier = Modifier.size(40.dp)) {
+                    Icon(
+                        Icons.Default.LocalFlorist,
+                        contentDescription = "Macro focus on",
+                        tint = Color.White,
+                        modifier = Modifier.size(24.dp).then(rotate)
+                    )
+                }
+            }
         }
         if (onScanImageClick != null) {
             IconButton(onClick = onScanImageClick, enabled = !isScanningImage, modifier = Modifier.size(40.dp)) {
@@ -296,9 +364,8 @@ fun CameraTopBar(
 }
 
 @Composable
-private fun TopBarChip(
-    text: String,
-    active: Boolean,
+private fun TopBarBadge(
+    lines: List<String>,
     /** Degrees, read in the draw phase. */
     rotation: () -> Float,
     onClick: () -> Unit,
@@ -307,19 +374,15 @@ private fun TopBarChip(
 ) {
     Box(
         modifier = Modifier
-            .height(30.dp)
-            .widthIn(min = 40.dp)
-            .clip(RoundedCornerShape(15.dp))
-            .background(if (active) CameraAccent else Color.Black.copy(alpha = 0.35f))
-            .clickableWithDescription(description, enabled, onClick)
-            .padding(horizontal = 8.dp),
+            .size(40.dp)
+            .clip(CircleShape)
+            .clickableWithDescription(description, enabled, onClick),
         contentAlignment = Alignment.Center
     ) {
-        Text(
-            text,
-            color = if (active) OnCameraAccent else Color.White,
-            fontSize = 11.sp,
-            fontWeight = FontWeight.Bold,
+        TextBadge(
+            lines = lines,
+            color = Color.White,
+            contentColor = Color.Black,
             modifier = Modifier.graphicsLayer { rotationZ = rotation() }
         )
     }
@@ -419,7 +482,7 @@ private fun CameraTopBarPreview() {
     CameraTopBar(
         rotation = 0, showResolution = true, isFullResolution = false, showFlash = true,
         flashLabel = "Auto", flashIcon = Icons.Default.FlashAuto, flashActive = false,
-        timerSeconds = 3, macroOn = true,
+        timerSeconds = 3, macroOn = true, videoResolutionLabel = "FHD",
         onResolutionClick = {}, onFlashClick = {}, onTimerClick = {},
         modifier = Modifier.padding(horizontal = 12.dp),
         onScanImageClick = {},

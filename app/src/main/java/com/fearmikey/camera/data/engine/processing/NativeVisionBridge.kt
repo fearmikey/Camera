@@ -48,12 +48,15 @@ object NativeVisionBridge {
     // Use CodeDecoder rather than calling this directly.
     external fun nativeDecodeCodes(bitmap: Bitmap, cornersOut: FloatArray, tryHarder: Boolean): Array<ByteArray>?
 
-    // Open-palm detector. Returns normalized {left, top, right, bottom} or null.
+    // Open-palm detector (spread or relaxed fingers) next to the given face. [otherFaces]
+    // holds normalized {left, top, right, bottom} per other person, whose skin is ignored.
+    // Returns normalized {left, top, right, bottom} or null.
     external fun nativeDetectOpenPalm(
         bitmap: Bitmap,
         faceLeft: Float,
         faceTop: Float,
         faceRight: Float,
         faceBottom: Float,
+        otherFaces: FloatArray?,
     ): FloatArray?
 }

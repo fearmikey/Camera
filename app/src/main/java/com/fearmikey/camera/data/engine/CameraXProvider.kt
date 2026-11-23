@@ -767,6 +767,12 @@ class CameraXProvider(
         activeRecording = null
     }
 
+    /** CameraX's own PreviewView keeps running while it records. */
+    override fun setRecordingPreview(target: RecordingPreviewTarget?) = Unit
+
+    /** Slow motion is recorded by Camera2Provider. */
+    override fun getSlowMotionFrameRates(): List<Int> = emptyList()
+
     override fun pauseVideo() {
         activeRecording?.pause()
     }

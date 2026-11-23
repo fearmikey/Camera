@@ -2,6 +2,30 @@
 
 All notable changes to this project will be documented in this file.
 
+## [1.2.1] - 2026-11-22
+
+### Added
+- Settings → About: links to the source code on GitHub, the changelog and the issue tracker, the GPL-3.0 license notice and the open-source library licenses, plus a "Buy me a coffee" link to support development. Links open in your browser; the app itself still has no network access.
+- Slow motion: live viewfinder while recording (Time lapse too) instead of a dark "Recording..." screen. After you stop, the last frame stays up until the normal viewfinder is back.
+- Slow motion speed choice: 1/4x (120 fps) or 1/8x (240 fps), showing only the rates your camera supports; the choice is remembered. 1/8x records at up to 720p on most phones. The speed button at the bottom right shows the current speed and opens the Speed control, next to Exposure, in the adjustments row.
+- Exposure adjustment in Slow motion and Time lapse: the adjustments row now opens there too (Exposure, plus Speed in Slow motion).
+
+### Improved
+- Photo modes are now ordered Long exposure · Portrait · Photo · Night · Panorama, so Night sits right next to Photo.
+- Video modes are now ordered Slow motion · Video · Time lapse, so Video sits in the center like Photo does in its row.
+- Slow motion picks the largest 16:9 size for the chosen speed and scales the bit rate to it, and switching to Slow motion on a camera without high-speed video says so right away instead of only when you press record.
+- The recording timer starts when frames actually reach the file, so in Slow motion and Time lapse (which first open the camera) it no longer runs ahead of the clip.
+- Redesigned settings screen: collapsing large title, settings grouped into rounded cards with an icon for each setting, check-mark switches, an app info card (icon, version) and more accessible switches and choice dialogs (the whole row toggles; radio options are announced as a group).
+- Portrait no longer cuts off dark shoulders: a black shirt against a dark wall keeps its natural rounded shoulder outline instead of being blurred along a straight vertical line.
+- Refreshed camera screen: status icons (12MP/MAX badge, FHD/4K badge in Video, flash, timer, macro) line up on the left of the top bar, the shutter has a dark ring (Slow motion and Time lapse show their icon on a white disc), the gallery and flip buttons are rounded squares, and the selected mode, zoom preset and photo/video toggle use the Material You accent. Tapping the FHD/4K badge switches video resolution.
+- Redesigned in-camera settings sheet: always dark and see-through, large title with a "…" button for all settings, the current value of each setting in large accent text, and every option (including on/off settings that used to be switches) as an icon button; the selected one turns into an accent circle. Slow motion and Time lapse show their few settings on one page.
+- Redesigned manual controls: a row of tools (Reset All, Exposure, ISO, Shutter speed, Focus, White balance) replaces the mode row, the selected tool opens a sliding tick dial above the shutter with its value shown above it, and a strip at the top shows which controls are automatic or manual. Exposure compensation is now part of manual controls too.
+
+### Fixed
+- Slow motion / Time lapse: stopping right after starting (while the camera was still opening) could leave the recording running in the background and fight the viewfinder for the camera; it now cancels cleanly with "Video too short".
+- Stopping a Slow motion or Time lapse recording no longer freezes the UI while the video file is finalized, and the normal viewfinder only comes back once the recording has released the camera.
+- Palm timer: a natural open palm held up beside your head now works; you no longer need to spread your fingers wide. Other people's faces in the shot are ignored.
+
 ## [1.2.0] - 2026-11-22
 
 ### Added

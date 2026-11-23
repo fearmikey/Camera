@@ -30,6 +30,8 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Pause
+import androidx.compose.material.icons.filled.SlowMotionVideo
+import androidx.compose.material.icons.filled.Timelapse
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
@@ -66,13 +68,26 @@ import kotlinx.coroutines.launch
 /** Record red used by the video shutter and the recording indicator. */
 val RecordRed = Color(0xFFF2382F)
 
-enum class ShutterStyle { PHOTO, VIDEO, PANORAMA }
+/**
+ * SLOW_MOTION / TIME_LAPSE: a smaller white disc with the mode's glyph on a filled dark circle;
+ * recording turns it into the red stop square like VIDEO.
+ */
+enum class ShutterStyle {
+    PHOTO, VIDEO, PANORAMA, SLOW_MOTION, TIME_LAPSE;
+
+    val records: Boolean get() = this == VIDEO || this == SLOW_MOTION || this == TIME_LAPSE
+    val hasGlyphDisc: Boolean get() = this == SLOW_MOTION || this == TIME_LAPSE
+}
 
 /** Outer size of [ShutterButton]; constant in every state so the controls never shift. */
 val ShutterSize = 88.dp
 
-private val RingWidth = 4.dp
-private val DiscSize = 70.dp
+private val RingWidth = 7.dp
+/** Dark ring around the disc (white on the progress arc and the capture pulse). */
+private val RingColor = Color(0xFF3A3A3C)
+private val DiscSize = 72.dp
+/** White disc of the SLOW_MOTION / TIME_LAPSE styles, on a filled [RingColor] circle. */
+private val GlyphDiscSize = 56.dp
 private val StopSize = 30.dp
 private val PanoramaStopSize = 36.dp
 /** Hold time before a press becomes QuickTake / hold-to-record (taps are well under this). */
@@ -80,7 +95,7 @@ private const val LONG_PRESS_MS = 300L
 
 /**
  * The capture button. Everything is drawn in one Canvas so the inner shape can morph:
- * photo = white disc in a white ring, video = red disc in the ring, recording = small red
+ * photo = white disc in a dark ring, video = red disc in the ring, recording = small red
  * rounded square (stop) in the ring, panorama sweep = dark disc with a white stop square.
  * Pressing shrinks the inner shape (springs back on release); a photo tap also sends a short
  * ring pulse outwards. [progress] (0..1, null = none) turns the ring into a progress arc for
@@ -117,6 +132,7 @@ fun ShutterButton(
         when {
             isPanoramaCapturing -> PanoramaStopSize
             isRecording -> StopSize
+            style.hasGlyphDisc -> GlyphDiscSize
             else -> DiscSize
         },
         morphSpring, label = "shutterInnerSize"
@@ -129,7 +145,7 @@ fun ShutterButton(
     val innerColor by animateColorAsState(
         when {
             isPanoramaCapturing -> Color.White
-            style == ShutterStyle.VIDEO || isRecording -> RecordRed
+            isRecording || style == ShutterStyle.VIDEO -> RecordRed
             else -> Color.White
         },
         tween(240), label = "shutterColor"
@@ -150,6 +166,11 @@ fun ShutterButton(
     val glyphAlpha by animateFloatAsState(
         if (style == ShutterStyle.PANORAMA && !isPanoramaCapturing) 1f else 0f, tween(180), label = "panoGlyph"
     )
+    // Slow motion / time lapse: filled dark circle behind the disc, mode glyph on the disc.
+    val discFill by animateFloatAsState(if (style.hasGlyphDisc) 1f else 0f, tween(200), label = "shutterDiscFill")
+    val modeGlyphAlpha by animateFloatAsState(
+        if (style.hasGlyphDisc && !isRecording) 1f else 0f, tween(160), label = "modeGlyph"
+    )
 
     Box(
         contentAlignment = Alignment.Center,
@@ -160,7 +181,7 @@ fun ShutterButton(
                 contentDescription = when {
                     isPanoramaCapturing -> "Stop panorama"
                     isRecording -> "Stop recording"
-                    style == ShutterStyle.VIDEO -> "Start recording"
+                    style.records -> "Start recording"
                     style == ShutterStyle.PANORAMA -> "Start panorama"
                     else -> "Take photo"
                 }
@@ -215,18 +236,21 @@ fun ShutterButton(
                 drawCircle(
                     color = Color.White.copy(alpha = 0.45f * (1f - p)),
                     radius = ringRadius + p * 14.dp.toPx(),
-                    style = Stroke(width = ringPx * (1f - p * 0.5f))
+                    style = Stroke(width = 4.dp.toPx() * (1f - p * 0.5f))
                 )
             }
 
             if (isPanoramaCapturing || ringAlpha < 1f) {
                 drawCircle(Color.White.copy(alpha = 0.16f * (1f - ringAlpha)))
             }
+            if (discFill > 0f) {
+                drawCircle(RingColor.copy(alpha = discFill * ringAlpha), radius = size.minDimension / 2f)
+            }
 
             if (ringAlpha > 0f) {
                 if (busy) {
                     drawCircle(
-                        color = Color.White.copy(alpha = 0.25f * ringAlpha),
+                        color = RingColor.copy(alpha = ringAlpha),
                         radius = ringRadius, style = Stroke(ringPx)
                     )
                     drawArc(
@@ -240,7 +264,7 @@ fun ShutterButton(
                     )
                 } else {
                     drawCircle(
-                        color = Color.White.copy(alpha = ringAlpha),
+                        color = RingColor.copy(alpha = ringAlpha),
                         radius = ringRadius, style = Stroke(ringPx)
                     )
                 }
@@ -262,6 +286,18 @@ fun ShutterButton(
                 scaleX = pressScale
                 scaleY = pressScale
             })
+        }
+        if (modeGlyphAlpha > 0f) {
+            Icon(
+                if (style == ShutterStyle.TIME_LAPSE) Icons.Default.Timelapse else Icons.Default.SlowMotionVideo,
+                contentDescription = null,
+                tint = Color.Black,
+                modifier = Modifier.size(28.dp).graphicsLayer {
+                    alpha = modeGlyphAlpha
+                    scaleX = pressScale
+                    scaleY = pressScale
+                }
+            )
         }
     }
 }
@@ -311,7 +347,7 @@ fun RecordingTimerPill(duration: String, isPaused: Boolean, modifier: Modifier =
     }
 }
 
-@Preview(widthDp = 420, heightDp = 140, showBackground = true, backgroundColor = 0xFF000000)
+@Preview(widthDp = 520, heightDp = 140, showBackground = true, backgroundColor = 0xFF000000)
 @Composable
 private fun ShutterButtonPreview() {
     Row(
@@ -323,6 +359,7 @@ private fun ShutterButtonPreview() {
         ShutterButton(ShutterStyle.VIDEO, isRecording = false, isPanoramaCapturing = false, onCapture = {})
         ShutterButton(ShutterStyle.VIDEO, isRecording = true, isPanoramaCapturing = false, onCapture = {})
         ShutterButton(ShutterStyle.PHOTO, isRecording = false, isPanoramaCapturing = false, onCapture = {}, progress = 0.6f)
+        ShutterButton(ShutterStyle.SLOW_MOTION, isRecording = false, isPanoramaCapturing = false, onCapture = {})
     }
 }
 

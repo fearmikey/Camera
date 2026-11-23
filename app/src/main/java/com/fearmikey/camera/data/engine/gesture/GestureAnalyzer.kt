@@ -14,8 +14,10 @@ import kotlin.math.roundToInt
 /**
  * Palm-timer analyzer built entirely on FOSS components:
  *  1. Android's framework face detector gates detection to frames with a person.
- *  2. An OpenCV skin model, calibrated from that face, finds an open hand via
- *     convexity defects between extended fingers (see `vision_jni.cpp`).
+ *  2. An OpenCV skin model, calibrated from that face, finds an open hand beside it by its
+ *     shape: widely spread fingers on their own, or a relaxed open hand (fingers together or
+ *     slightly apart) held at head height (see `vision_jni.cpp`). Other people's faces are
+ *     masked out.
  *
  * Orientation: detection runs on the frame turned by the image rotation plus [deviceRotation],
  * so people are upright however the phone is held (the UI is locked to portrait, and both the
@@ -49,6 +51,8 @@ class GestureAnalyzer(
 
     /** Last face, normalized in the upright (world) frame. */
     private var trackedFace: RectF? = null
+    /** Other people found with it (same frame); the palm detector ignores their skin. */
+    private var otherFaces: List<RectF> = emptyList()
     private var lastFaceTimestamp = 0L
     private var lastRotation = -1
     private var farPass = false
@@ -99,16 +103,20 @@ class GestureAnalyzer(
             // The phone was turned: old coordinates no longer mean anything.
             lastRotation = rotation
             trackedFace = null
+            otherFaces = emptyList()
             consecutiveDetections = 0
         }
 
         val now = System.currentTimeMillis()
-        val face = findFace(raw, rotation)
+        val faces = findFaces(raw, rotation)
+        val face = faces.firstOrNull()
         if (face != null) {
             trackedFace = face
+            otherFaces = faces.drop(1)
             lastFaceTimestamp = now
         } else if (now - lastFaceTimestamp > FACE_TIMEOUT_MS) {
             trackedFace = null
+            otherFaces = emptyList()
         }
 
         val faceBox = trackedFace
@@ -138,26 +146,25 @@ class GestureAnalyzer(
         onGestureTriggered(GestureResult(toDisplay(handBox, extra), toDisplay(faceBox, extra), triggered))
     }
 
-    /** Largest face, normalized in the upright frame, or null. */
-    private fun findFace(raw: Bitmap, rotation: Int): RectF? {
+    /** Faces (largest first) normalized in the upright frame; empty if none. */
+    private fun findFaces(raw: Bitmap, rotation: Int): List<RectF> {
         trackedFace?.let { last ->
             // Track: a window around the last face, at up to full analysis resolution.
             val w = last.width()
             val h = last.height()
             val window = RectF(last.left - 2f * w, last.top - 1.5f * h, last.right + 2f * w, last.bottom + 1.5f * h)
-            searchFaces(raw, rotation, window, TRACK_MAX_SIDE)?.let { return it }
+            searchFaces(raw, rotation, window, TRACK_MAX_SIDE).takeIf { it.isNotEmpty() }?.let { return it }
         }
         farPass = !farPass
         val full = RectF(0f, 0f, 1f, 1f)
-        return searchFaces(raw, rotation, full, NEAR_MAX_SIDE)
-            ?: if (farPass) searchFaces(raw, rotation, full, FAR_MAX_SIDE) else null
+        return searchFaces(raw, rotation, full, NEAR_MAX_SIDE).takeIf { it.isNotEmpty() }
+            ?: if (farPass) searchFaces(raw, rotation, full, FAR_MAX_SIDE) else emptyList()
     }
 
-    private fun searchFaces(raw: Bitmap, rotation: Int, region: RectF, maxSide: Int): RectF? {
-        val (crop, area) = cropUpright(raw, rotation, region, maxSide) ?: return null
+    private fun searchFaces(raw: Bitmap, rotation: Int, region: RectF, maxSide: Int): List<RectF> {
+        val (crop, area) = cropUpright(raw, rotation, region, maxSide) ?: return emptyList()
         try {
-            val f = FaceLocator.findLargestFace(crop, maxSide) ?: return null
-            return area.subRect(f)
+            return FaceLocator.findFaces(crop, maxSide).map { area.subRect(it) }
         } finally {
             if (crop !== raw) crop.recycle()
         }
@@ -175,11 +182,18 @@ class GestureAnalyzer(
         val maxScale = FACE_TARGET_PX / facePx
         val (crop, area) = cropUpright(raw, rotation, roi, PALM_MAX_SIDE, maxScale) ?: return null
         try {
-            val l = (face.left - area.left) / area.width()
-            val t = (face.top - area.top) / area.height()
-            val r = (face.right - area.left) / area.width()
-            val b = (face.bottom - area.top) / area.height()
-            val palm = NativeVisionBridge.nativeDetectOpenPalm(crop, l, t, r, b) ?: return null
+            fun RectF.inCrop() = RectF(
+                (left - area.left) / area.width(), (top - area.top) / area.height(),
+                (right - area.left) / area.width(), (bottom - area.top) / area.height(),
+            )
+            val f = face.inCrop()
+            val others = otherFaces.map { it.inCrop() }
+                .filter { it.right > 0f && it.left < 1f && it.bottom > 0f && it.top < 1f }
+                .flatMap { listOf(it.left, it.top, it.right, it.bottom) }
+                .toFloatArray()
+            val palm = NativeVisionBridge.nativeDetectOpenPalm(
+                crop, f.left, f.top, f.right, f.bottom, others.takeIf { it.isNotEmpty() }
+            ) ?: return null
             return area.subRect(RectF(palm[0], palm[1], palm[2], palm[3]))
         } finally {
             if (crop !== raw) crop.recycle()

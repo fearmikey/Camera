@@ -35,6 +35,19 @@ interface CaptureEngine {
     fun startSlowMoVideo(onSuccess: () -> Unit, onError: (Exception) -> Unit)
     /** Stops the recording; exactly one of [onSuccess] (saved URI) or [onError] is called. */
     fun stopSlowMoVideo(onSuccess: (String) -> Unit, onError: (Exception) -> Unit)
+
+    /**
+     * Live view for Camera2 recordings (Slow motion, Time lapse), or null when the UI has none.
+     * Picked up when the next recording starts. CameraX ignores it (its PreviewView keeps working).
+     */
+    fun setRecordingPreview(target: RecordingPreviewTarget?)
+
+    /**
+     * Slow-motion capture rates (fps, ascending) of the selected camera's facing; empty when it
+     * has no constrained high-speed video. The recording uses SlowMotion.resolveFps of
+     * UserPreferences.slowMotionFps against this list.
+     */
+    fun getSlowMotionFrameRates(): List<Int>
     fun pauseVideo()
     fun resumeVideo()
     fun captureVideoSnapshot(onSuccess: (String) -> Unit, onError: (Exception) -> Unit)

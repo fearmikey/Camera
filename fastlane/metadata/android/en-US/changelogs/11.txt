@@ -1,0 +1,6 @@
+• Refreshed camera screen, settings sheet and manual controls (tool row + dials)
+• Redesigned settings: grouped cards with icons, collapsing title, more accessible switches
+• About: source code, changelog, issue tracker, license and open-source licenses
+• Buy me a coffee link to support development
+• Slow motion: live viewfinder while recording and a 1/4x or 1/8x speed choice
+• Palm timer works with a natural open palm and ignores other faces

@@ -91,7 +91,15 @@ import androidx.compose.ui.unit.sp
 import com.fearmikey.camera.ui.camera.CameraViewModel
 import com.fearmikey.camera.ui.camera.CameraUiState
 import com.fearmikey.camera.ui.camera.FocusState
-import com.fearmikey.camera.ui.camera.ProControlOverlay
+import com.fearmikey.camera.ui.camera.ProInfoStrip
+import com.fearmikey.camera.ui.camera.ProTool
+import com.fearmikey.camera.ui.camera.ProToolBar
+import com.fearmikey.camera.ui.camera.ProToolControl
+import com.fearmikey.camera.ui.camera.availableProTools
+import com.fearmikey.camera.ui.camera.CameraHighlight
+import com.fearmikey.camera.ui.camera.OnCameraHighlight
+import com.fearmikey.camera.ui.camera.ControlSquareShape
+import androidx.compose.runtime.saveable.rememberSaveable
 import com.fearmikey.camera.ui.camera.HudOverlay
 import com.fearmikey.camera.ui.camera.CameraTopBar
 import com.fearmikey.camera.ui.camera.ExposureSlider
@@ -120,6 +128,11 @@ import androidx.compose.material.icons.filled.NightsStay
 import androidx.compose.material.icons.filled.Pause
 import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.History
+import androidx.compose.material.icons.filled.SlowMotionVideo
+import androidx.compose.ui.semantics.Role
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.role
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.font.FontWeight
 import com.fearmikey.camera.domain.model.AspectRatio as DomainAspectRatio
 import com.fearmikey.camera.data.repository.MediaRepository
@@ -395,6 +408,8 @@ fun CameraScreen(
     }
     
     var showFlashOverlay by remember { mutableStateOf(false) }
+    // Manual-controls tool whose dial is open (null = tool row only, zoom row visible).
+    var selectedProTool by rememberSaveable { mutableStateOf<ProTool?>(ProTool.EXPOSURE) }
     
     val systemBarsPadding = WindowInsets.systemBars.asPaddingValues()
     
@@ -457,6 +472,20 @@ fun CameraScreen(
                 // uiState, so they stay the same instance and CameraPreview can skip recomposing.
                 onDoubleTap = { if (viewModel.uiState.value.userPreferences.doubleTapSwitch) viewModel.toggleCamera() },
                 onPreviewViewReady = { previewView = it },
+                recordingPreview = {
+                    // Camera2 recordings release CameraX: their own live view replaces the PreviewView.
+                    if (CameraModes.isCamera2Video(uiState.currentMode)) {
+                        val timeLapse = uiState.currentMode == CameraMode.TIME_LAPSE
+                        com.fearmikey.camera.ui.camera.RecordingPreview(
+                            previewView = previewView,
+                            isRecording = uiState.isRecording,
+                            fallbackText = if (timeLapse) "Recording time lapse\nKeep the phone steady" else "Recording slow motion",
+                            hint = if (timeLapse) "Keep the phone steady" else null,
+                            onTarget = { viewModel.setRecordingPreview(it) },
+                            modifier = Modifier.fillMaxSize(),
+                        )
+                    }
+                },
                 viewfinderOverlay = {
                     if (uiState.currentMode == CameraMode.PHOTO && uiState.userPreferences.scanQrCodes) {
                         com.fearmikey.camera.ui.camera.CodeOutlineOverlay(
@@ -548,22 +577,37 @@ fun CameraScreen(
                     uiState.currentMode == CameraMode.PHOTO && prefs.scanQrCodes && !uiState.isRecording
                 },
                 isScanningImage = uiState.isScanningImage,
+                videoResolutionLabel = if (caps.showsVideoQualitySettings) {
+                    if (prefs.videoResolution == com.fearmikey.camera.domain.model.VideoResolution.RES_4K) "4K" else "FHD"
+                } else null,
+                onVideoResolutionClick = {
+                    viewModel.updateVideoResolution(
+                        if (prefs.videoResolution == com.fearmikey.camera.domain.model.VideoResolution.RES_4K)
+                            com.fearmikey.camera.domain.model.VideoResolution.RES_1080P
+                        else com.fearmikey.camera.domain.model.VideoResolution.RES_4K
+                    )
+                    haptic.performHapticFeedback(HapticFeedbackType.LongPress)
+                },
             )
 
-            // Manual controls sit below the top bar so they never cover the shutter.
+            // Manual controls: a status strip at the top of the viewfinder, the tool row in place
+            // of the mode row (CameraControls) and the selected tool's dial in place of the zoom row.
+            val proTools = remember(uiState.capabilities, caps, uiState.slowMotionRates) {
+                availableProTools(uiState.capabilities, caps, uiState.slowMotionRates)
+            }
+            val activeProTool = selectedProTool?.let { if (it in proTools) it else proTools.firstOrNull() }
             if (uiState.isProMode) {
-                ProControlOverlay(
-                    uiState = uiState,
-                    onConfigChange = { viewModel.updateProConfig(it) },
-                    onReset = { viewModel.resetProConfig() },
+                ProInfoStrip(
+                    tools = proTools,
+                    config = uiState.proConfig,
+                    onSelect = { selectedProTool = it },
                     modifier = Modifier
                         .align(Alignment.TopCenter)
                         .padding(
-                    // Leave room for the recording time pill while recording.
-                    top = systemBarsPadding.calculateTopPadding() + com.fearmikey.camera.ui.camera.TopBarHeight + 8.dp +
-                        (if (uiState.isRecording) 44.dp else 0.dp),
-                    start = 12.dp, end = 12.dp
-                )
+                            // Leave room for the recording time pill while recording.
+                            top = systemBarsPadding.calculateTopPadding() + com.fearmikey.camera.ui.camera.TopBarHeight +
+                                (if (uiState.isRecording) 44.dp else 0.dp),
+                        )
                 )
             }
 
@@ -583,7 +627,20 @@ fun CameraScreen(
                 showCaptureProgress = uiState.isProcessing && uiState.showsCaptureProgress,
                 supportsQuickTake = caps.supportsQuickTake,
                 supportsVideoSnapshot = caps.supportsVideoSnapshot,
-                manualControlsAvailable = caps.supportsManualControls,
+                manualControlsAvailable = caps.offersAdjustments,
+                // Slow motion: the speed pill replaces Tune and opens the row on the Speed tool.
+                speedLabel = uiState.slowMotionRates
+                    .takeIf { caps.supportsSlowMotionSpeed }
+                    ?.let { com.fearmikey.camera.domain.model.SlowMotion.resolveFps(prefs.slowMotionFps, it) }
+                    ?.let { com.fearmikey.camera.domain.model.SlowMotion.speedLabel(it) },
+                onSpeedClick = {
+                    if (viewModel.uiState.value.isProMode && selectedProTool == ProTool.SPEED) {
+                        viewModel.toggleProMode()
+                    } else {
+                        selectedProTool = ProTool.SPEED
+                        if (!viewModel.uiState.value.isProMode) viewModel.toggleProMode()
+                    }
+                },
                 lastCapturedUri = uiState.lastCapturedUri,
                 orientation = orientation,
                 onModeSelected = { viewModel.setMode(it) },
@@ -619,6 +676,21 @@ fun CameraScreen(
                 onSettingsClick = { viewModel.setShowSettingsSheet(true) },
                 onProControlsClick = { viewModel.toggleProMode() },
                 isProMode = uiState.isProMode,
+                proToolBar = {
+                    ProToolBar(
+                        tools = proTools,
+                        selected = activeProTool,
+                        config = uiState.proConfig,
+                        exposureIndex = uiState.exposureIndex,
+                        // Tapping the open tool again closes its dial.
+                        onSelect = { tool -> selectedProTool = if (tool == activeProTool) null else tool },
+                        onResetAll = {
+                            viewModel.resetProConfig()
+                            viewModel.setExposureIndex(0)
+                        },
+                        onClose = { viewModel.toggleProMode() },
+                    )
+                },
             )
 
             ViewfinderZoomControls(
@@ -640,6 +712,21 @@ fun CameraScreen(
                 },
                 onPortraitApertureChange = { viewModel.updatePortraitAperture(it) },
                 zoomLabelScale = uiState.zoomLabelScale,
+                overrideContent = if (!uiState.isProMode || activeProTool == null) null else uiState.capabilities?.let { hw ->
+                    {
+                        ProToolControl(
+                            tool = activeProTool,
+                            capabilities = hw,
+                            config = uiState.proConfig,
+                            exposureIndex = uiState.exposureIndex,
+                            onConfigChange = { viewModel.updateProConfig(it) },
+                            onExposureIndexChange = { viewModel.setExposureIndex(it) },
+                            slowMotionRates = uiState.slowMotionRates,
+                            slowMotionFps = prefs.slowMotionFps,
+                            onSlowMotionFpsChange = { viewModel.updateSlowMotionFps(it) },
+                        )
+                    }
+                },
                 modifier = Modifier.align(Alignment.TopCenter),
             )
 
@@ -725,19 +812,6 @@ fun CameraScreen(
                         .align(Alignment.TopCenter)
                         .padding(top = systemBarsPadding.calculateTopPadding() + com.fearmikey.camera.ui.camera.TopBarHeight + 8.dp)
                 )
-            }
-
-            // Camera2-recorded modes can't feed the CameraX preview while recording.
-            if (uiState.isRecording && CameraModes.isCamera2Video(uiState.currentMode)) {
-                Box(Modifier.fillMaxSize().background(Color.Black.copy(alpha = 0.55f)), contentAlignment = Alignment.Center) {
-                    Text(
-                        if (uiState.currentMode == CameraMode.TIME_LAPSE) "Recording time lapse\nKeep the phone steady"
-                        else "Recording slow motion",
-                        color = Color.White,
-                        textAlign = androidx.compose.ui.text.style.TextAlign.Center,
-                        style = MaterialTheme.typography.titleMedium
-                    )
-                }
             }
 
             // Recording time at the top of the viewfinder (keeps the shutter row fixed).
@@ -860,6 +934,11 @@ fun CameraPreview(
     onPreviewViewReady: (PreviewView) -> Unit = {},
     /** Drawn on top of the viewfinder, sized and centered to it (e.g. the panorama guide). */
     viewfinderOverlay: @Composable androidx.compose.foundation.layout.BoxScope.() -> Unit = {},
+    /**
+     * Drawn over the camera image but under the grid/levels, sized to the viewfinder: the live
+     * view of Camera2 recordings (RecordingPreview).
+     */
+    recordingPreview: @Composable androidx.compose.foundation.layout.BoxScope.() -> Unit = {},
     /** Bottom edge of the visible viewfinder in root coordinates (px), for anchoring the zoom row. */
     onViewfinderBottom: (Float) -> Unit = {},
     /** Visible viewfinder width / height, so photos can be cropped to what it shows. */
@@ -1005,6 +1084,8 @@ fun CameraPreview(
                         .blur(20.dp)
                 )
             }
+
+            recordingPreview()
 
             HudOverlay(
                 gridMode = gridMode,
@@ -1267,12 +1348,13 @@ private fun ModeCarousel(
         ) { mode ->
             val isSelected = mode == highlighted
             val label = CameraModes.label(mode)
+            val highlight = CameraHighlight
             val pillColor by animateColorAsState(
-                if (isSelected) Color.White else Color.White.copy(alpha = 0f),
+                if (isSelected) highlight else highlight.copy(alpha = 0f),
                 tween(200), label = "modePill"
             )
             val labelColor by animateColorAsState(
-                if (isSelected) Color.Black else Color.White,
+                if (isSelected) OnCameraHighlight else Color.White,
                 tween(200), label = "modeLabel"
             )
 
@@ -1282,15 +1364,16 @@ private fun ModeCarousel(
                     .clip(CircleShape)
                     .background(pillColor)
                     .clickable(enabled = enabled) { onModeSelected(mode) }
-                    .padding(horizontal = 16.dp, vertical = 8.dp),
+                    .padding(horizontal = 18.dp, vertical = 7.dp),
                 contentAlignment = Alignment.Center
             ) {
                 Text(
                     text = label,
                     color = labelColor,
-                    style = MaterialTheme.typography.labelLarge.copy(
-                        fontWeight = FontWeight.Medium
-                    )
+                    style = MaterialTheme.typography.titleMedium.copy(
+                        fontWeight = FontWeight.Normal
+                    ),
+                    maxLines = 1,
                 )
             }
         }
@@ -1305,29 +1388,37 @@ fun PhotoVideoToggle(
     modifier: Modifier = Modifier
 ) {
     val darkGray = com.fearmikey.camera.ui.camera.ControlBackground
-    val segmentWidth = 52.dp
-    // The highlight slides between the two segments instead of jumping.
+    val segmentWidth = 44.dp
+    val segmentHeight = 40.dp
+    // The accent highlight slides between the two segments instead of jumping.
     val indicatorOffset by animateDpAsState(
         if (currentType == CaptureType.PHOTO) 0.dp else segmentWidth,
         spring(dampingRatio = Spring.DampingRatioNoBouncy, stiffness = Spring.StiffnessMediumLow),
         label = "captureTypeIndicator"
+    )
+    val selectedTint = com.fearmikey.camera.ui.camera.OnCameraAccent
+    val photoTint by animateColorAsState(
+        if (currentType == CaptureType.PHOTO) selectedTint else Color.White, tween(200), label = "photoTint"
+    )
+    val videoTint by animateColorAsState(
+        if (currentType == CaptureType.VIDEO) selectedTint else Color.White, tween(200), label = "videoTint"
     )
     Surface(
         color = darkGray,
         shape = CircleShape,
         modifier = modifier
     ) {
-        Box(modifier = Modifier.padding(2.dp)) {
+        Box(modifier = Modifier.padding(4.dp)) {
         Box(
             Modifier
                 .offset { androidx.compose.ui.unit.IntOffset(indicatorOffset.roundToPx(), 0) }
-                .size(segmentWidth, 38.dp)
-                .background(Color.White.copy(alpha = 0.2f), CircleShape)
+                .size(segmentWidth, segmentHeight)
+                .background(CameraAccent, CircleShape)
         )
         Row(verticalAlignment = Alignment.CenterVertically) {
             Box(
                 modifier = Modifier
-                    .size(segmentWidth, 38.dp)
+                    .size(segmentWidth, segmentHeight)
                     .clip(CircleShape)
                     .clickable { onTypeSelected(CaptureType.PHOTO) },
                 contentAlignment = Alignment.Center
@@ -1335,13 +1426,13 @@ fun PhotoVideoToggle(
                 Icon(
                     Icons.Default.CameraAlt,
                     contentDescription = "Photo",
-                    tint = Color.White,
-                    modifier = Modifier.size(20.dp)
+                    tint = photoTint,
+                    modifier = Modifier.size(22.dp)
                 )
             }
             Box(
                 modifier = Modifier
-                    .size(segmentWidth, 38.dp)
+                    .size(segmentWidth, segmentHeight)
                     .clip(CircleShape)
                     .clickable { onTypeSelected(CaptureType.VIDEO) },
                 contentAlignment = Alignment.Center
@@ -1349,8 +1440,8 @@ fun PhotoVideoToggle(
                 Icon(
                     Icons.Default.Videocam,
                     contentDescription = "Video",
-                    tint = Color.White,
-                    modifier = Modifier.size(20.dp)
+                    tint = videoTint,
+                    modifier = Modifier.size(22.dp)
                 )
             }
         }
@@ -1397,14 +1488,14 @@ fun ZoomSwitcher(
                     Modifier
                         .offset { androidx.compose.ui.unit.IntOffset(highlightX.roundToPx(), 0) }
                         .size(pillSize)
-                        .background(Color.White, CircleShape)
+                        .background(CameraHighlight, CircleShape)
                 )
             }
             Row(verticalAlignment = Alignment.CenterVertically) {
                 zoomPresets.forEach { zoom ->
                     val isSelected = zoom == highlighted
                     val labelColor by animateColorAsState(
-                        if (isSelected) Color.Black else Color.White, tween(160), label = "zoomLabel"
+                        if (isSelected) OnCameraHighlight else Color.White, tween(160), label = "zoomLabel"
                     )
                     // Visual text size only; must not shadow the ratio->label [labelScale] parameter.
                     val textScale by animateFloatAsState(
@@ -1423,11 +1514,13 @@ fun ZoomSwitcher(
                             },
                         contentAlignment = Alignment.Center
                     ) {
+                        // Only the highlighted preset carries the "x" ("1x", then "2", "5").
+                        val label = formatZoom((if (isSelected) currentZoom else zoom) * labelScale)
                         Text(
-                            text = formatZoom((if (isSelected) currentZoom else zoom) * labelScale),
+                            text = if (isSelected) label else label.removeSuffix("x"),
                             color = labelColor,
-                            style = MaterialTheme.typography.labelSmall.copy(fontSize = 12.sp),
-                            fontWeight = FontWeight.Bold,
+                            style = MaterialTheme.typography.labelLarge.copy(fontSize = 14.sp),
+                            fontWeight = FontWeight.Medium,
                             maxLines = 1,
                             modifier = Modifier.graphicsLayer {
                                 scaleX = textScale
@@ -1468,6 +1561,8 @@ fun ViewfinderZoomControls(
     onPortraitApertureChange: (Float) -> Unit = {},
     /** CameraUiState.zoomLabelScale. */
     zoomLabelScale: Float = 1f,
+    /** Shown instead of the zoom row (the open manual-controls dial). */
+    overrideContent: (@Composable () -> Unit)? = null,
 ) {
     val alpha by animateFloatAsState(if (visible) 1f else 0f, label = "zoomChrome")
     Column(
@@ -1485,19 +1580,23 @@ fun ViewfinderZoomControls(
             }
             .graphicsLayer { this.alpha = alpha }
     ) {
-        if (portraitAperture != null) {
-            com.fearmikey.camera.ui.camera.PortraitApertureControl(
-                aperture = portraitAperture,
-                onApertureChange = { if (visible) onPortraitApertureChange(it) },
+        if (overrideContent != null) {
+            overrideContent()
+        } else {
+            if (portraitAperture != null) {
+                com.fearmikey.camera.ui.camera.PortraitApertureControl(
+                    aperture = portraitAperture,
+                    onApertureChange = { if (visible) onPortraitApertureChange(it) },
+                )
+            }
+            ZoomSwitcher(
+                currentZoom = zoomLevel(),
+                zoomPresets = zoomPresets,
+                onZoomSelected = { if (visible) onZoomChanged(it) },
+                targetZoom = zoomTarget(),
+                labelScale = zoomLabelScale,
             )
         }
-        ZoomSwitcher(
-            currentZoom = zoomLevel(),
-            zoomPresets = zoomPresets,
-            onZoomSelected = { if (visible) onZoomChanged(it) },
-            targetZoom = zoomTarget(),
-            labelScale = zoomLabelScale,
-        )
     }
 }
 
@@ -1536,6 +1635,11 @@ fun CameraControls(
     onSettingsClick: () -> Unit,
     onProControlsClick: () -> Unit = {},
     isProMode: Boolean = false,
+    /** Manual-controls tool row, shown instead of the mode row and bottom buttons while [isProMode]. */
+    proToolBar: (@Composable () -> Unit)? = null,
+    /** Slow motion's current speed ("1/4x"): a speed pill replaces the Tune button. */
+    speedLabel: String? = null,
+    onSpeedClick: () -> Unit = {},
 ) {
     val currentModes = if (captureType == CaptureType.PHOTO) CameraModes.photo else CameraModes.video
     val darkGray = com.fearmikey.camera.ui.camera.ControlBackground
@@ -1567,7 +1671,7 @@ fun CameraControls(
                 modifier = Modifier
                     .size(56.dp)
                     .then(chromeFade)
-                    .clip(androidx.compose.foundation.shape.RoundedCornerShape(12.dp))
+                    .clip(ControlSquareShape)
                     .background(darkGray)
                     .clickable(enabled = idle) { 
                         if (isRecording) {
@@ -1612,6 +1716,8 @@ fun CameraControls(
                 com.fearmikey.camera.ui.camera.ShutterButton(
                     style = when {
                         isPanorama -> com.fearmikey.camera.ui.camera.ShutterStyle.PANORAMA
+                        currentMode == CameraMode.SLOW_MO -> com.fearmikey.camera.ui.camera.ShutterStyle.SLOW_MOTION
+                        currentMode == CameraMode.TIME_LAPSE -> com.fearmikey.camera.ui.camera.ShutterStyle.TIME_LAPSE
                         CameraModes.isVideo(currentMode) -> com.fearmikey.camera.ui.camera.ShutterStyle.VIDEO
                         else -> com.fearmikey.camera.ui.camera.ShutterStyle.PHOTO
                     },
@@ -1646,7 +1752,7 @@ fun CameraControls(
                 modifier = Modifier
                     .size(56.dp)
                     .graphicsLayer { alpha = if (snapshotHidden) 0f else chromeAlpha }
-                    .clip(CircleShape)
+                    .clip(ControlSquareShape)
                     .background(darkGray)
                     .clickable(enabled = idle && !snapshotHidden) { if (isRecording) onVideoSnapshot() else onFlipCamera() },
                 contentAlignment = Alignment.Center
@@ -1675,7 +1781,15 @@ fun CameraControls(
             }
         }
 
-        // Modes below shutter
+        // Below the shutter: the mode row and bottom buttons, or the manual-controls tool row.
+        AnimatedContent(
+            targetState = isProMode && proToolBar != null,
+            transitionSpec = { fadeIn(tween(220, delayMillis = 60)) togetherWith fadeOut(tween(160)) },
+            label = "bottomChrome",
+        ) { showTools ->
+        if (showTools) {
+            Box(Modifier.fillMaxWidth().then(chromeFade)) { proToolBar?.invoke() }
+        } else Column(horizontalAlignment = Alignment.CenterHorizontally) {
         CameraModeSelector(
             modes = currentModes,
             currentMode = currentMode,
@@ -1698,7 +1812,7 @@ fun CameraControls(
                 contentDescription = "Settings",
                 rotation = orientation,
                 onClick = { if (canSwitch) onSettingsClick() },
-                modifier = Modifier.alpha(if (isRecording) 0.38f else 1f),
+                modifier = Modifier.size(48.dp).alpha(if (isRecording) 0.38f else 1f),
             )
 
             PhotoVideoToggle(
@@ -1707,6 +1821,13 @@ fun CameraControls(
                 modifier = Modifier.alpha(if (isRecording) 0.38f else 1f),
             )
 
+            if (speedLabel != null) {
+                SpeedPillButton(
+                    label = speedLabel,
+                    orientation = orientation,
+                    onClick = { if (idle) onSpeedClick() },
+                )
+            } else
             // Dimmed (still tappable, the ViewModel explains why) where manual controls are ignored.
             com.fearmikey.camera.ui.camera.RotatingIconButton(
                 icon = Icons.Default.Tune,
@@ -1715,8 +1836,34 @@ fun CameraControls(
                 onClick = { if (idle) onProControlsClick() },
                 tint = if (isProMode) com.fearmikey.camera.ui.camera.OnCameraAccent else Color.White,
                 background = if (isProMode) CameraAccent else darkGray,
-                modifier = Modifier.alpha(if (manualControlsAvailable || isProMode) 1f else 0.38f),
+                modifier = Modifier.size(48.dp).alpha(if (manualControlsAvailable || isProMode) 1f else 0.38f),
             )
         }
+        }
+        }
+    }
+}
+
+/** Slow motion's bottom-right button: current speed with the slow-motion glyph (opens the Speed tool). */
+@Composable
+private fun SpeedPillButton(label: String, orientation: Int, onClick: () -> Unit) {
+    Row(
+        modifier = Modifier
+            .height(48.dp)
+            .clip(CircleShape)
+            .background(com.fearmikey.camera.ui.camera.ControlBackground)
+            .semantics { contentDescription = "Slow motion speed $label"; role = Role.Button }
+            .clickable(onClick = onClick)
+            .padding(horizontal = 14.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        RotatableIcon(
+            imageVector = androidx.compose.material.icons.Icons.Default.SlowMotionVideo,
+            contentDescription = null,
+            targetRotation = orientation,
+            modifier = Modifier.size(24.dp),
+        )
+        Spacer(Modifier.width(6.dp))
+        Text(label, color = Color.White, style = MaterialTheme.typography.titleMedium)
     }
 }

@@ -1,6 +1,10 @@
 package com.fearmikey.camera.ui.settings
 
+import androidx.compose.animation.animateColorAsState
+import androidx.compose.animation.core.animateDpAsState
+import androidx.compose.animation.core.tween
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.rememberScrollState
@@ -15,13 +19,23 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.semantics.Role
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.role
+import androidx.compose.ui.semantics.selected
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.tooling.preview.Preview
+import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.fearmikey.camera.domain.model.*
+import com.fearmikey.camera.ui.camera.TextBadge
+import com.fearmikey.camera.ui.theme.ViewfinderTheme
 
-import com.fearmikey.camera.ui.theme.CameraAppTheme
+/** Translucent near-black sheet: the viewfinder stays faintly visible behind it. */
+private val SheetColor = Color(0xFF0B0B0C).copy(alpha = 0.92f)
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -46,12 +60,15 @@ fun SettingsSheet(
     onLocationTaggingToggle: () -> Unit,
     onFullSettingsClick: () -> Unit
 ) {
-    // The sheet follows the system light/dark theme (the viewfinder behind it stays dark).
-    CameraAppTheme {
+    // Always dark, like the rest of the camera screen (accent still follows Material You).
+    ViewfinderTheme {
     ModalBottomSheet(
         onDismissRequest = onDismiss,
-        containerColor = MaterialTheme.colorScheme.surfaceContainerLow,
-        contentColor = MaterialTheme.colorScheme.onSurface,
+        containerColor = SheetColor,
+        contentColor = Color.White,
+        scrimColor = Color.Black.copy(alpha = 0.25f),
+        tonalElevation = 0.dp,
+        dragHandle = { BottomSheetDefaults.DragHandle(color = Color.White.copy(alpha = 0.45f)) },
     ) {
         SettingsSheetContent(
             userPreferences, modeCaps,
@@ -90,8 +107,8 @@ fun SettingsSheetContent(
         modifier = Modifier
             .fillMaxWidth()
             .verticalScroll(rememberScrollState())
-            .padding(horizontal = 24.dp)
-            .padding(bottom = 32.dp)
+            .padding(horizontal = 16.dp)
+            .padding(top = 8.dp, bottom = 32.dp)
     ) {
         Row(
             modifier = Modifier.fillMaxWidth(),
@@ -100,18 +117,56 @@ fun SettingsSheetContent(
         ) {
             Text(
                 "${CameraModes.label(modeCaps.mode)} settings",
-                style = MaterialTheme.typography.headlineSmall,
-                fontWeight = FontWeight.Medium
+                style = MaterialTheme.typography.headlineMedium,
+                fontWeight = FontWeight.Normal,
+                modifier = Modifier.weight(1f, fill = false),
             )
-            IconButton(
-                onClick = onFullSettingsClick,
-                modifier = Modifier.background(MaterialTheme.colorScheme.surfaceContainerHighest, CircleShape)
+            Box(
+                modifier = Modifier
+                    .padding(start = 12.dp)
+                    .size(width = 52.dp, height = 40.dp)
+                    .clip(CircleShape)
+                    .border(1.dp, Color.White.copy(alpha = 0.7f), CircleShape)
+                    .semantics { contentDescription = "All settings"; role = Role.Button }
+                    .clickable(onClick = onFullSettingsClick),
+                contentAlignment = Alignment.Center
             ) {
-                Icon(Icons.Default.Settings, contentDescription = "All settings")
+                Icon(Icons.Default.MoreHoriz, contentDescription = null, modifier = Modifier.size(22.dp))
             }
         }
 
-        Spacer(modifier = Modifier.height(16.dp))
+        // Slow motion / Time lapse have only a few settings: one page, no tabs.
+        val singlePage = modeCaps.isVideo && !modeCaps.showsVideoQualitySettings
+        if (singlePage) {
+            Spacer(modifier = Modifier.height(24.dp))
+            Column(verticalArrangement = Arrangement.spacedBy(RowGap)) {
+                VideoSettings(
+                    userPreferences = userPreferences,
+                    modeCaps = modeCaps,
+                    onLightModeChange = onLightModeChange,
+                    onVideoResolutionChange = onVideoResolutionChange,
+                    onVideoStabilizationToggle = onVideoStabilizationToggle,
+                    onVideoFrameRateChange = onVideoFrameRateChange,
+                )
+                MoreSettings(
+                    userPreferences = userPreferences,
+                    modeCaps = modeCaps,
+                    onResolutionChange = onResolutionChange,
+                    onSaveModeChange = onSaveModeChange,
+                    onHdrToggle = onHdrToggle,
+                    onRecordAudioToggle = onRecordAudioToggle,
+                    onGridModeChange = onGridModeChange,
+                    onLevelerToggle = onLevelerToggle,
+                    onLocationTaggingToggle = onLocationTaggingToggle,
+                )
+                Text(
+                    "${CameraModes.label(modeCaps.mode)} records without sound.",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = Color.White.copy(alpha = 0.6f),
+                )
+            }
+        } else {
+        Spacer(modifier = Modifier.height(20.dp))
         TabSwitcher(selectedTab, listOf("General", "More")) { selectedTab = it }
         Spacer(modifier = Modifier.height(24.dp))
 
@@ -144,34 +199,39 @@ fun SettingsSheetContent(
                 onMacroFocusChange = onMacroFocusChange,
             )
         }
+        }
     }
 }
 
+/** Two side-by-side tabs: the selected one is an accent pill, the other a dark rounded box. */
 @Composable
 private fun TabSwitcher(selected: Int, labels: List<String>, onSelect: (Int) -> Unit) {
     Row(
-        modifier = Modifier
-            .fillMaxWidth()
-            .height(48.dp)
-            .clip(RoundedCornerShape(24.dp))
-            .background(MaterialTheme.colorScheme.surfaceContainerHighest)
-            .padding(4.dp)
+        modifier = Modifier.fillMaxWidth(),
+        horizontalArrangement = Arrangement.spacedBy(4.dp)
     ) {
         labels.forEachIndexed { i, label ->
+            val isSelected = selected == i
+            val corner by animateDpAsState(if (isSelected) 20.dp else 12.dp, tween(200), label = "tabCorner")
+            val container by animateColorAsState(
+                if (isSelected) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.surfaceContainerHigh,
+                tween(200), label = "tabBg"
+            )
+            val content by animateColorAsState(
+                if (isSelected) MaterialTheme.colorScheme.onPrimary else Color.White,
+                tween(200), label = "tabFg"
+            )
             Box(
                 modifier = Modifier
                     .weight(1f)
-                    .fillMaxHeight()
-                    .clip(RoundedCornerShape(20.dp))
-                    .background(if (selected == i) MaterialTheme.colorScheme.primary else Color.Transparent)
+                    .height(40.dp)
+                    .clip(RoundedCornerShape(corner))
+                    .background(container)
+                    .semantics { this.selected = isSelected; role = Role.Tab }
                     .clickable { onSelect(i) },
                 contentAlignment = Alignment.Center
             ) {
-                Text(
-                    label,
-                    color = if (selected == i) MaterialTheme.colorScheme.onPrimary else MaterialTheme.colorScheme.onSurface,
-                    fontWeight = FontWeight.Medium
-                )
+                Text(label, color = content, style = MaterialTheme.typography.bodyLarge)
             }
         }
     }
@@ -186,72 +246,79 @@ fun PhotoSettings(
     onLightModeChange: (LightMode) -> Unit,
     onMacroFocusChange: (MacroMode) -> Unit,
 ) {
-    Column(verticalArrangement = Arrangement.spacedBy(16.dp)) {
+    Column(verticalArrangement = Arrangement.spacedBy(RowGap)) {
         val lightMode = modeCaps.effectiveLightMode
         if (lightMode != null) {
             SettingRowWithIcons(
                 label = "Flash",
-                subLabel = when (lightMode) {
-                    LightMode.AUTO_NIGHT_SIGHT -> "Auto Night: no flash, Night shot when dark"
-                    else -> lightMode.label
-                },
+                value = lightMode.label,
+                caption = if (lightMode == LightMode.AUTO_NIGHT_SIGHT) "No flash, Night shot when it's dark" else null,
                 currentValue = lightMode,
                 options = modeCaps.lightModes,
                 onOptionSelected = onLightModeChange,
-                iconProvider = { mode, tint ->
+                optionDescription = { it.label },
+                iconProvider = { mode, tint, _ ->
                     val icon = when (mode) {
                         LightMode.NONE -> Icons.Default.FlashOff
                         LightMode.AUTO_NIGHT_SIGHT -> Icons.Default.NightsStay
                         LightMode.AUTO_FLASH -> Icons.Default.FlashAuto
                         LightMode.FLASH -> Icons.Default.FlashOn
                     }
-                    Icon(icon, mode.label, tint = tint, modifier = Modifier.size(20.dp))
+                    OptionIcon(icon, tint)
                 }
             )
         }
         if (modeCaps.supportsTimer) {
             SettingRowWithIcons(
                 label = "Timer",
+                value = if (userPreferences.timer == TimerMode.OFF) "Off" else "${userPreferences.timer.seconds} seconds",
                 currentValue = userPreferences.timer,
                 options = TimerMode.selectable,
                 onOptionSelected = onTimerChange,
-                iconProvider = { mode, tint ->
+                optionDescription = { if (it == TimerMode.OFF) "Timer off" else "${it.seconds} second timer" },
+                iconProvider = { mode, tint, _ ->
                     when (mode) {
-                        TimerMode.OFF -> Icon(Icons.Default.TimerOff, "Timer off", tint = tint, modifier = Modifier.size(20.dp))
-                        else -> Text("${mode.seconds}", color = tint, fontWeight = FontWeight.Bold, fontSize = 14.sp)
+                        TimerMode.OFF -> OptionIcon(Icons.Default.TimerOff, tint)
+                        TimerMode.SEC_3 -> OptionIcon(Icons.Default.Timer3, tint)
+                        TimerMode.SEC_10 -> OptionIcon(Icons.Default.Timer10, tint)
+                        else -> Text("${mode.seconds}", color = tint, fontWeight = FontWeight.Bold, fontSize = 15.sp)
                     }
+                }
+            )
+        }
+        if (modeCaps.showsMacro) {
+            SettingRowWithIcons(
+                label = "Macro focus",
+                value = if (userPreferences.macroFocus == MacroMode.ON) "On" else "Off",
+                caption = if (userPreferences.macroFocus == MacroMode.ON) "Focuses very close" else null,
+                currentValue = userPreferences.macroFocus,
+                options = MacroMode.entries,
+                onOptionSelected = onMacroFocusChange,
+                optionDescription = { if (it == MacroMode.ON) "Macro on" else "Macro off" },
+                iconProvider = { mode, tint, _ ->
+                    OptionIcon(if (mode == MacroMode.ON) Icons.Default.LocalFlorist else Icons.Default.Block, tint)
                 }
             )
         }
         SettingRowWithIcons(
             label = "Ratio",
+            value = when (userPreferences.aspectRatio) {
+                AspectRatio.RATIO_4_3 -> "Full image (4:3)"
+                AspectRatio.RATIO_16_9 -> "Wide (16:9)"
+                AspectRatio.RATIO_FULL -> "Full screen"
+            },
             currentValue = userPreferences.aspectRatio,
             options = AspectRatio.entries,
             onOptionSelected = onAspectRatioChange,
-            iconProvider = { ratio, tint ->
+            optionDescription = { if (it == AspectRatio.RATIO_FULL) "Full screen" else it.value },
+            iconProvider = { ratio, tint, _ ->
                 when (ratio) {
-                    AspectRatio.RATIO_4_3 -> Text("4:3", color = tint, fontWeight = FontWeight.Bold, fontSize = 12.sp)
-                    AspectRatio.RATIO_16_9 -> Text("16:9", color = tint, fontWeight = FontWeight.Bold, fontSize = 12.sp)
-                    AspectRatio.RATIO_FULL -> Icon(Icons.Default.CropFree, "Full screen", tint = tint, modifier = Modifier.size(20.dp))
+                    AspectRatio.RATIO_4_3 -> RatioGlyph(16.dp, 21.dp, tint)
+                    AspectRatio.RATIO_16_9 -> RatioGlyph(12.dp, 21.dp, tint)
+                    AspectRatio.RATIO_FULL -> OptionIcon(Icons.Default.CropFree, tint)
                 }
             }
         )
-        if (modeCaps.showsMacro) {
-            SettingRowWithIcons(
-                label = "Macro focus",
-                subLabel = if (userPreferences.macroFocus == MacroMode.ON) "On: focuses very close" else "Off",
-                currentValue = userPreferences.macroFocus,
-                options = MacroMode.entries,
-                onOptionSelected = onMacroFocusChange,
-                iconProvider = { mode, tint ->
-                    if (mode == MacroMode.ON) {
-                        Icon(Icons.Default.LocalFlorist, "Macro on", tint = tint, modifier = Modifier.size(20.dp))
-                    } else {
-                        Icon(Icons.Default.Block, "Macro off", tint = tint, modifier = Modifier.size(20.dp))
-                    }
-                }
-            )
-        }
     }
 }
 
@@ -264,50 +331,51 @@ fun VideoSettings(
     onVideoStabilizationToggle: () -> Unit,
     onVideoFrameRateChange: (VideoFrameRate) -> Unit,
 ) {
-    Column(verticalArrangement = Arrangement.spacedBy(16.dp)) {
+    Column(verticalArrangement = Arrangement.spacedBy(RowGap)) {
+        if (modeCaps.effectiveLightMode != null) {
+            val torchOn = modeCaps.effectiveLightMode == LightMode.FLASH
+            ToggleIconRow(
+                label = "Flash",
+                checked = torchOn,
+                offIcon = Icons.Default.FlashOff,
+                onIcon = Icons.Default.FlashOn,
+                onCheckedChange = { on -> onLightModeChange(if (on) LightMode.FLASH else LightMode.NONE) },
+            )
+        }
         if (modeCaps.showsVideoQualitySettings) {
             SettingRowWithIcons(
                 label = "Resolution",
-                subLabel = userPreferences.videoResolution.value,
+                value = if (userPreferences.videoResolution == VideoResolution.RES_4K) "4K (Ultra HD)" else "1080p (Full HD)",
                 currentValue = userPreferences.videoResolution,
                 options = VideoResolution.entries,
                 onOptionSelected = onVideoResolutionChange,
-                iconProvider = { res, tint ->
-                    Text(if (res == VideoResolution.RES_4K) "4K" else "HD", color = tint, fontWeight = FontWeight.Bold, fontSize = 12.sp)
+                optionDescription = { it.value },
+                iconProvider = { res, tint, container ->
+                    TextBadge(listOf(if (res == VideoResolution.RES_4K) "4K" else "FHD"), color = tint, contentColor = container)
                 }
             )
-        }
-        if (modeCaps.effectiveLightMode != null) {
-            val torchOn = modeCaps.effectiveLightMode == LightMode.FLASH
-            SettingRowWithIcons(
-                label = "Torch",
-                subLabel = if (torchOn) "On" else "Off",
-                currentValue = torchOn,
-                options = listOf(false, true),
-                onOptionSelected = { on -> onLightModeChange(if (on) LightMode.FLASH else LightMode.NONE) },
-                iconProvider = { on, tint ->
-                    Icon(if (on) Icons.Default.FlashOn else Icons.Default.FlashOff, if (on) "Torch on" else "Torch off", tint = tint, modifier = Modifier.size(20.dp))
-                }
-            )
-        }
-        if (modeCaps.showsVideoQualitySettings) {
             SettingRowWithIcons(
                 label = "Frame rate",
-                subLabel = userPreferences.videoFrameRate.label + if (userPreferences.videoFrameRate != VideoFrameRate.AUTO) " (if supported)" else "",
+                value = userPreferences.videoFrameRate.fps?.toString() ?: "Auto",
+                caption = if (userPreferences.videoFrameRate != VideoFrameRate.AUTO) "When the camera supports it" else null,
                 currentValue = userPreferences.videoFrameRate,
                 options = VideoFrameRate.entries,
                 onOptionSelected = onVideoFrameRateChange,
-                iconProvider = { rate, tint ->
-                    Text(rate.fps?.toString() ?: "A", color = tint, fontWeight = FontWeight.Bold, fontSize = 12.sp)
+                optionDescription = { it.label },
+                iconProvider = { rate, tint, _ ->
+                    if (rate.fps == null) {
+                        OptionIcon(Icons.Default.HdrAuto, tint)
+                    } else {
+                        Text(rate.fps.toString(), color = tint, fontWeight = FontWeight.Black, fontSize = 15.sp)
+                    }
                 }
             )
-            SettingsSwitchRow("Stabilization", userPreferences.videoStabilization, onToggle = onVideoStabilizationToggle)
-        } else {
-            Text(
-                "${CameraModes.label(modeCaps.mode)} records without sound at up to 1080p. Resolution, " +
-                    "frame rate, stabilization and audio settings apply to Video mode.",
-                style = MaterialTheme.typography.bodyMedium,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            ToggleIconRow(
+                label = "Stabilization",
+                checked = userPreferences.videoStabilization,
+                offIcon = Icons.Default.Block,
+                onIcon = Icons.Default.VideoStable,
+                onCheckedChange = { onVideoStabilizationToggle() },
             )
         }
     }
@@ -325,148 +393,206 @@ fun MoreSettings(
     onLevelerToggle: () -> Unit,
     onLocationTaggingToggle: () -> Unit,
 ) {
-    Column(verticalArrangement = Arrangement.spacedBy(16.dp)) {
+    Column(verticalArrangement = Arrangement.spacedBy(RowGap)) {
         if (modeCaps.showsVideoQualitySettings) {
-            SettingsSwitchRow("Record audio", userPreferences.recordAudio) { onRecordAudioToggle(!userPreferences.recordAudio) }
+            ToggleIconRow(
+                label = "Record audio",
+                checked = userPreferences.recordAudio,
+                offIcon = Icons.Default.MicOff,
+                onIcon = Icons.Default.Mic,
+                onCheckedChange = onRecordAudioToggle,
+            )
         }
         if (modeCaps.showsPhotoOutputSettings) {
-            SettingsSwitchRow(
-                "HDR",
-                userPreferences.hdrPhoto,
-                subtitle = when {
+            SettingRowWithIcons(
+                label = "Resolution",
+                // Same badges as the top-bar chip.
+                value = if (userPreferences.resolution == ResolutionMode.MP_12) "12MP" else "Full resolution",
+                currentValue = userPreferences.resolution,
+                options = ResolutionMode.entries,
+                onOptionSelected = onResolutionChange,
+                optionDescription = { it.label },
+                iconProvider = { res, tint, container ->
+                    TextBadge(
+                        if (res == ResolutionMode.MP_12) listOf("12", "MP") else listOf("MAX"),
+                        color = tint, contentColor = container,
+                    )
+                }
+            )
+            SettingRowWithIcons(
+                label = "File format",
+                value = if (userPreferences.saveMode == ImageSaveMode.JPEG) "JPEG only" else "RAW + JPEG",
+                currentValue = userPreferences.saveMode,
+                options = ImageSaveMode.entries,
+                onOptionSelected = onSaveModeChange,
+                optionDescription = { it.label },
+                iconProvider = { mode, tint, container ->
+                    TextBadge(listOf(if (mode == ImageSaveMode.JPEG) "JPG" else "RAW"), color = tint, contentColor = container)
+                }
+            )
+            ToggleIconRow(
+                label = "HDR",
+                checked = userPreferences.hdrPhoto,
+                offIcon = Icons.Default.HdrOff,
+                onIcon = Icons.Default.HdrOn,
+                caption = when {
                     !userPreferences.hdrPhoto -> null
                     userPreferences.saveMode == ImageSaveMode.RAW_JPEG -> "Not used with RAW + JPEG"
                     modeCaps.hdrPausedByFlash -> "Not used while the flash is on"
                     else -> null
                 },
-            ) { onHdrToggle(!userPreferences.hdrPhoto) }
-            SettingRowWithIcons(
-                label = "Resolution",
-                currentValue = userPreferences.resolution,
-                options = ResolutionMode.entries,
-                onOptionSelected = onResolutionChange,
-                iconProvider = { res, tint ->
-                    // Same labels as the top-bar chip.
-                    Text(if (res == ResolutionMode.MP_12) "12MP" else "MAX", color = tint, fontWeight = FontWeight.Bold, fontSize = 10.sp)
-                }
-            )
-            SettingRowWithIcons(
-                label = "File format",
-                currentValue = userPreferences.saveMode,
-                options = ImageSaveMode.entries,
-                onOptionSelected = onSaveModeChange,
-                iconProvider = { mode, tint ->
-                    Text(if (mode == ImageSaveMode.JPEG) "JPG" else "RAW", color = tint, fontWeight = FontWeight.Bold, fontSize = 10.sp)
-                }
+                onCheckedChange = onHdrToggle,
             )
         }
         SettingRowWithIcons(
             label = "Grid",
-            subLabel = userPreferences.gridMode.label,
+            value = userPreferences.gridMode.label,
             currentValue = userPreferences.gridMode,
             options = GridMode.entries,
             onOptionSelected = onGridModeChange,
-            iconProvider = { mode, tint ->
+            optionDescription = { it.label },
+            iconProvider = { mode, tint, _ ->
                 when (mode) {
-                    GridMode.OFF -> Icon(Icons.Default.GridOff, mode.label, tint = tint, modifier = Modifier.size(20.dp))
-                    GridMode.GRID_3X3 -> Icon(Icons.Default.Grid3x3, mode.label, tint = tint, modifier = Modifier.size(20.dp))
-                    GridMode.GRID_4X4 -> Icon(Icons.Default.Grid4x4, mode.label, tint = tint, modifier = Modifier.size(20.dp))
-                    GridMode.GOLDEN_RATIO -> Text("φ", color = tint, fontWeight = FontWeight.Bold, fontSize = 16.sp)
+                    GridMode.OFF -> OptionIcon(Icons.Default.GridOff, tint)
+                    GridMode.GRID_3X3 -> OptionIcon(Icons.Default.Grid3x3, tint)
+                    GridMode.GRID_4X4 -> OptionIcon(Icons.Default.Grid4x4, tint)
+                    GridMode.GOLDEN_RATIO -> Text("φ", color = tint, fontWeight = FontWeight.Bold, fontSize = 18.sp)
                 }
             }
         )
-        SettingsSwitchRow(
-            "Framing hints",
-            userPreferences.showLeveler,
-            subtitle = "Level in landscape and when shooting straight down",
-            onToggle = onLevelerToggle,
+        ToggleIconRow(
+            label = "Framing hints",
+            checked = userPreferences.showLeveler,
+            offIcon = Icons.Default.Block,
+            onIcon = Icons.Default.Straighten,
+            caption = "Level in landscape and when shooting straight down",
+            onCheckedChange = { onLevelerToggle() },
         )
-        SettingsSwitchRow("Save location", userPreferences.locationTagging, onToggle = onLocationTaggingToggle)
+        ToggleIconRow(
+            label = "Save location",
+            checked = userPreferences.locationTagging,
+            offIcon = Icons.Default.LocationOff,
+            onIcon = Icons.Default.LocationOn,
+            onCheckedChange = { onLocationTaggingToggle() },
+        )
     }
 }
 
+private val RowGap = 14.dp
+private val OptionSize = 40.dp
+
+/**
+ * One setting: a small label with the current value in large accent text on the left, and
+ * one button per option on the right (dark rounded squares; the selected one is an accent
+ * circle). [iconProvider] draws an option's glyph given (option, content color, container color).
+ */
 @Composable
 fun <T> SettingRowWithIcons(
     label: String,
-    subLabel: String? = null,
+    value: String,
     currentValue: T,
     options: List<T>,
     onOptionSelected: (T) -> Unit,
-    iconProvider: @Composable (T, Color) -> Unit
+    optionDescription: (T) -> String,
+    caption: String? = null,
+    iconProvider: @Composable (T, Color, Color) -> Unit,
 ) {
     Row(
-        modifier = Modifier.fillMaxWidth(),
+        modifier = Modifier.fillMaxWidth().heightIn(min = 52.dp),
         horizontalArrangement = Arrangement.SpaceBetween,
         verticalAlignment = Alignment.CenterVertically
     ) {
         Column(modifier = Modifier.weight(1f).padding(end = 12.dp)) {
-            Text(label, style = MaterialTheme.typography.bodyLarge, fontWeight = FontWeight.Medium)
-            val valueText = subLabel ?: when (currentValue) {
-                is Boolean -> if (currentValue) "On" else "Off"
-                is AspectRatio -> currentValue.value
-                is LightMode -> currentValue.label
-                is ResolutionMode -> currentValue.label
-                is ImageSaveMode -> currentValue.label
-                is GridMode -> currentValue.label
-                is TimerMode -> if (currentValue == TimerMode.OFF) "Off" else "${currentValue.seconds} seconds"
-                else -> currentValue.toString().lowercase().replaceFirstChar { it.uppercase() }
+            Text(label, style = MaterialTheme.typography.bodyMedium, color = Color.White)
+            Text(value, style = MaterialTheme.typography.titleLarge, color = MaterialTheme.colorScheme.primary)
+            caption?.let {
+                Text(it, style = MaterialTheme.typography.bodySmall, color = Color.White.copy(alpha = 0.6f))
             }
-            Text(valueText, style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
         }
-
-        Row(
-            modifier = Modifier
-                .clip(CircleShape)
-                .background(MaterialTheme.colorScheme.surfaceContainerHighest)
-                .padding(4.dp),
-            horizontalArrangement = Arrangement.spacedBy(4.dp)
-        ) {
+        Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
             options.forEach { option ->
-                val isSelected = option == currentValue
-                IconButton(
+                OptionButton(
+                    selected = option == currentValue,
+                    description = optionDescription(option),
                     onClick = { onOptionSelected(option) },
-                    modifier = Modifier
-                        .size(40.dp)
-                        .clip(CircleShape)
-                        .background(if (isSelected) MaterialTheme.colorScheme.primary else Color.Transparent)
-                ) {
-                    iconProvider(
-                        option,
-                        if (isSelected) MaterialTheme.colorScheme.onPrimary else MaterialTheme.colorScheme.onSurface
-                    )
-                }
+                ) { content, container -> iconProvider(option, content, container) }
             }
         }
+    }
+}
+
+/** Off/On setting drawn with two icon buttons. */
+@Composable
+private fun ToggleIconRow(
+    label: String,
+    checked: Boolean,
+    offIcon: ImageVector,
+    onIcon: ImageVector,
+    onCheckedChange: (Boolean) -> Unit,
+    caption: String? = null,
+) {
+    SettingRowWithIcons(
+        label = label,
+        value = if (checked) "On" else "Off",
+        caption = caption,
+        currentValue = checked,
+        options = listOf(false, true),
+        onOptionSelected = onCheckedChange,
+        optionDescription = { if (it) "$label on" else "$label off" },
+        iconProvider = { on, tint, _ -> OptionIcon(if (on) onIcon else offIcon, tint) },
+    )
+}
+
+@Composable
+private fun OptionButton(
+    selected: Boolean,
+    description: String,
+    onClick: () -> Unit,
+    content: @Composable (Color, Color) -> Unit,
+) {
+    val corner by animateDpAsState(if (selected) OptionSize / 2 else 12.dp, tween(200), label = "optionCorner")
+    val container by animateColorAsState(
+        if (selected) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.surfaceContainerHigh,
+        tween(200), label = "optionBg"
+    )
+    val tint by animateColorAsState(
+        if (selected) MaterialTheme.colorScheme.onPrimary else Color.White,
+        tween(200), label = "optionFg"
+    )
+    Box(
+        modifier = Modifier
+            .size(OptionSize)
+            .clip(RoundedCornerShape(corner))
+            .background(container)
+            .semantics {
+                contentDescription = description
+                role = Role.RadioButton
+                this.selected = selected
+            }
+            .clickable(onClick = onClick),
+        contentAlignment = Alignment.Center
+    ) {
+        content(tint, container)
     }
 }
 
 @Composable
-fun SettingsSwitchRow(label: String, checked: Boolean, subtitle: String? = null, onToggle: () -> Unit) {
-    Row(
-        modifier = Modifier
-            .fillMaxWidth()
-            .clickable { onToggle() }
-            .padding(vertical = 8.dp),
-        horizontalArrangement = Arrangement.SpaceBetween,
-        verticalAlignment = Alignment.CenterVertically
-    ) {
-        Column(modifier = Modifier.weight(1f).padding(end = 12.dp)) {
-            Text(label, style = MaterialTheme.typography.bodyLarge)
-            subtitle?.let {
-                Text(it, style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
-            }
-        }
-        Switch(checked = checked, onCheckedChange = { onToggle() })
-    }
+private fun OptionIcon(icon: ImageVector, tint: Color) {
+    Icon(icon, contentDescription = null, tint = tint, modifier = Modifier.size(22.dp))
 }
 
-@Preview(name = "Light", widthDp = 380, heightDp = 560)
-@Preview(name = "Dark", widthDp = 380, heightDp = 560, uiMode = android.content.res.Configuration.UI_MODE_NIGHT_YES)
+/** Outlined frame with the photo's shape (4:3 / 16:9 in portrait). */
+@Composable
+private fun RatioGlyph(width: Dp, height: Dp, tint: Color) {
+    Box(Modifier.size(width, height).border(2.dp, tint, RoundedCornerShape(3.dp)))
+}
+
+@Preview(widthDp = 412, heightDp = 620, showBackground = true, backgroundColor = 0xFF3A3A3A)
 @Composable
 private fun PhotoSettingsSheetPreview() {
-    CameraAppTheme {
-        Surface(color = MaterialTheme.colorScheme.surfaceContainerLow) {
-            val prefs = UserPreferences(timer = TimerMode.SEC_3)
+    ViewfinderTheme {
+        Surface(color = SheetColor, contentColor = Color.White) {
+            val prefs = UserPreferences(timer = TimerMode.SEC_3, lightMode = LightMode.AUTO_NIGHT_SIGHT)
             SettingsSheetContent(
                 prefs, ModeCapabilities.forMode(CameraMode.PHOTO, isFrontCamera = false, prefs),
                 {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}
@@ -475,13 +601,13 @@ private fun PhotoSettingsSheetPreview() {
     }
 }
 
-@Preview(widthDp = 380, heightDp = 560)
+@Preview(widthDp = 412, heightDp = 620, showBackground = true, backgroundColor = 0xFF3A3A3A)
 @Composable
 private fun MoreSettingsPreview() {
-    CameraAppTheme {
-        Surface(color = MaterialTheme.colorScheme.surfaceContainerLow) {
+    ViewfinderTheme {
+        Surface(color = SheetColor, contentColor = Color.White) {
             val prefs = UserPreferences(hdrPhoto = true, lightMode = LightMode.FLASH, gridMode = GridMode.GRID_3X3)
-            Box(Modifier.padding(24.dp)) {
+            Box(Modifier.padding(16.dp)) {
                 MoreSettings(
                     prefs, ModeCapabilities.forMode(CameraMode.PHOTO, isFrontCamera = false, prefs),
                     {}, {}, {}, {}, {}, {}, {},
@@ -491,11 +617,25 @@ private fun MoreSettingsPreview() {
     }
 }
 
-@Preview(widthDp = 380, heightDp = 420)
+@Preview(widthDp = 412, heightDp = 520, showBackground = true, backgroundColor = 0xFF3A3A3A)
+@Composable
+private fun SlowMotionSettingsSheetPreview() {
+    ViewfinderTheme {
+        Surface(color = SheetColor, contentColor = Color.White) {
+            val prefs = UserPreferences()
+            SettingsSheetContent(
+                prefs, ModeCapabilities.forMode(CameraMode.SLOW_MO, isFrontCamera = false, prefs),
+                {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}
+            )
+        }
+    }
+}
+
+@Preview(widthDp = 412, heightDp = 520, showBackground = true, backgroundColor = 0xFF3A3A3A)
 @Composable
 private fun VideoSettingsSheetPreview() {
-    CameraAppTheme {
-        Surface(color = MaterialTheme.colorScheme.surfaceContainerLow) {
+    ViewfinderTheme {
+        Surface(color = SheetColor, contentColor = Color.White) {
             val prefs = UserPreferences()
             SettingsSheetContent(
                 prefs, ModeCapabilities.forMode(CameraMode.VIDEO, isFrontCamera = false, prefs),

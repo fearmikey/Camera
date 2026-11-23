@@ -40,6 +40,8 @@ import com.fearmikey.camera.domain.model.CameraMode
 import com.fearmikey.camera.domain.model.CapturePipeline
 import com.fearmikey.camera.domain.model.FlashMode
 import com.fearmikey.camera.domain.model.FrameGeometry
+import com.fearmikey.camera.domain.model.HighSpeedConfig
+import com.fearmikey.camera.domain.model.SlowMotion
 import com.fearmikey.camera.domain.model.ImageSaveMode
 import com.fearmikey.camera.domain.model.LightMode
 import com.fearmikey.camera.domain.model.ModeCapabilities
@@ -93,10 +95,19 @@ class Camera2Provider(
         progressListener?.invoke(progress.coerceIn(0f, 1f))
     }
 
-    // Slow motion recording state
+    // Recording state (Slow motion, Time lapse). Only touched on the background thread: start,
+    // stop, pause and abort are all posted there, so a stop can't race a start that is still
+    // opening the camera.
     private var mediaRecorder: MediaRecorder? = null
     private var slowMoUri: Uri? = null
     private var slowMoPfd: ParcelFileDescriptor? = null
+    /** Surface over the UI's recording preview texture for the current recording. */
+    private var recordingPreviewSurface: Surface? = null
+    /** Bumped by every stop/abort; callbacks of an older start see a new value and back out. */
+    private var recordingToken = 0
+    @Volatile private var recordingPreview: RecordingPreviewTarget? = null
+    /** Slow-motion configurations per camera id (static characteristics). */
+    private val highSpeedConfigCache = java.util.concurrent.ConcurrentHashMap<String, List<HighSpeedConfig>>()
 
     private fun startBackgroundThread() {
         if (backgroundThread == null) {
@@ -1123,32 +1134,142 @@ class Camera2Provider(
 
     override fun startSlowMoVideo(onSuccess: () -> Unit, onError: (Exception) -> Unit) {
         startBackgroundThread()
-        if (currentMode == CameraMode.TIME_LAPSE) {
-            val id = findCameraId(currentCameraSelector) ?: run {
-                onError(IllegalStateException("No camera found"))
-                return
-            }
-            openCamera(id, { camera -> setupTimeLapseRecording(camera, onSuccess, onError) }, onError)
+        val handler = backgroundHandler ?: run {
+            onError(IllegalStateException("Camera thread not running"))
             return
         }
-        val cameraId = findHighSpeedCamera()
-        if (cameraId == null) {
-            onError(
-                IllegalStateException(
-                    if (isFrontCamera) "Slow motion isn't available on the front camera"
-                    else "This device does not support high-speed video"
+        val timeLapse = currentMode == CameraMode.TIME_LAPSE
+        handler.post {
+            val token = ++recordingToken
+            val cameraId = if (timeLapse) findCameraId(currentCameraSelector) else findHighSpeedCamera()
+            if (cameraId == null) {
+                onError(
+                    IllegalStateException(
+                        when {
+                            timeLapse -> "No camera found"
+                            isFrontCamera -> "Slow motion isn't available on the front camera"
+                            else -> "This device does not support high-speed video"
+                        }
+                    )
                 )
-            )
-            return
+                return@post
+            }
+            openCamera(cameraId, { camera ->
+                when {
+                    token != recordingToken -> {
+                        // Stopped while the camera was opening: nothing was recorded.
+                        camera.close()
+                        if (cameraDevice == camera) cameraDevice = null
+                    }
+                    timeLapse -> setupTimeLapseRecording(camera, token, onSuccess, onError)
+                    else -> setupHighSpeedRecording(camera, token, onSuccess, onError)
+                }
+            }, { e ->
+                if (token == recordingToken) {
+                    abortSlowMo()
+                    onError(e)
+                }
+            })
         }
-        openCamera(cameraId, { camera -> setupHighSpeedRecording(camera, onSuccess, onError) }, onError)
+    }
+
+    /** MediaRecorder writing silent H.264 at 30 fps into a new pending MediaStore video. */
+    private fun prepareRecorder(prefix: String, chars: CameraCharacteristics, configure: MediaRecorder.() -> Unit): MediaRecorder {
+        val resolver = context.contentResolver
+        val values = mediaSaver.newVideoValues(prefix).apply { put(MediaStore.MediaColumns.IS_PENDING, 1) }
+        val uri = resolver.insert(MediaStore.Video.Media.EXTERNAL_CONTENT_URI, values)
+            ?: throw IllegalStateException("Unable to create video entry")
+        slowMoUri = uri // set first, so a failure below deletes the entry (abortSlowMo)
+        val pfd = resolver.openFileDescriptor(uri, "rw") ?: throw IllegalStateException("Unable to open video file")
+        slowMoPfd = pfd
+        return MediaRecorder(context).apply {
+            mediaRecorder = this
+            setVideoSource(MediaRecorder.VideoSource.SURFACE)
+            setOutputFormat(MediaRecorder.OutputFormat.MPEG_4)
+            setVideoEncoder(MediaRecorder.VideoEncoder.H264)
+            setVideoFrameRate(SlowMotion.PLAYBACK_FPS)
+            setOrientationHint(outputRotation(chars))
+            locationProvider()?.let { setLocation(it.latitude.toFloat(), it.longitude.toFloat()) }
+            configure()
+            setOutputFile(pfd.fileDescriptor)
+            prepare()
+        }
+    }
+
+    /**
+     * Surface over the UI's recording preview with buffers of the stream [size], or null when
+     * the UI shows none. Reports the upright size first so the view can crop it.
+     */
+    private fun attachRecordingPreview(size: Size, chars: CameraCharacteristics): Surface? {
+        val target = recordingPreview ?: return null
+        return try {
+            target.surfaceTexture.setDefaultBufferSize(size.width, size.height)
+            val sideways = (chars[CameraCharacteristics.SENSOR_ORIENTATION] ?: 90) % 180 != 0
+            target.onStreamSize(if (sideways) Size(size.height, size.width) else size)
+            Surface(target.surfaceTexture).also { recordingPreviewSurface = it }
+        } catch (e: Exception) {
+            Log.w(TAG, "Recording preview unavailable", e)
+            null
+        }
+    }
+
+    private fun releaseRecordingPreviewSurface() {
+        recordingPreviewSurface?.release()
+        recordingPreviewSurface = null
+    }
+
+    /**
+     * Creates the recording session with the live [preview] as a second output when there is
+     * one (if the camera rejects that, records without it), runs [repeat] to start the frames,
+     * then starts [recorder]. Callbacks of a stopped recording ([token] outdated) do nothing.
+     */
+    private fun startRecordingSession(
+        camera: CameraDevice,
+        token: Int,
+        recorder: MediaRecorder,
+        recorderSurface: Surface,
+        preview: Surface?,
+        type: Int,
+        label: String,
+        onSuccess: () -> Unit,
+        onError: (Exception) -> Unit,
+        repeat: (CameraCaptureSession, List<Surface>) -> Unit,
+    ) {
+        val targets = listOfNotNull(preview, recorderSurface)
+        fun fallBack(cause: Exception?) {
+            if (preview != null) {
+                Log.w(TAG, "$label session with live preview failed; recording without it", cause)
+                releaseRecordingPreviewSurface()
+                startRecordingSession(camera, token, recorder, recorderSurface, null, type, label, onSuccess, onError, repeat)
+            } else {
+                abortSlowMo()
+                onError(cause ?: Exception("$label session configuration failed"))
+            }
+        }
+        try {
+            createSession(camera, targets, type, onConfigured = { session ->
+                if (token != recordingToken) return@createSession
+                try {
+                    repeat(session, targets)
+                    recorder.start()
+                    onSuccess()
+                } catch (e: Exception) {
+                    abortSlowMo()
+                    onError(e)
+                }
+            }, onFailed = {
+                if (token == recordingToken) fallBack(null)
+            })
+        } catch (e: Exception) {
+            fallBack(e)
+        }
     }
 
     /**
      * Time lapse: a regular repeating session feeds MediaRecorder, which keeps one
      * frame every 1/[TIME_LAPSE_CAPTURE_FPS] s and encodes at 30 fps (15x speed-up).
      */
-    private fun setupTimeLapseRecording(camera: CameraDevice, onSuccess: () -> Unit, onError: (Exception) -> Unit) {
+    private fun setupTimeLapseRecording(camera: CameraDevice, token: Int, onSuccess: () -> Unit, onError: (Exception) -> Unit) {
         try {
             val chars = characteristics(camera)
             val configs = chars[CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP]
@@ -1159,127 +1280,86 @@ class Camera2Provider(
             val fpsRange = chars[CameraCharacteristics.CONTROL_AE_AVAILABLE_TARGET_FPS_RANGES]
                 ?.filter { it.upper == 30 }?.minByOrNull { it.lower } ?: Range(15, 30)
 
-            val resolver = context.contentResolver
-            val values = mediaSaver.newVideoValues("TIMELAPSE").apply { put(MediaStore.MediaColumns.IS_PENDING, 1) }
-            val uri = resolver.insert(MediaStore.Video.Media.EXTERNAL_CONTENT_URI, values)
-                ?: throw IllegalStateException("Unable to create video entry")
-            val pfd = resolver.openFileDescriptor(uri, "rw") ?: throw IllegalStateException("Unable to open video file")
-            slowMoUri = uri
-            slowMoPfd = pfd
-
-            val recorder = MediaRecorder(context).apply {
-                setVideoSource(MediaRecorder.VideoSource.SURFACE)
-                setOutputFormat(MediaRecorder.OutputFormat.MPEG_4)
-                setVideoEncoder(MediaRecorder.VideoEncoder.H264)
+            val recorder = prepareRecorder("TIMELAPSE", chars) {
                 setVideoEncodingBitRate(12_000_000)
                 setCaptureRate(TIME_LAPSE_CAPTURE_FPS)
-                setVideoFrameRate(SLOW_MO_PLAYBACK_FPS)
                 setVideoSize(size.width, size.height)
-                setOrientationHint(outputRotation(chars))
-                locationProvider()?.let { setLocation(it.latitude.toFloat(), it.longitude.toFloat()) }
-                setOutputFile(pfd.fileDescriptor)
-                prepare()
             }
-            mediaRecorder = recorder
-            val recorderSurface = recorder.surface
-
-            createSession(camera, listOf(recorderSurface), onConfigured = { session ->
-                try {
-                    val request = camera.createCaptureRequest(CameraDevice.TEMPLATE_RECORD).apply {
-                        addTarget(recorderSurface)
-                        applyCommon(this)
-                        applyTorch(this, chars)
-                        set(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE, fpsRange)
-                        set(CaptureRequest.CONTROL_VIDEO_STABILIZATION_MODE, CaptureRequest.CONTROL_VIDEO_STABILIZATION_MODE_ON)
-                    }.build()
-                    session.setRepeatingRequest(request, null, backgroundHandler)
-                    recorder.start()
-                    onSuccess()
-                } catch (e: Exception) {
-                    abortSlowMo()
-                    onError(e)
-                }
-            }, onFailed = {
-                abortSlowMo()
-                onError(Exception("Time-lapse session configuration failed"))
-            })
+            val preview = attachRecordingPreview(size, chars)
+            startRecordingSession(
+                camera, token, recorder, recorder.surface, preview, SessionConfiguration.SESSION_REGULAR,
+                "Time-lapse", onSuccess, onError,
+            ) { session, targets ->
+                // The preview runs at 30 fps; MediaRecorder keeps 2 frames a second.
+                val request = camera.createCaptureRequest(CameraDevice.TEMPLATE_RECORD).apply {
+                    targets.forEach { addTarget(it) }
+                    applyCommon(this)
+                    applyTorch(this, chars)
+                    set(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE, fpsRange)
+                    set(CaptureRequest.CONTROL_VIDEO_STABILIZATION_MODE, CaptureRequest.CONTROL_VIDEO_STABILIZATION_MODE_ON)
+                }.build()
+                session.setRepeatingRequest(request, null, backgroundHandler)
+            }
         } catch (e: Exception) {
             abortSlowMo()
             onError(e)
         }
     }
 
-    private fun setupHighSpeedRecording(camera: CameraDevice, onSuccess: () -> Unit, onError: (Exception) -> Unit) {
+    /**
+     * Slow motion: a constrained high-speed session at the chosen rate (UserPreferences.slowMotionFps,
+     * else the closest the camera offers) feeds MediaRecorder, which encodes at 30 fps so the file
+     * itself plays back slowed down. The live preview gets the first frame of every burst.
+     */
+    private fun setupHighSpeedRecording(camera: CameraDevice, token: Int, onSuccess: () -> Unit, onError: (Exception) -> Unit) {
         try {
             val chars = characteristics(camera)
-            val configs = chars[CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP]
-            val targetSize = configs?.highSpeedVideoSizes?.filter { it.width <= 1920 }?.maxByOrNull { it.width }
-                ?: Size(1280, 720)
-            val fpsRange = configs?.getHighSpeedVideoFpsRangesFor(targetSize)
-                ?.filter { it.lower == it.upper }?.maxByOrNull { it.upper }
-                ?: Range(120, 120)
+            val configs = highSpeedConfigs(camera.id, chars)
+            val fps = SlowMotion.resolveFps(currentPrefs.slowMotionFps, SlowMotion.rates(configs))
+            val config = fps?.let { SlowMotion.pick(configs, it) }
+                ?: throw IllegalStateException("This device does not support high-speed video")
+            val fpsRange = Range(config.fps, config.fps)
+            val size = Size(config.width, config.height)
+            Log.i(TAG, "Slow motion: ${size.width}x${size.height} at ${config.fps} fps")
 
-            val resolver = context.contentResolver
-            val values = mediaSaver.newVideoValues("SLOMO").apply { put(MediaStore.MediaColumns.IS_PENDING, 1) }
-            val uri = resolver.insert(MediaStore.Video.Media.EXTERNAL_CONTENT_URI, values)
-                ?: throw IllegalStateException("Unable to create video entry")
-            val pfd = resolver.openFileDescriptor(uri, "rw") ?: throw IllegalStateException("Unable to open video file")
-            slowMoUri = uri
-            slowMoPfd = pfd
-
-            val recorder = MediaRecorder(context).apply {
-                setVideoSource(MediaRecorder.VideoSource.SURFACE)
-                setOutputFormat(MediaRecorder.OutputFormat.MPEG_4)
-                setVideoEncoder(MediaRecorder.VideoEncoder.H264)
-                setVideoEncodingBitRate(20_000_000)
-                // Capture at high speed but encode at 30 fps, so the file itself
-                // plays back in slow motion in any player.
-                setCaptureRate(fpsRange.upper.toDouble())
-                setVideoFrameRate(SLOW_MO_PLAYBACK_FPS)
-                setVideoSize(targetSize.width, targetSize.height)
-                setOrientationHint(outputRotation(chars))
-                locationProvider()?.let { setLocation(it.latitude.toFloat(), it.longitude.toFloat()) }
-                setOutputFile(pfd.fileDescriptor)
-                prepare()
+            val recorder = prepareRecorder("SLOMO", chars) {
+                setVideoEncodingBitRate(SlowMotion.bitRate(config))
+                setCaptureRate(config.fps.toDouble())
+                setVideoSize(size.width, size.height)
             }
-            mediaRecorder = recorder
-            val recorderSurface = recorder.surface
-
-            createSession(camera, listOf(recorderSurface), SessionConfiguration.SESSION_HIGH_SPEED, onConfigured = { session ->
-                try {
-                    val highSpeed = session as CameraConstrainedHighSpeedCaptureSession
-                    fun request(withControls: Boolean) = camera.createCaptureRequest(CameraDevice.TEMPLATE_RECORD).apply {
-                        addTarget(recorderSurface)
-                        set(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE, fpsRange)
-                        if (withControls) {
-                            // Zoom, brightness and torch are among the keys high-speed sessions accept.
-                            applyCommon(this)
-                            applyTorch(this, chars)
-                        }
-                    }.build()
-                    try {
-                        highSpeed.setRepeatingBurst(highSpeed.createHighSpeedRequestList(request(true)), null, backgroundHandler)
-                    } catch (e: IllegalArgumentException) {
-                        Log.w(TAG, "High-speed request rejected with zoom/torch; recording without them", e)
-                        highSpeed.setRepeatingBurst(highSpeed.createHighSpeedRequestList(request(false)), null, backgroundHandler)
+            // Every output of a high-speed session must have the recording's size.
+            val preview = attachRecordingPreview(size, chars)
+            startRecordingSession(
+                camera, token, recorder, recorder.surface, preview, SessionConfiguration.SESSION_HIGH_SPEED,
+                "High-speed", onSuccess, onError,
+            ) { session, targets ->
+                val highSpeed = session as CameraConstrainedHighSpeedCaptureSession
+                fun request(withControls: Boolean) = camera.createCaptureRequest(CameraDevice.TEMPLATE_RECORD).apply {
+                    targets.forEach { addTarget(it) }
+                    set(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE, fpsRange)
+                    if (withControls) {
+                        // Zoom, brightness and torch are among the keys high-speed sessions accept.
+                        applyCommon(this)
+                        applyTorch(this, chars)
                     }
-                    recorder.start()
-                    onSuccess()
-                } catch (e: Exception) {
-                    abortSlowMo()
-                    onError(e)
+                }.build()
+                // In each burst only the first request also targets the preview (30 fps there).
+                try {
+                    highSpeed.setRepeatingBurst(highSpeed.createHighSpeedRequestList(request(true)), null, backgroundHandler)
+                } catch (e: IllegalArgumentException) {
+                    Log.w(TAG, "High-speed request rejected with zoom/torch; recording without them", e)
+                    highSpeed.setRepeatingBurst(highSpeed.createHighSpeedRequestList(request(false)), null, backgroundHandler)
                 }
-            }, onFailed = {
-                abortSlowMo()
-                onError(Exception("High-speed session configuration failed"))
-            })
+            }
         } catch (e: Exception) {
             abortSlowMo()
             onError(e)
         }
     }
 
+    /** Background thread. Drops a recording that failed to start: deletes the file, closes the camera. */
     private fun abortSlowMo() {
+        recordingToken++
         mediaRecorder?.release()
         mediaRecorder = null
         slowMoPfd?.close()
@@ -1287,15 +1367,27 @@ class Camera2Provider(
         slowMoUri?.let { context.contentResolver.delete(it, null, null) }
         slowMoUri = null
         closeCamera()
+        releaseRecordingPreviewSurface()
     }
 
     override fun stopSlowMoVideo(onSuccess: (String) -> Unit, onError: (Exception) -> Unit) {
+        val handler = backgroundHandler ?: run {
+            onError(IllegalStateException("Not recording"))
+            return
+        }
+        // Off the main thread: finalizing the MP4 in MediaRecorder.stop can take a while.
+        handler.post { finishRecording(onSuccess, onError) }
+    }
+
+    /** Background thread. Saves the recording and closes the camera; exactly one callback. */
+    private fun finishRecording(onSuccess: (String) -> Unit, onError: (Exception) -> Unit) {
+        recordingToken++ // a start that is still opening the camera backs out
         val uri = slowMoUri
-        var ok = true
+        var ok = mediaRecorder != null
         try {
             mediaRecorder?.stop()
         } catch (e: RuntimeException) {
-            // Thrown when no frames were recorded.
+            // Thrown when no frames were recorded (or the recorder never started).
             Log.w(TAG, "MediaRecorder.stop failed", e)
             ok = false
         }
@@ -1305,19 +1397,49 @@ class Camera2Provider(
         slowMoPfd = null
         slowMoUri = null
         closeCamera()
+        releaseRecordingPreviewSurface()
 
-        if (uri == null) {
-            onError(IllegalStateException("Not recording"))
-            return
-        }
-        if (ok) {
-            context.contentResolver.update(uri, ContentValues().apply { put(MediaStore.MediaColumns.IS_PENDING, 0) }, null, null)
-            onSuccess(uri.toString())
-        } else {
-            context.contentResolver.delete(uri, null, null)
-            onError(Exception("Video too short"))
+        when {
+            // Stopped before the camera was even open.
+            uri == null -> onError(Exception("Video too short"))
+            ok -> {
+                context.contentResolver.update(uri, ContentValues().apply { put(MediaStore.MediaColumns.IS_PENDING, 0) }, null, null)
+                onSuccess(uri.toString())
+            }
+            else -> {
+                context.contentResolver.delete(uri, null, null)
+                onError(Exception("Video too short"))
+            }
         }
     }
+
+    override fun setRecordingPreview(target: RecordingPreviewTarget?) {
+        recordingPreview = target
+    }
+
+    override fun getSlowMotionFrameRates(): List<Int> {
+        val id = findHighSpeedCamera() ?: return emptyList()
+        return SlowMotion.rates(highSpeedConfigs(id, cameraManager.getCameraCharacteristics(id)))
+    }
+
+    /** Fixed-rate high-speed sizes of a camera (recording needs a fixed rate). */
+    private fun highSpeedConfigs(cameraId: String, chars: CameraCharacteristics): List<HighSpeedConfig> =
+        highSpeedConfigCache.getOrPut(cameraId) {
+            val hasHighSpeed = chars[CameraCharacteristics.REQUEST_AVAILABLE_CAPABILITIES]
+                ?.contains(CameraMetadata.REQUEST_AVAILABLE_CAPABILITIES_CONSTRAINED_HIGH_SPEED_VIDEO) == true
+            val map = chars[CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP]
+            if (!hasHighSpeed || map == null) return@getOrPut emptyList()
+            runCatching {
+                map.highSpeedVideoSizes.flatMap { size ->
+                    map.getHighSpeedVideoFpsRangesFor(size)
+                        .filter { it.lower == it.upper }
+                        .map { HighSpeedConfig(size.width, size.height, it.upper) }
+                }
+            }.getOrElse {
+                Log.w(TAG, "High-speed configurations unreadable for camera $cameraId", it)
+                emptyList()
+            }
+        }
 
     /** Video "Flash On" is a torch; CameraX is unbound while Camera2 records, so set it here. */
     private fun applyTorch(builder: CaptureRequest.Builder, chars: CameraCharacteristics) {
@@ -1329,11 +1451,23 @@ class Camera2Provider(
     }
 
     override fun pauseVideo() {
-        mediaRecorder?.pause()
+        backgroundHandler?.post {
+            try {
+                mediaRecorder?.pause()
+            } catch (e: IllegalStateException) {
+                Log.w(TAG, "Pause before the recording started", e)
+            }
+        }
     }
 
     override fun resumeVideo() {
-        mediaRecorder?.resume()
+        backgroundHandler?.post {
+            try {
+                mediaRecorder?.resume()
+            } catch (e: IllegalStateException) {
+                Log.w(TAG, "Resume without a paused recording", e)
+            }
+        }
     }
 
     override fun captureVideoSnapshot(onSuccess: (String) -> Unit, onError: (Exception) -> Unit) {
@@ -1362,8 +1496,7 @@ class Camera2Provider(
         return candidates.firstOrNull { id ->
             val chars = cameraManager.getCameraCharacteristics(id)
             chars[CameraCharacteristics.LENS_FACING] == lensFacing &&
-                chars[CameraCharacteristics.REQUEST_AVAILABLE_CAPABILITIES]
-                    ?.contains(CameraMetadata.REQUEST_AVAILABLE_CAPABILITIES_CONSTRAINED_HIGH_SPEED_VIDEO) == true
+                SlowMotion.rates(highSpeedConfigs(id, chars)).isNotEmpty()
         }
     }
 
@@ -1434,7 +1567,13 @@ class Camera2Provider(
     }
 
     override fun unbind() {
-        if (mediaRecorder != null) abortSlowMo() else closeCamera()
+        // Recording state belongs to the background thread; quitSafely still runs this.
+        val handler = backgroundHandler
+        if (handler != null) {
+            handler.post { if (mediaRecorder != null) abortSlowMo() else closeCamera() }
+        } else {
+            closeCamera()
+        }
         stopBackgroundThread()
     }
 
@@ -1464,7 +1603,6 @@ class Camera2Provider(
         const val STACK_PROGRESS_FRAMES_END = 0.85f
         const val HDR_PROGRESS_FRAMES_END = 0.45f
         const val PROGRESS_MERGED = 0.95f
-        const val SLOW_MO_PLAYBACK_FPS = 30
         val HDR_EV_STOPS = listOf(-2f, 0f, 2f)
     }
 }

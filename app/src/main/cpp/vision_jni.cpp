@@ -737,16 +737,24 @@ Java_com_fearmikey_camera_data_engine_processing_NativeVisionBridge_nativePortra
 }
 
 // ===========================================================================
-// Palm detection: face-calibrated skin segmentation + convexity defects.
+// Palm detection: face-calibrated skin segmentation + hand-shape scoring.
 // Returns null if no open palm, otherwise {left, top, right, bottom} normalized.
+// otherFaces: normalized {l, t, r, b} per other person (may be null); their skin is ignored.
 // ===========================================================================
 
 JNIEXPORT jfloatArray JNICALL
 Java_com_fearmikey_camera_data_engine_processing_NativeVisionBridge_nativeDetectOpenPalm(
-        JNIEnv* env, jobject, jobject bitmap, jfloat faceL, jfloat faceT, jfloat faceR, jfloat faceB) {
+        JNIEnv* env, jobject, jobject bitmap, jfloat faceL, jfloat faceT, jfloat faceR, jfloat faceB,
+        jfloatArray otherFaces) {
+    if (!(faceR > faceL && faceB > faceT)) return nullptr;
+    std::vector<jfloat> others;
+    if (otherFaces) {
+        const jsize n = env->GetArrayLength(otherFaces) / 4 * 4;
+        others.resize(static_cast<size_t>(n));
+        if (n > 0) env->GetFloatArrayRegion(otherFaces, 0, n, others.data());
+    }
     LockedBitmap bmp(env, bitmap);
     if (!bmp.ok()) return nullptr;
-    if (!(faceR > faceL && faceB > faceT)) return nullptr;
 
     try {
         cv::Mat rgb;
@@ -763,8 +771,12 @@ Java_com_fearmikey_camera_data_engine_processing_NativeVisionBridge_nativeDetect
         face &= cv::Rect(0, 0, w, h);
         if (face.area() < 16) return nullptr;
 
-        // Calibrate the skin model from the central part of the face.
-        cv::Rect sample(face.x + face.width / 4, face.y + face.height / 4, face.width / 2, face.height / 2);
+        // Calibrate the skin model from the cheeks and nose (below the eyes and brows, above
+        // the mouth), the most uniformly skin-colored part of the face box.
+        cv::Rect sample(face.x + face.width / 4, face.y + static_cast<int>(face.height * 0.48),
+                        std::max(1, face.width / 2), std::max(1, static_cast<int>(face.height * 0.24)));
+        sample &= cv::Rect(0, 0, w, h);
+        if (sample.area() < 4) return nullptr;
         cv::Scalar mean, stddev;
         cv::meanStdDev(ycrcb(sample), mean, stddev);
         // Palms are usually a little paler/pinker than the face: keep some slack.
@@ -776,17 +788,25 @@ Java_com_fearmikey_camera_data_engine_processing_NativeVisionBridge_nativeDetect
                     cv::Scalar(std::max(0.0, mean[0] * 0.35), mean[1] - crTol, mean[2] - cbTol),
                     cv::Scalar(255, mean[1] + crTol, mean[2] + cbTol), skin);
 
-        // Remove the face and neck so they are not mistaken for a hand.
-        cv::Rect faceAndNeck(face.x - face.width / 6, face.y - face.height / 6,
-                             face.width + face.width / 3, static_cast<int>(face.height * 1.9));
-        faceAndNeck &= cv::Rect(0, 0, w, h);
-        skin(faceAndNeck).setTo(0);
+        // Remove faces and necks (yours and anyone else's) so they are not mistaken for a hand.
+        auto removeFaceAndNeck = [&](const cv::Rect& f) {
+            cv::Rect r(f.x - f.width / 6, f.y - f.height / 6, f.width + f.width / 3,
+                       static_cast<int>(f.height * 1.9));
+            r &= cv::Rect(0, 0, w, h);
+            if (r.area() > 0) skin(r).setTo(0);
+        };
+        removeFaceAndNeck(face);
+        for (size_t i = 0; i + 3 < others.size(); i += 4) {
+            removeFaceAndNeck(cv::Rect(static_cast<int>(others[i] * w), static_cast<int>(others[i + 1] * h),
+                                       static_cast<int>((others[i + 2] - others[i]) * w),
+                                       static_cast<int>((others[i + 3] - others[i + 1]) * h)));
+        }
 
-        // Scale the clean-up to the face size: a fixed 7 px close fills the gaps between the
-        // fingers of a smaller (farther) hand, which is then no longer recognized.
+        // Scale the clean-up to the face size. Keep the close small: a larger one fills the
+        // gaps between fingers that are only slightly apart.
         auto oddKernel = [](int k) { k = std::max(3, k); return k | 1; };
-        const int openK = oddKernel(face.width / 27);
-        const int closeK = oddKernel(face.width / 12);
+        const int openK = oddKernel(face.width / 36);
+        const int closeK = oddKernel(face.width / 20);
         cv::morphologyEx(skin, skin, cv::MORPH_OPEN,
                          cv::getStructuringElement(cv::MORPH_ELLIPSE, cv::Size(openK, openK)));
         cv::morphologyEx(skin, skin, cv::MORPH_CLOSE,
@@ -825,37 +845,61 @@ Java_com_fearmikey_camera_data_engine_processing_NativeVisionBridge_nativeDetect
             const double area = cv::contourArea(contour);
             if (area < 0.3 * faceArea || area > 3.5 * faceArea) continue;
             const double aspect = static_cast<double>(box.height) / std::max(1, box.width);
-            if (aspect < 0.6 || aspect > 2.4) continue;
+            if (aspect < 0.6 || aspect > 2.6) continue;
 
             std::vector<int> hullIdx;
             cv::convexHull(contour, hullIdx, false, false);
             if (hullIdx.size() < 4) continue;
+            std::vector<cv::Point> hullPts;
+            hullPts.reserve(hullIdx.size());
+            for (int i : hullIdx) hullPts.push_back(contour[static_cast<size_t>(i)]);
+            const double solidity = area / std::max(1.0, cv::contourArea(hullPts));
             std::sort(hullIdx.begin(), hullIdx.end());
             std::vector<cv::Vec4i> defects;
             cv::convexityDefects(contour, hullIdx, defects);
 
-            int fingerGaps = 0;
-            const double minDepth = 0.15 * box.height;
+            // Valleys between fingers (or thumb and index finger). Widely spread fingers give
+            // several deep, narrow ones; a relaxed open hand gives shallower ones, usually at
+            // least the thumb's.
+            int gaps = 0;
+            int deepGaps = 0;
+            const double minDepth = std::max(2.0, 0.07 * box.height);
             for (const auto& d : defects) {
                 const cv::Point& s = contour[d[0]];
                 const cv::Point& e = contour[d[1]];
                 const cv::Point& f = contour[d[2]];
                 const double depth = d[3] / 256.0;
                 if (depth < minDepth) continue;
-                if (angleBetween(s, f, e) > CV_PI * 0.5) continue;
-                // Fingers point upwards: the valley lies below both tips.
+                const double angle = angleBetween(s, f, e);
+                if (angle > CV_PI * 0.6) continue;
+                // Fingers point upward: the valley lies below both tips.
                 if (f.y < std::min(s.y, e.y)) continue;
-                fingerGaps++;
+                gaps++;
+                if (depth >= 0.15 * box.height && angle <= CV_PI * 0.5) deepGaps++;
             }
 
-            if (fingerGaps >= 3) {
-                // Prefer larger, more hand-sized blobs (fill ratio of the bounding box).
-                const double fill = area / std::max(1.0, static_cast<double>(box.area()));
-                const double score = fingerGaps + fill;
-                if (score > bestScore) {
-                    bestScore = score;
-                    bestBox = box;
-                }
+            // Without spread fingers the shape alone is weaker evidence, so also require the
+            // pose: held beside the head (from above it to about chin height), fully in view
+            // (blobs running into the crop edge are usually background), and not a perfectly
+            // convex block (walls, door frames).
+            const double cy = box.y + box.height * 0.5;
+            const bool atHeadHeight = cy >= face.y - 1.6 * face.height && cy <= face.y + 1.3 * face.height;
+            const bool inside = box.x > 1 && box.y > 1 && box.x + box.width < w - 1 &&
+                                box.y + box.height < h - 1;
+            const bool posed = atHeadHeight && inside && solidity <= 0.97;
+
+            double score = 0;
+            if (deepGaps >= 3) {
+                score = 3.0 + deepGaps;                        // fingers spread wide
+            } else if (posed && gaps >= 1 && solidity >= 0.7 && aspect >= 1.0) {
+                score = 2.0 + 0.3 * gaps + solidity;           // relaxed open hand
+            } else if (posed && gaps == 0 && solidity >= 0.85 && aspect >= 1.25 && aspect <= 2.4 &&
+                       area >= 0.45 * faceArea && area <= 2.5 * faceArea) {
+                score = 1.0 + solidity;                        // fingers and thumb together
+            }
+            if (score > bestScore) {
+                bestScore = score;
+                bestBox = box;
             }
         }
 
