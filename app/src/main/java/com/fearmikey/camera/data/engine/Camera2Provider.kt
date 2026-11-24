@@ -108,6 +108,8 @@ class Camera2Provider(
     @Volatile private var recordingPreview: RecordingPreviewTarget? = null
     /** Slow-motion configurations per camera id (static characteristics). */
     private val highSpeedConfigCache = java.util.concurrent.ConcurrentHashMap<String, List<HighSpeedConfig>>()
+    /** getSlowMotionFrameRates per facing (true = front). */
+    private val slowMotionRatesCache = java.util.concurrent.ConcurrentHashMap<Boolean, List<Int>>()
 
     private fun startBackgroundThread() {
         if (backgroundThread == null) {
@@ -1417,9 +1419,16 @@ class Camera2Provider(
         recordingPreview = target
     }
 
+    /**
+     * Cached per facing: the lookup reads the characteristics of every camera (a binder call
+     * each) and the answer never changes, while this is asked after every rebind.
+     */
     override fun getSlowMotionFrameRates(): List<Int> {
-        val id = findHighSpeedCamera() ?: return emptyList()
-        return SlowMotion.rates(highSpeedConfigs(id, cameraManager.getCameraCharacteristics(id)))
+        val front = isFrontCamera
+        return slowMotionRatesCache.getOrPut(front) {
+            val id = findHighSpeedCamera() ?: return@getOrPut emptyList()
+            SlowMotion.rates(highSpeedConfigs(id, cameraManager.getCameraCharacteristics(id)))
+        }
     }
 
     /** Fixed-rate high-speed sizes of a camera (recording needs a fixed rate). */

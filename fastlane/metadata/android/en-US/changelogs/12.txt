@@ -1,0 +1,3 @@
+• Scanned codes show their action just above the zoom buttons, within thumb reach
+• Shorter freeze after stopping a Slow motion or Time lapse recording
+• Back from a video mode returns to the previous photo mode instead of closing the app

@@ -238,16 +238,21 @@ class CameraViewModel(
 
     private fun onCameraReady() {
         val capabilities = captureEngine.getCapabilities()
-        val slowMotionRates = captureEngine.getSlowMotionFrameRates()
-        val ratesChanged = slowMotionRates != _uiState.value.slowMotionRates
         _uiState.update {
-            val withCaps = it.copy(capabilities = capabilities, slowMotionRates = slowMotionRates)
+            val withCaps = it.copy(capabilities = capabilities)
             withCaps.copy(
                 zoomPresets = zoomPolicy(withCaps).presets,
                 zoomLabelScale = capabilities?.zoomLabelScale ?: 1f,
             )
         }
-        if (ratesChanged) showSlowMotionHint()
+        // Off the main thread: the first lookup per camera reads every camera's characteristics.
+        viewModelScope.launch {
+            val slowMotionRates = withContext(Dispatchers.Default) { captureEngine.getSlowMotionFrameRates() }
+            if (slowMotionRates != _uiState.value.slowMotionRates) {
+                _uiState.update { it.copy(slowMotionRates = slowMotionRates) }
+                showSlowMotionHint()
+            }
+        }
         if (pendingDefaultZoom && capabilities != null) {
             pendingDefaultZoom = false
             applyZoom(zoomPolicy().defaultRatio)
@@ -459,11 +464,34 @@ class CameraViewModel(
         }
     }
 
-    fun setCaptureType(type: CaptureType) {
+    fun setCaptureType(type: CaptureType) =
+        switchCaptureType(type, if (type == CaptureType.PHOTO) CameraMode.PHOTO else CameraMode.VIDEO)
+
+    /** Photo-row mode last used (Back from a video mode returns there). */
+    private var lastPhotoMode = CameraMode.PHOTO
+
+    /**
+     * System Back: from a video mode, back to the photo mode you came from; from any other photo
+     * mode, back to Photo. The UI only routes Back here when [handlesBack]; otherwise it leaves.
+     */
+    fun onBack() {
+        val state = _uiState.value
+        if (state.captureType == CaptureType.VIDEO) {
+            switchCaptureType(CaptureType.PHOTO, lastPhotoMode)
+        } else {
+            setMode(CameraMode.PHOTO)
+        }
+    }
+
+    /** Back switches modes (see [onBack]) rather than leaving: not in Photo, and nothing running. */
+    fun handlesBack(state: CameraUiState): Boolean =
+        state.currentMode != CameraMode.PHOTO && !state.isRecording && !state.isPanoramaCapturing && !state.isProcessing
+
+    private fun switchCaptureType(type: CaptureType, nextMode: CameraMode) {
         val state = _uiState.value
         if (state.isRecording || state.isPanoramaCapturing) return
-        val nextMode = if (type == CaptureType.PHOTO) CameraMode.PHOTO else CameraMode.VIDEO
         if (state.captureType == type && state.currentMode == nextMode) return
+        if (nextMode in CameraModes.photo) lastPhotoMode = nextMode
         _uiState.update {
             it.copy(
                 captureType = type, currentMode = nextMode,
@@ -481,6 +509,7 @@ class CameraViewModel(
         if (_uiState.value.isRecording || _uiState.value.isPanoramaCapturing) return
         val previous = _uiState.value.currentMode
         if (mode == previous) return
+        if (mode in CameraModes.photo) lastPhotoMode = mode
         _uiState.update { it.copy(currentMode = mode, lowLightSuggested = false, scannedCodes = emptyList()) }
         _panoramaProgress.value = null
         captureEngine.setMode(mode)

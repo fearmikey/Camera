@@ -393,39 +393,15 @@ private fun Modifier.clickableWithDescription(description: String, enabled: Bool
         .semantics { contentDescription = description; role = Role.Button }
         .clickable(enabled = enabled, onClick = onClick)
 
-/** Contextual chips under the top bar: detected QR codes/barcodes and low-light Night suggestion. */
+/** Contextual chip under the top bar: the low-light Night suggestion. */
 @Composable
 fun SuggestionChips(
-    codes: List<ScannedCode>,
     showNightSuggestion: Boolean,
-    onCodesClick: () -> Unit,
-    onCodesDismiss: () -> Unit,
     onNightClick: () -> Unit,
     onNightDismiss: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
     Column(modifier = modifier.padding(horizontal = 24.dp), horizontalAlignment = Alignment.CenterHorizontally) {
-        codes.firstOrNull()?.let { first ->
-            val payload = first.payload
-            if (codes.size == 1) {
-                SuggestionChip(
-                    icon = CodeActions.icon(payload),
-                    title = CodeActions.primaryLabel(payload),
-                    subtitle = CodeActions.summary(payload).ifEmpty { CodeActions.title(payload) }.take(48),
-                    onClick = onCodesClick,
-                    onDismiss = onCodesDismiss,
-                )
-            } else {
-                SuggestionChip(
-                    icon = Icons.Default.QrCode2,
-                    title = "${codes.size} codes found",
-                    subtitle = codes.joinToString(" · ") { CodeActions.title(it.payload) }.take(48),
-                    onClick = onCodesClick,
-                    onDismiss = onCodesDismiss,
-                )
-            }
-            Spacer(Modifier.height(8.dp))
-        }
         if (showNightSuggestion) {
             SuggestionChip(
                 icon = Icons.Default.NightsStay,
@@ -434,6 +410,66 @@ fun SuggestionChips(
                 onClick = onNightClick,
                 onDismiss = onNightDismiss,
             )
+        }
+    }
+}
+
+/**
+ * Detected QR codes/barcodes as a large white pill just above the zoom row, within thumb reach
+ * (one code: its primary action and summary; several: "N codes found"). Tap opens the code
+ * sheet; the X dismisses until the codes leave the frame.
+ */
+@Composable
+fun CodeSuggestionChip(
+    codes: List<ScannedCode>,
+    onClick: () -> Unit,
+    onDismiss: () -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    val first = codes.firstOrNull() ?: return
+    val payload = first.payload
+    val icon: ImageVector
+    val title: String
+    val subtitle: String
+    if (codes.size == 1) {
+        icon = CodeActions.icon(payload)
+        title = CodeActions.primaryLabel(payload)
+        subtitle = CodeActions.summary(payload).ifEmpty { CodeActions.title(payload) }
+    } else {
+        icon = Icons.Default.QrCode2
+        title = "${codes.size} codes found"
+        subtitle = codes.joinToString(" · ") { CodeActions.title(it.payload) }
+    }
+    Row(
+        modifier = modifier
+            .padding(horizontal = 24.dp)
+            .heightIn(min = 56.dp)
+            .clip(CircleShape)
+            .background(Color.White)
+            .semantics(mergeDescendants = true) {}
+            .clickable(onClick = onClick)
+            .padding(start = 10.dp, end = 4.dp, top = 8.dp, bottom = 8.dp),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        Box(
+            modifier = Modifier.size(36.dp).clip(CircleShape).background(CameraAccent),
+            contentAlignment = Alignment.Center
+        ) {
+            Icon(icon, contentDescription = null, tint = OnCameraAccent, modifier = Modifier.size(20.dp))
+        }
+        Spacer(Modifier.width(12.dp))
+        Column(Modifier.widthIn(max = 240.dp)) {
+            Text(
+                title, color = Color.Black, fontSize = 15.sp, fontWeight = FontWeight.Bold,
+                maxLines = 1, overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis,
+            )
+            Text(
+                subtitle, color = Color.Black.copy(alpha = 0.65f), fontSize = 13.sp,
+                maxLines = 1, overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis,
+            )
+        }
+        IconButton(onClick = onDismiss, modifier = Modifier.size(44.dp)) {
+            Icon(Icons.Default.Close, contentDescription = "Dismiss", tint = Color.Black.copy(alpha = 0.6f), modifier = Modifier.size(20.dp))
         }
     }
 }
@@ -492,18 +528,22 @@ private fun CameraTopBarPreview() {
 @Preview(widthDp = 400, showBackground = true, backgroundColor = 0xFF3A4A3A)
 @Composable
 private fun SuggestionChipsPreview() {
-    Column {
-        SuggestionChips(
-            codes = listOf(ScannedCode("https://f-droid.org", CodeFormat.QR_CODE)), showNightSuggestion = true,
-            onCodesClick = {}, onCodesDismiss = {}, onNightClick = {}, onNightDismiss = {}
+    Column(verticalArrangement = Arrangement.spacedBy(8.dp), horizontalAlignment = Alignment.CenterHorizontally) {
+        SuggestionChips(showNightSuggestion = true, onNightClick = {}, onNightDismiss = {})
+        CodeSuggestionChip(
+            codes = listOf(ScannedCode("https://f-droid.org", CodeFormat.QR_CODE)),
+            onClick = {}, onDismiss = {},
         )
-        SuggestionChips(
+        CodeSuggestionChip(
+            codes = listOf(ScannedCode("026229574764", CodeFormat.UPC_A)),
+            onClick = {}, onDismiss = {},
+        )
+        CodeSuggestionChip(
             codes = listOf(
                 ScannedCode("WIFI:T:WPA;S:Cafe;P:espresso42;;", CodeFormat.QR_CODE),
                 ScannedCode("4006381333931", CodeFormat.EAN_13),
             ),
-            showNightSuggestion = false,
-            onCodesClick = {}, onCodesDismiss = {}, onNightClick = {}, onNightDismiss = {}
+            onClick = {}, onDismiss = {},
         )
     }
 }

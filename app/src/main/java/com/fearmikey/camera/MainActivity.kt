@@ -445,6 +445,9 @@ fun CameraScreen(
     val zoomGapPx = with(LocalDensity.current) { ZoomControlsGap.toPx() }
 
     if (hasCameraPermission) {
+        // Back leaves a video mode (or Night, Portrait, ...) for Photo instead of closing the app;
+        // in Photo, or while recording/sweeping/processing, it behaves as usual.
+        androidx.activity.compose.BackHandler(enabled = viewModel.handlesBack(uiState)) { viewModel.onBack() }
         Box(modifier = Modifier.fillMaxSize().onGloballyPositioned { rootTop = it.positionInRoot().y }) {
             CameraPreview(
                 modifier = Modifier.fillMaxSize(),
@@ -727,6 +730,26 @@ fun CameraScreen(
                         )
                     }
                 },
+                aboveContent = {
+                    // Scanned codes sit just above the zoom row (thumb reach on big phones).
+                    val codes = uiState.scannedCodes.takeIf {
+                        !uiState.isProMode && !uiState.isRecording && uiState.codeSheet == null
+                    }.orEmpty()
+                    // Keep the last codes while the chip animates out.
+                    var shownCodes by remember { mutableStateOf(codes) }
+                    if (codes.isNotEmpty()) shownCodes = codes
+                    androidx.compose.animation.AnimatedVisibility(
+                        visible = codes.isNotEmpty(),
+                        enter = fadeIn(tween(180)) + androidx.compose.animation.scaleIn(tween(220), initialScale = 0.9f),
+                        exit = fadeOut(tween(140)) + androidx.compose.animation.scaleOut(tween(160), targetScale = 0.9f),
+                    ) {
+                        com.fearmikey.camera.ui.camera.CodeSuggestionChip(
+                            codes = shownCodes,
+                            onClick = { viewModel.openScannedCodes() },
+                            onDismiss = { viewModel.dismissScannedCodes() },
+                        )
+                    }
+                },
                 modifier = Modifier.align(Alignment.TopCenter),
             )
 
@@ -797,15 +820,12 @@ fun CameraScreen(
                 }
             }
 
-            // Suggestions under the top bar (scanned codes, low light).
+            // Low-light suggestion under the top bar (scanned codes float above the zoom row).
             if (!uiState.isProMode && !uiState.isRecording && uiState.codeSheet == null) {
                 com.fearmikey.camera.ui.camera.SuggestionChips(
-                    codes = uiState.scannedCodes,
                     // Auto Night handles dark scenes by itself, so it never shows the chip.
                     showNightSuggestion = uiState.lowLightSuggested && uiState.currentMode == CameraMode.PHOTO &&
                         prefs.lightMode != LightMode.AUTO_NIGHT_SIGHT,
-                    onCodesClick = { viewModel.openScannedCodes() },
-                    onCodesDismiss = { viewModel.dismissScannedCodes() },
                     onNightClick = { viewModel.acceptNightSuggestion() },
                     onNightDismiss = { viewModel.dismissNightSuggestion() },
                     modifier = Modifier
@@ -1563,6 +1583,8 @@ fun ViewfinderZoomControls(
     zoomLabelScale: Float = 1f,
     /** Shown instead of the zoom row (the open manual-controls dial). */
     overrideContent: (@Composable () -> Unit)? = null,
+    /** Floats above the zoom row, within thumb reach (the scanned-code chip). */
+    aboveContent: @Composable () -> Unit = {},
 ) {
     val alpha by animateFloatAsState(if (visible) 1f else 0f, label = "zoomChrome")
     Column(
@@ -1583,6 +1605,7 @@ fun ViewfinderZoomControls(
         if (overrideContent != null) {
             overrideContent()
         } else {
+            aboveContent()
             if (portraitAperture != null) {
                 com.fearmikey.camera.ui.camera.PortraitApertureControl(
                     aperture = portraitAperture,

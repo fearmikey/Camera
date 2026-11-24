@@ -221,6 +221,7 @@ class CameraXProvider(
         surfaceProvider: Preview.SurfaceProvider,
         cameraSelector: CameraSelector,
     ) {
+        val bindStartMs = android.os.SystemClock.elapsedRealtime()
         val spec = specFor(lifecycleOwner, surfaceProvider, cameraSelector)
         val keptPreview = boundPreview?.takeIf {
             camera != null && boundSpec?.preview == spec.preview && provider.isBound(it)
@@ -405,6 +406,8 @@ class CameraXProvider(
         boundSpec = if (bound != null && !degraded) spec else null
         boundPreview = if (bound != null) preview else null
         boundUseCases = useCases.toList()
+        // Runs on the main thread: a slow bind is UI jank (e.g. restoring after a Camera2 recording).
+        Log.i(TAG, "bindUseCases: ${android.os.SystemClock.elapsedRealtime() - bindStartMs} ms on the main thread")
         camera?.let { cam ->
             applyProConfigLive()
             if (zoomRatio != 1f) cam.cameraControl.setZoomRatio(zoomRatio)

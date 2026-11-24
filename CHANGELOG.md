@@ -2,6 +2,15 @@
 
 All notable changes to this project will be documented in this file.
 
+## [1.2.2] - 2026-11-24
+
+### Improved
+- Scanned QR codes and barcodes now appear as a large white chip just above the zoom buttons instead of under the top bar, so the link or action is within thumb reach on big phones.
+
+### Fixed
+- Shorter freeze after stopping a Slow motion or Time lapse recording (and after every mode switch): the list of slow-motion speeds is now looked up once per camera, off the main thread, instead of re-reading every camera's details each time the camera restarted.
+- Back no longer closes the app from a video mode: it returns to the photo mode you came from (and from Night, Portrait, Long exposure or Panorama to Photo). In Photo, Back still leaves the app.
+
 ## [1.2.1] - 2026-11-22
 
 ### Added
