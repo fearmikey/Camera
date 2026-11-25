@@ -68,3 +68,13 @@ The universal APK includes all four ABIs (OpenCV makes it large). To build a sin
 ```
 
 Store listing metadata for F-Droid lives in `fastlane/metadata/android/`.
+
+### Releases (reproducible builds)
+
+F-Droid builds each release tag from source and publishes it with the developer's signature only if its APK is byte-identical to the signed one on the GitHub release. To build those APKs, tag the release, then run:
+
+```
+scripts/build-release.sh v1.2.4 /path/to/Camera-Release.jks
+```
+
+The script clones the tag fresh and builds each ABI clean (the way F-Droid does), signs the APKs, and writes `dist/<tag>/Camera-<versionName>-<versionCode>.apk`. Upload all four to the GitHub release for that tag.

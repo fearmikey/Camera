@@ -1,8 +1,8 @@
 {
   "manifest_meta": {
     "purpose": "Code map for AI agents. Consult before editing; update in the same change whenever files, features, data flows, modes, preferences, assets, native code, or build config change (see AGENTS.md).",
-    "last_updated": "2026-11-24",
-    "app_version": "1.2.3 (versionCode 13; per-ABI builds use 13*10+n; not tagged yet, last tag v1.2.2)"
+    "last_updated": "2026-11-25",
+    "app_version": "1.2.4 (versionCode 14; per-ABI builds use 14*10+n; release tag v1.2.4)"
   },
   "project": {
     "name": "Camera",
@@ -21,7 +21,7 @@
       "image_loading": "ContentResolver.loadThumbnail (MediaThumbnail composable in MainActivity.kt); no image-loading library",
       "location": "Framework LocationManager (DeviceLocationProvider); no Play Services",
       "async": "Kotlin Coroutines & StateFlow; Camera2 uses a HandlerThread; analyzers use ExecutorServices",
-      "build": "AGP 8.7.3, compileSdk/targetSdk 35, minSdk 31, version catalog gradle/libs.versions.toml, release R8 minify + shrinkResources enabled (app/proguard-rules.pro keeps NativePanoramaBridge/NativeVisionBridge for JNI), buildConfig + prefab enabled, dependenciesInfo excluded from APK/AAB, optional -PabiFilter=<abi> per-ABI build"
+      "build": "AGP 8.7.3, compileSdk/targetSdk 35, minSdk 31, version catalog gradle/libs.versions.toml, release R8 minify + shrinkResources enabled (app/proguard-rules.pro keeps NativePanoramaBridge/NativeVisionBridge for JNI), buildConfig + prefab enabled, dependenciesInfo excluded from APK/AAB, optional -PabiFilter=<abi> per-ABI build. Reproducible builds: F-Droid's recipe has Binaries: https://github.com/fearmikey/Camera/releases/download/v%v/Camera-%v-%c.apk + AllowedAPKSigningKeys, so its unsigned APK must be byte-identical to the signed GitHub one. CMakeLists.txt maps the repo root, NDK and OpenCV prefab include dirs out of __FILE__/debug info (-ffile-prefix-map) and links with --build-id=none; do not add path-, time- or machine-dependent build inputs. Release APKs come from scripts/build-release.sh (fresh clone of the tag, git clean before each ABI, same prebuild sed as the recipe, apksigner) -> dist/<tag>/ (gitignored); local incremental builds are NOT reproducible references."
     }
   },
   "data_flow_pattern": {
@@ -51,7 +51,8 @@
       "gradle/libs.versions.toml",
       "settings.gradle.kts",
       "build.gradle.kts",
-      "app/src/main/cpp/CMakeLists.txt"
+      "app/src/main/cpp/CMakeLists.txt",
+      "scripts/build-release.sh"
     ],
     "keep_rules": "app/src/main/keepRules/rules.keep",
     "di_module": "app/src/main/java/com/fearmikey/camera/core/di/CameraModule.kt (commented-out Hilt module; not active)",

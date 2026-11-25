@@ -2,6 +2,11 @@
 
 All notable changes to this project will be documented in this file.
 
+## [1.2.4] - 2026-11-25
+
+### Improved
+- Release builds are reproducible. The native image-processing library no longer embeds the paths it was built from, so F-Droid can verify its build against the signed APKs on the GitHub release and ship them with the developer's signature. F-Droid and GitHub installs can be updated from either source without reinstalling.
+
 ## [1.2.3] - 2026-11-24
 
 ### Improved
