@@ -24,7 +24,7 @@ Do **NOT** add AI attribution to commits or PRs: no `Co-Authored-By: Claude ...`
 * **Dependency wiring:** Manual construction in `MainActivity.onCreate`. Hilt is not active (`core/di/CameraModule.kt` is commented out).
 * **Camera modes:** When adding a mode, update `CameraMode.kt`, both mode lists in `MainActivity.kt` (`onModeSwiped` and `CameraControls`), the label in `CameraModeSelector`, and the routing in `HybridCaptureEngine` / providers.
 * **Preferences:** New settings need a field in `UserPreferences.kt`, a key + flow mapping + `update*` function in `UserPreferencesRepository.kt`, a ViewModel method, and UI wiring.
-* **Native code:** JNI symbols are bound to `com.fearmikey.camera.data.engine.processing.NativePanoramaBridge` and `NativeVisionBridge`. OpenCV comes from the Maven Central AAR (`org.opencv:opencv`) via prefab; nothing is vendored. Keep the reproducibility flags in `app/src/main/cpp/CMakeLists.txt` (`-ffile-prefix-map`, `--build-id=none`) and never add path-, time- or machine-dependent build inputs (see Release workflow).
+* **Native code:** JNI symbols are bound to `com.fearmikey.camera.data.engine.processing.NativePanoramaBridge` and `NativeVisionBridge`. OpenCV comes from the Maven Central AAR (`org.opencv:opencv`) via prefab; nothing is vendored. Keep the reproducibility flags in `app/src/main/cpp/CMakeLists.txt` (`-ffile-prefix-map`, `--build-id=none`) and the `ArtProfile` task disabling in `app/build.gradle.kts` (AGP's `baseline.prof` differs between machines), and never add path-, time- or machine-dependent build inputs (see Release workflow).
 * **Assets:** `.tflite` and `.task` models must stay uncompressed (`androidResources.noCompress`).
 
 ## RELEASE WORKFLOW

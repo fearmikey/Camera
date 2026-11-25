@@ -2,6 +2,11 @@
 
 All notable changes to this project will be documented in this file.
 
+## [1.2.5] - 2026-11-25
+
+### Fixed
+- F-Droid could not verify 1.2.4 against the signed GitHub APKs: the ART startup profile that the build packs into the APK (`baseline.prof`) comes out slightly different on each build machine. Release APKs no longer include it, so F-Droid's build matches and ships with the developer's signature. The first launch after installing may be marginally slower.
+
 ## [1.2.4] - 2026-11-25
 
 ### Improved

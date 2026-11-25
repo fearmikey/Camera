@@ -6,7 +6,7 @@ plugins {
 
 // Optional per-ABI builds (e.g. for F-Droid): ./gradlew assembleRelease -PabiFilter=arm64-v8a
 // Each ABI gets a distinct versionCode (base * 10 + n) so they can be published side by side.
-val baseVersionCode = 14
+val baseVersionCode = 15
 val abiVersionOffsets = mapOf("armeabi-v7a" to 1, "arm64-v8a" to 2, "x86" to 3, "x86_64" to 4)
 val abiFilter: String? = providers.gradleProperty("abiFilter").orNull?.also {
     require(it in abiVersionOffsets) { "Unknown abiFilter '$it'. Use one of ${abiVersionOffsets.keys}" }
@@ -21,7 +21,7 @@ android {
         minSdk = 31
         targetSdk = 35
         versionCode = abiFilter?.let { baseVersionCode * 10 + abiVersionOffsets.getValue(it) } ?: baseVersionCode
-        versionName = "1.2.4"
+        versionName = "1.2.5"
 
         abiFilter?.let { ndk { abiFilters += it } }
 
@@ -80,6 +80,13 @@ android {
         includeInApk = false
         includeInBundle = false
     }
+}
+
+// Reproducible builds: AGP's compiled ART baseline profile (assets/dexopt/baseline.prof[m]) is not
+// byte-stable across machines, so F-Droid's build never matched the signed GitHub APK. Don't
+// generate or package it (the F-Droid-recommended workaround); costs a little first-launch speed.
+tasks.whenTaskAdded {
+    if (name.contains("ArtProfile")) enabled = false
 }
 
 dependencies {

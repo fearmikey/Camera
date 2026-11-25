@@ -1,0 +1,1 @@
+• Fixed reproducible builds: F-Droid's build now matches the signed GitHub release, so both carry the developer's signature
