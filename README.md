@@ -77,4 +77,4 @@ F-Droid builds each release tag from source and publishes it with the developer'
 scripts/build-release.sh v1.2.4 /path/to/Camera-Release.jks
 ```
 
-The script clones the tag fresh and builds each ABI clean (the way F-Droid does), signs the APKs, and writes `dist/<tag>/Camera-<versionName>-<versionCode>.apk`. Upload all four to the GitHub release for that tag.
+The script clones the tag fresh and builds each ABI clean (the way F-Droid does), signs the APKs, and writes `dist/<tag>/Camera-<versionName>-<abi>.apk` (e.g. `Camera-1.2.4-arm64-v8a.apk`; most phones want `arm64-v8a`). Upload all four to the GitHub release for that tag.

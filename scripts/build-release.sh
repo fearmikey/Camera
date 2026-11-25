@@ -17,7 +17,8 @@
 #   KEY_ALIAS='alias'         # optional
 # Without the file, pass the keystore as the 2nd argument and type the passwords when asked.
 #
-# Output: dist/<tag>/Camera-<versionName>-<versionCode>.apk (matches the F-Droid `Binaries:` URL);
+# Output: dist/<tag>/Camera-<versionName>-<abi>.apk, e.g. Camera-1.2.4-arm64-v8a.apk (matches each
+#         F-Droid build entry's `binary:` URL);
 #         set CAMERA_RELEASE_OUT=<dir> to write somewhere else.
 set -euo pipefail
 
@@ -75,7 +76,8 @@ for abi in "${ABIS[@]}"; do
     meta=app/build/outputs/apk/release/output-metadata.json
     name=$(grep -o '"versionName": *"[^"]*"' "$meta" | cut -d'"' -f4)
     code=$(grep -o '"versionCode": *[0-9]*' "$meta" | grep -o '[0-9]*$')
-    apk="$OUT/Camera-$name-$code.apk"
+    apk="$OUT/Camera-$name-$abi.apk"
+    echo "    versionCode $code"
     # F-Droid copies our signature onto its own unsigned build, so signing may only add the
     # APK Signing Block: no v1 JAR signature (rewrites META-INF; minSdk 31 doesn't need it) and
     # no re-alignment of entries (apksigner moves them unless --alignment-preserved).
