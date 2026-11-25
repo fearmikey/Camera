@@ -5,7 +5,7 @@ A free and open-source Android camera app with computational photography that ru
 ## Features
 
 - **Photo**: GPU pixel binning for clean ~12 MP shots, or full sensor resolution.
-- **Night**: long-exposure metering, then a burst of 8–14 hand-holdable manual exposures (up to 1/8 s each with OIS, 1/15 s without) that are aligned to sub-pixel precision and averaged, brightened in linear light with highlights rolled off, cleaned of chroma noise, sharpened and dithered from a 16-bit merge (no banding). **Auto Night** (flash setting) uses it automatically for Photo-mode shots in the dark.
+- **Night**: long-exposure metering, then a burst of 8–20 hand-holdable manual exposures (up to 1/8 s each with OIS, 1/15 s without) that are aligned to sub-pixel precision and averaged, then brightened by up to 5 EV in linear light to a bright, contrasty night-mode look (measured black point, highlights rolled off in their own color, contrast curve), cleaned of chroma noise, sharpened and dithered from a 16-bit merge (no banding). **Auto Night** (flash setting) uses it automatically for Photo-mode shots in the dark.
 - **HDR** (photo option): deterministic -2/0/+2 EV manual exposure bracket, aligned and merged with Mertens exposure fusion.
 - **Long exposure**: handheld, ~2 s of back-to-back base-ISO frames (16–32) aligned and averaged in linear light for silky water, with bright light trails recovered from clipped highlights.
 - **Time lapse**: speeds up 15x (one frame every half second, played at 30 fps).

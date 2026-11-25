@@ -2,6 +2,16 @@
 
 All notable changes to this project will be documented in this file.
 
+## [1.2.3] - 2026-11-24
+
+### Improved
+- Night photos are much brighter and have real contrast, closer to what a phone's night mode produces. The merge used to brighten by at most 2.6 EV toward a dim target with a curve that flattened everything, so dark scenes stayed dark and grey. It now measures the merged frames and brightens by up to 5 EV to just under middle grey, held back when a lit part of the scene would wash out (a lit building under a black sky sets the exposure, not the sky), and applies a contrast curve that lets the deepest shadows fall to black. A scene that is already bright comes out unchanged.
+- Colored lights keep their color in Night photos: warm windows and neon signs roll off toward their own color instead of fading to white.
+- Very dark scenes use up to 20 frames (previously 14) to hold down the noise that the stronger brightening reveals.
+
+### Fixed
+- Shadows in Night photos could carry a grey or purple haze: the sensor's black level is now measured per color channel and removed before brightening.
+
 ## [1.2.2] - 2026-11-24
 
 ### Improved

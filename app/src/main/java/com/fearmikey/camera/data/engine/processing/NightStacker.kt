@@ -11,7 +11,8 @@ import android.media.Image
  * up to three textured patches) and accumulated. Not thread-safe: feed frames from one
  * thread.
  *
- * Night ([longExposure] = false): 12-bit sum, brightened and tone mapped in linear light.
+ * Night ([longExposure] = false): 12-bit sum, brightened to a night-mode look (bright, with
+ * contrast and true blacks) in linear light.
  * Long exposure: linear-light average (what one continuous exposure records) with
  * light-trail recovery for clipped moving highlights. Both finish at 16 bits, sharpen once
  * and dither to 8 bits (see [finish]).

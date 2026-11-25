@@ -28,9 +28,9 @@ object NativeVisionBridge {
         uvPixelStride: Int,
     ): Boolean
     external fun nativeNightFrameCount(ptr: Long): Int
-    // Night: brighten in linear light by max(minGain, auto gain) with a highlight roll-off and
-    // chroma denoise. Long exposure: linear mean x minGain with light-trail recovery. Both are
-    // sharpened once and dithered from 16 to 8 bits.
+    // Night: brighten in linear light by max(minGain, measured gain, up to 5 EV) with a black
+    // point, highlight roll-off, contrast curve and chroma denoise. Long exposure: linear mean
+    // x minGain with light-trail recovery. Both are sharpened once and dithered from 16 to 8 bits.
     external fun nativeNightFinish(ptr: Long, out: Bitmap, rotationDegrees: Int, minGain: Float): Boolean
     external fun nativeNightRelease(ptr: Long)
 

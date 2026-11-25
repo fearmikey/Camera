@@ -566,8 +566,10 @@ class Camera2Provider(
     /**
      * Keeps (slightly more than) the metered brightness, including AE's post-RAW boost, but
      * moves it from gain into exposure time: up to 4x the metered time, capped at the
-     * hand-holdable limit. Darker scenes get more frames, since averaging N frames cuts noise
-     * by sqrt(N).
+     * hand-holdable limit. The frames stay near the viewfinder's brightness (pushing the sensor
+     * further would clip street lights for good); the merge measures the stack and brightens
+     * it. Darker scenes get more frames (8 to 20), since that brightening amplifies noise and
+     * averaging N frames cuts it by sqrt(N).
      */
     private fun planNight(chars: CameraCharacteristics, meter: Meter): StackPlan {
         val expRange = chars[CameraCharacteristics.SENSOR_INFO_EXPOSURE_TIME_RANGE] ?: Range(100_000L, 250_000_000L)
@@ -583,8 +585,9 @@ class Camera2Provider(
 
         val isoSeconds = metered / 1e9
         val frames = when {
-            isoSeconds >= 150 -> NIGHT_FRAMES_MAX
-            isoSeconds >= 50 -> (NIGHT_FRAMES_MIN + NIGHT_FRAMES_MAX) / 2
+            isoSeconds >= NIGHT_VERY_DARK_ISO_SECONDS -> NIGHT_FRAMES_MAX
+            isoSeconds >= 150 -> NIGHT_FRAMES_DARK
+            isoSeconds >= 50 -> (NIGHT_FRAMES_MIN + NIGHT_FRAMES_DARK) / 2
             else -> NIGHT_FRAMES_MIN
         }
         return StackPlan(exposure, exposure, gain.iso, gain.boost, gain.digitalGain, frames)
@@ -1589,7 +1592,9 @@ class Camera2Provider(
     private companion object {
         const val TAG = "Camera2Provider"
         const val NIGHT_FRAMES_MIN = 8
-        const val NIGHT_FRAMES_MAX = 14
+        const val NIGHT_FRAMES_DARK = 14 // from 150 metered ISO-seconds
+        const val NIGHT_FRAMES_MAX = 20 // very dark: the merge brightens by up to 5 EV there
+        const val NIGHT_VERY_DARK_ISO_SECONDS = 400.0
         const val LONG_EXPOSURE_FRAMES_MIN = 16
         const val LONG_EXPOSURE_FRAMES_MAX = 32
         const val LONG_EXPOSURE_TARGET_NS = 2_000_000_000L // planned burst length (back-to-back frames)

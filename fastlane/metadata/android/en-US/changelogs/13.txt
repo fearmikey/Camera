@@ -1,0 +1,3 @@
+• Night photos are much brighter, with real contrast and true blacks, instead of staying as dark as the scene
+• Colored lights (warm windows, neon signs) keep their color in Night photos
+• Very dark scenes use up to 20 frames for less noise

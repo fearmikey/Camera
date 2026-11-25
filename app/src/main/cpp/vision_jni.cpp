@@ -120,11 +120,21 @@ inline double linearToSrgb(double c) {
     return c <= 0.0031308 ? c * 12.92 : 1.055 * std::pow(c, 1.0 / 2.4) - 0.055;
 }
 
-// Night tone mapping parameters (linear light).
-constexpr double kNightKey = 0.10;        // target log-average luminance of the result
-constexpr double kNightMaxAutoGain = 6.0; // auto brightening cap (~2.6 EV)
-constexpr double kNightMaxGain = 8.0;     // overall cap incl. the capture plan's shortfall
-constexpr double kNightMaxBlack = 0.004;  // black point never above this
+// Night tone mapping parameters (linear light unless noted). See nightToneMap.
+constexpr double kNightKey = 0.14;         // target log-average luminance (a third of a stop under middle grey)
+constexpr double kNightHighTarget = 0.8;   // ...but the 90th percentile lands at most here (pre shoulder)
+constexpr double kNightHighPercentile = 0.90;
+constexpr double kNightMaxGain = 32.0;     // brightening cap (5 EV), incl. the capture plan's shortfall
+constexpr double kNightBlackPercentile = 0.005;
+constexpr double kNightMaxBlack = 0.02;    // black point never above this...
+constexpr double kNightBlackShare = 0.6;   // ...nor above this share of the channel's log-average
+constexpr double kNightContrast = 1.35;    // S-curve slope at the pivot (sRGB-encoded) at full strength
+constexpr double kNightPivot = 0.40;       // sRGB-encoded value the S-curve leaves alone (~ the key)
+constexpr double kNightSaturation = 1.15;  // chroma scale at full strength
+constexpr double kNightFullLookStops = 2.0;  // contrast/saturation reach full strength at this gain (EV)
+// From this gain on, chroma is denoised at 1/4 resolution: color blotches are the ugliest part
+// of a 4+ EV push, at the price of slightly rounded corners on small saturated shapes.
+constexpr double kNightStrongChromaGain = 16.0;
 // Luma sharpening after the merge (the frames are captured with EDGE_MODE_OFF).
 constexpr double kNightSharpenSigma = 1.2;
 constexpr double kNightSharpenAmount = 0.8;
@@ -164,13 +174,21 @@ const std::array<float, 256>& srgb8ToLinear() {
     return lut;
 }
 
+struct FinishParams {
+    int chromaDenoiseScale = 0;  // 0 = off, else chroma median at 1/scale resolution
+    double saturation = 1.0;     // chroma scale
+    double sharpenAmount = 0.0;
+    int sharpenCoring = kNightSharpenCoring;  // 16-bit luma differences below this are left alone
+};
+
 // Shared 16-bit finishing for merged stacks. Releases `rgb16` (CV_16UC3, display-encoded).
-//  1. YCrCb; optional chroma median at half resolution (gain amplifies color blotches).
+//  1. YCrCb; optional chroma median at reduced resolution (gain amplifies color blotches)
+//     and chroma scale (saturation).
 //  2. Cored unsharp mask on luma: frames are captured with EDGE_MODE_OFF, so this restores
 //     the detail the ISP's edge enhancement would add, once, without sharpening noise.
 //  3. Triangular dither to 8 bits. Staying at 16 bits until here keeps smooth gradients
 //     (dark walls, skies) free of contour bands.
-void finishRgb16(cv::Mat& rgb16, bool chromaDenoise, double sharpenAmount, cv::Mat& rgbOut) {
+void finishRgb16(cv::Mat& rgb16, const FinishParams& params, cv::Mat& rgbOut) {
     std::vector<cv::Mat> ch;
     {
         cv::Mat ycc;
@@ -179,28 +197,34 @@ void finishRgb16(cv::Mat& rgb16, bool chromaDenoise, double sharpenAmount, cv::M
         cv::split(ycc, ch);
     }
     const cv::Size full = ch[0].size();
-    if (chromaDenoise) {
-        const cv::Size halfSize(std::max(1, full.width / 2), std::max(1, full.height / 2));
-        for (int c = 1; c <= 2; ++c) {
+    const bool saturate = std::abs(params.saturation - 1.0) > 1e-3;
+    for (int c = 1; c <= 2; ++c) {
+        if (params.chromaDenoiseScale > 0) {
+            const cv::Size reduced(std::max(1, full.width / params.chromaDenoiseScale),
+                                   std::max(1, full.height / params.chromaDenoiseScale));
             cv::Mat small;
-            cv::resize(ch[c], small, halfSize, 0, 0, cv::INTER_AREA);
+            cv::resize(ch[c], small, reduced, 0, 0, cv::INTER_AREA);
             cv::medianBlur(small, small, 5);
             cv::resize(small, ch[c], full, 0, 0, cv::INTER_LINEAR);
         }
+        // 16-bit YCrCb chroma is centered on 32768.
+        if (saturate) ch[c].convertTo(ch[c], CV_16U, params.saturation, 32768.0 * (1.0 - params.saturation));
     }
-    if (sharpenAmount > 0.0) {
+    if (params.sharpenAmount > 0.0) {
         cv::Mat blur;
         cv::GaussianBlur(ch[0], blur, cv::Size(0, 0), kNightSharpenSigma);
         cv::Mat& luma = ch[0];
+        const double amount = params.sharpenAmount;
+        const int coring = params.sharpenCoring;
         cv::parallel_for_(cv::Range(0, luma.rows), [&](const cv::Range& range) {
             for (int r = range.start; r < range.end; ++r) {
                 auto* y = luma.ptr<uint16_t>(r);
                 const auto* b = blur.ptr<uint16_t>(r);
                 for (int c = 0; c < luma.cols; ++c) {
                     const int d = static_cast<int>(y[c]) - static_cast<int>(b[c]);
-                    const int mag = std::max(std::abs(d) - kNightSharpenCoring, 0);
+                    const int mag = std::max(std::abs(d) - coring, 0);
                     if (mag == 0) continue;
-                    const double boost = sharpenAmount * (d > 0 ? mag : -mag);
+                    const double boost = amount * (d > 0 ? mag : -mag);
                     y[c] = cv::saturate_cast<uint16_t>(y[c] + boost);
                 }
             }
@@ -236,69 +260,155 @@ void finishRgb16(cv::Mat& rgb16, bool chromaDenoise, double sharpenAmount, cv::M
 // gamma lift) muddies and flattens the image. Everything below runs at 16 bits and is only
 // dithered down to 8 bits at the very end: a smooth dark wall spans just a few 8-bit levels,
 // and any 8-bit intermediate step turns the brightened gradient into visible contour bands.
-//  1. Measure the merged frame in linear light: log-average luminance and a low percentile
-//     (black point). Gain = kNightKey / log-average, never below 1 (never darker than the
-//     frames) or `minGain` (exposure the capture plan could not reach).
-//  2. One per-channel LUT indexed by the exact frame sum: linearize, subtract the black point,
-//     multiply by the gain, then extended Reinhard with white point = gain (identity at gain
-//     1; original white stays white) so street lights roll off instead of clipping; re-encode.
-//  3. YCrCb clean-up: chroma median at half resolution (the gain amplifies color blotches),
-//     cored unsharp mask on luma (restores the detail the ISP's edge enhancement would add).
+// The look follows what a phone night mode produces: a bright frame (log-average near middle
+// grey) with firm contrast and blacks that stay black, instead of the scene's own dimness.
+//  1. Measure the merged frame in linear light on an area-averaged 1/8 copy:
+//     - black point per channel: a low percentile (the sensor/ISP pedestal, which a large gain
+//       would turn into a colored haze), capped so it can never eat the picture;
+//     - log-average and 90th percentile luminance above the black point.
+//     Gain = kNightKey / log-average, limited so the 90th percentile is not pushed past
+//     kNightHighTarget (a lit facade under a black sky sets the exposure, not the sky), never
+//     below 1 (never darker than the frames) or `minGain` (exposure the capture plan could
+//     not reach), at most kNightMaxGain.
+//  2. Per pixel: a LUT per channel indexed by the exact frame sum linearizes, subtracts the
+//     black point and multiplies by the gain; an extended Reinhard shoulder with white point
+//     = gain (original white stays white) rolls street lights off instead of clipping them;
+//     an S-curve around kNightPivot gives back the contrast the roll-off took and lets the
+//     deepest shadows (and their noise) fall to black. Shoulder and S-curve are one factor
+//     per pixel, so colors keep their hue. Black point, contrast and saturation fade in with
+//     the brightening, so a scene that needed none comes out unchanged.
+//  3. YCrCb clean-up: chroma median (the gain amplifies color blotches; coarser at high
+//     gains), chroma scale, cored unsharp mask on luma (gentler at high gains, where the
+//     "detail" is mostly noise).
 //  4. Triangular dither to 8 bits.
 void nightToneMap(cv::Mat& acc, int frames, double minGain, cv::Mat& rgbOut) {
     const double toUnit = 1.0 / (255.0 * frames);
+    constexpr double kLumWeight[3] = {0.2126, 0.7152, 0.0722};
 
     // --- 1. statistics on a small copy ---
     cv::Mat small;
     const int sw = std::max(1, acc.cols / 8);
     const int sh = std::max(1, acc.rows / 8);
     cv::resize(acc, small, cv::Size(sw, sh), 0, 0, cv::INTER_AREA);
-    std::vector<float> lum;
-    lum.reserve(static_cast<size_t>(sw) * sh);
-    double logSum = 0.0;
+    const size_t count = static_cast<size_t>(sw) * sh;
+    std::array<std::vector<float>, 3> lin;  // linear channel values, pixel order
+    for (auto& v : lin) v.resize(count);
+    double rawLogSum = 0.0;
+    double channelLogSum[3] = {0.0, 0.0, 0.0};
     for (int r = 0; r < small.rows; ++r) {
         const auto* p = small.ptr<uint16_t>(r);
-        for (int c = 0; c < small.cols; ++c, p += 3) {
-            const double y = 0.2126 * srgbToLinear(p[0] * toUnit) +
-                             0.7152 * srgbToLinear(p[1] * toUnit) +
-                             0.0722 * srgbToLinear(p[2] * toUnit);
-            lum.push_back(static_cast<float>(y));
-            logSum += std::log(1e-4 + y);
+        size_t i = static_cast<size_t>(r) * sw;
+        for (int c = 0; c < small.cols; ++c, p += 3, ++i) {
+            double y = 0.0;
+            for (int k = 0; k < 3; ++k) {
+                const double v = srgbToLinear(p[k] * toUnit);
+                lin[k][i] = static_cast<float>(v);
+                channelLogSum[k] += std::log(1e-4 + v);
+                y += kLumWeight[k] * v;
+            }
+            rawLogSum += std::log(1e-4 + y);
         }
     }
-    const double logAvg = std::exp(logSum / static_cast<double>(lum.size()));
-    auto nth = lum.begin() + static_cast<long>(lum.size() / 200);  // 0.5th percentile
-    std::nth_element(lum.begin(), nth, lum.end());
-    const double black = std::clamp(static_cast<double>(*nth), 0.0, kNightMaxBlack);
-
-    const double autoGain = std::clamp(kNightKey / std::max(logAvg - black, 1e-4), 1.0, kNightMaxAutoGain);
-    const double gain = std::clamp(std::max(autoGain, minGain), 1.0, kNightMaxGain);
-    LOGI("Night tone map: logAvg %.4f black %.4f minGain %.2f -> gain %.2f", logAvg, black, minGain, gain);
-
-    // --- 2. LUT indexed by the frame sum (exact; no intermediate rounding) ---
-    const int lutSize = 255 * frames + 1;
-    std::vector<uint16_t> lut(static_cast<size_t>(lutSize));
-    const double white = gain;  // the brightest input maps to exactly 1
-    for (int i = 0; i < lutSize; ++i) {
-        double x = srgbToLinear(i / static_cast<double>(lutSize - 1));
-        x = std::max(0.0, x - black) / (1.0 - black) * gain;
-        // Extended Reinhard: slope 1 in the shadows, white -> 1, identity when gain == 1.
-        const double y = x * (1.0 + x / (white * white)) / (1.0 + x);
-        lut[i] = cv::saturate_cast<uint16_t>(linearToSrgb(std::clamp(y, 0.0, 1.0)) * 65535.0 + 0.5);
+    const double rawLogAvg = std::exp(rawLogSum / static_cast<double>(count));
+    const auto percentile = [](std::vector<float> v, double p) {  // by value: reorders its copy
+        auto nth = v.begin() + static_cast<long>(static_cast<double>(v.size() - 1) * p);
+        std::nth_element(v.begin(), nth, v.end());
+        return static_cast<double>(*nth);
+    };
+    // The pedestal only shows once it is amplified: a scene that needs no brightening keeps
+    // its own blacks (and comes out unchanged). Each channel's black point is capped by that
+    // channel's own level: clipped sensor noise leaves more pedestal in the channels white
+    // balance amplifies most (purple shadows), while a flat scene (fog, a bare wall) must not
+    // lose most of its signal.
+    const double need = std::clamp(std::log2(kNightKey / rawLogAvg) / kNightFullLookStops, 0.0, 1.0);
+    double black[3];
+    for (int k = 0; k < 3; ++k) {
+        const double channelLogAvg = std::exp(channelLogSum[k] / static_cast<double>(count));
+        const double cap = std::min(kNightMaxBlack, kNightBlackShare * channelLogAvg) * need;
+        black[k] = std::clamp(percentile(lin[k], kNightBlackPercentile), 0.0, cap);
     }
+
+    std::vector<float> lum(count);
+    double logSum = 0.0;
+    for (size_t i = 0; i < count; ++i) {
+        double y = 0.0;
+        for (int k = 0; k < 3; ++k) {
+            y += kLumWeight[k] * std::max(0.0, lin[k][i] - black[k]) / (1.0 - black[k]);
+        }
+        lum[i] = static_cast<float>(y);
+        logSum += std::log(1e-4 + y);
+    }
+    const double logAvg = std::exp(logSum / static_cast<double>(count));
+    const double high = percentile(std::move(lum), kNightHighPercentile);
+
+    const double autoGain = std::min(kNightKey / std::max(logAvg, 1e-4), kNightHighTarget / std::max(high, 1e-4));
+    const double gain = std::clamp(std::max(autoGain, minGain), 1.0, kNightMaxGain);
+    const double stops = std::log2(gain);
+    const double look = std::clamp(stops / kNightFullLookStops, 0.0, 1.0);
+    const double contrast = 1.0 + (kNightContrast - 1.0) * look;
+    LOGI("Night tone map: logAvg %.4f p90 %.4f black %.4f/%.4f/%.4f minGain %.2f -> gain %.2f contrast %.2f",
+         logAvg, high, black[0], black[1], black[2], minGain, gain, contrast);
+
+    // --- 2. tone curve ---
+    // Frame sum (exact; no intermediate rounding) -> linear light above black, x gain.
+    const int lutSize = 255 * frames + 1;
+    std::array<std::vector<float>, 3> toScene;
+    for (int k = 0; k < 3; ++k) {
+        toScene[k].resize(static_cast<size_t>(lutSize));
+        for (int i = 0; i < lutSize; ++i) {
+            const double x = srgbToLinear(i / static_cast<double>(lutSize - 1));
+            toScene[k][i] = static_cast<float>(std::max(0.0, x - black[k]) / (1.0 - black[k]) * gain);
+        }
+    }
+    // Both curves below are driven by the pixel's largest channel and applied as one factor to
+    // all three, so colors keep their hue and saturation: per channel, a warm window or a neon
+    // sign rolls off to white and the S-curve oversaturates every dark tone.
+    // S-curve, as a factor per linear value: two power segments in sRGB-encoded space that
+    // meet at the pivot with slope `contrast`. 1/65535 linear steps are ~0.05 8-bit levels
+    // even in deep shadows.
+    constexpr int kEncSize = 65536;
+    std::vector<float> curve(kEncSize);
+    std::vector<uint16_t> encode(kEncSize);  // linear [0, 1] -> 16-bit sRGB
+    for (int i = 0; i < kEncSize; ++i) {
+        const double v = i / static_cast<double>(kEncSize - 1);
+        const double e = linearToSrgb(v);
+        const double s = e < kNightPivot
+            ? kNightPivot * std::pow(e / kNightPivot, contrast)
+            : 1.0 - (1.0 - kNightPivot) * std::pow((1.0 - e) / (1.0 - kNightPivot), contrast);
+        curve[i] = i == 0 ? 0.0f : static_cast<float>(srgbToLinear(s) / v);
+        encode[i] = cv::saturate_cast<uint16_t>(e * 65535.0 + 0.5);
+    }
+    // Extended Reinhard shoulder with white point = gain: slope 1 in the shadows, the brightest
+    // input maps to exactly 1, identity when gain == 1.
+    const float invWhiteSq = static_cast<float>(1.0 / (gain * gain));
     cv::Mat rgb16(acc.rows, acc.cols, CV_16UC3);
     cv::parallel_for_(cv::Range(0, acc.rows), [&](const cv::Range& range) {
         for (int r = range.start; r < range.end; ++r) {
             const auto* src = acc.ptr<uint16_t>(r);
             auto* dst = rgb16.ptr<uint16_t>(r);
-            const int n = acc.cols * 3;
-            for (int i = 0; i < n; ++i) dst[i] = lut[std::min<int>(src[i], lutSize - 1)];
+            for (int c = 0; c < acc.cols; ++c, src += 3, dst += 3) {
+                float x[3];
+                for (int k = 0; k < 3; ++k) x[k] = toScene[k][std::min<int>(src[k], lutSize - 1)];
+                const float m = std::max({x[0], x[1], x[2]});
+                const float shoulder = (1.0f + m * invWhiteSq) / (1.0f + m);
+                const float top = std::min(m * shoulder, 1.0f);
+                const float factor = shoulder * curve[static_cast<int>(top * (kEncSize - 1) + 0.5f)];
+                for (int k = 0; k < 3; ++k) {
+                    const float y = std::min(x[k] * factor, 1.0f);
+                    dst[k] = encode[static_cast<int>(y * (kEncSize - 1) + 0.5f)];
+                }
+            }
         }
     });
     acc.release();
 
-    // --- 3./4. chroma denoise + luma sharpening at 16 bits, dither to 8 bits ---
-    finishRgb16(rgb16, true, kNightSharpenAmount, rgbOut);
+    // --- 3./4. chroma denoise + saturation + luma sharpening at 16 bits, dither to 8 bits ---
+    FinishParams finish;
+    finish.chromaDenoiseScale = gain >= kNightStrongChromaGain ? 4 : 2;
+    finish.saturation = 1.0 + (kNightSaturation - 1.0) * look;
+    finish.sharpenAmount = kNightSharpenAmount / (1.0 + 0.25 * stops);
+    finish.sharpenCoring = static_cast<int>(kNightSharpenCoring * (1.0 + 0.5 * stops));
+    finishRgb16(rgb16, finish, rgbOut);
 }
 
 // Long exposure merge. `sum` is the CV_32FC3 linear-light sum of `frames` aligned frames,
@@ -367,7 +477,10 @@ void longExposureMerge(cv::Mat& sum, cv::Mat& peak, int frames, double gain, cv:
     peak.release();
     LOGI("Long exposure merge: %d frames, gain %.2f", frames, gain);
 
-    finishRgb16(rgb16, gain > 2.0, kLongSharpenAmount, rgbOut);
+    FinishParams finish;
+    finish.chromaDenoiseScale = gain > 2.0 ? 2 : 0;
+    finish.sharpenAmount = kLongSharpenAmount;
+    finishRgb16(rgb16, finish, rgbOut);
 }
 
 // ---------------------------------------------------------------------------
