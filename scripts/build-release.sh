@@ -5,15 +5,36 @@
 # unsigned APK is byte-identical to ours, so this mirrors F-Droid's build: a fresh clone of the
 # tag, the recipe's prebuild step, and a `git clean` before every ABI so nothing is incremental.
 #
-# Usage: scripts/build-release.sh <tag> <keystore.jks> [key-alias]
-#   e.g. scripts/build-release.sh v1.2.4 ~/Documents/Keystores/Camera-Release.jks
+# Usage: scripts/build-release.sh <tag> [keystore.jks] [key-alias]
+#   e.g. scripts/build-release.sh v1.2.4
+#
+# Signing settings come from a private file outside the repo, so the script (and agents running it)
+# never prompt for or see the password. Default ~/.config/camera-release/release.env, override with
+# CAMERA_RELEASE_CONFIG. chmod 600 it. Contents (bash syntax; quote values):
+#   KEYSTORE='/path/to/Camera-Release.jks'
+#   KS_PASS='keystore password'
+#   KEY_PASS='key password'   # optional, defaults to KS_PASS
+#   KEY_ALIAS='alias'         # optional
+# Without the file, pass the keystore as the 2nd argument and type the passwords when asked.
+#
 # Output: dist/<tag>/Camera-<versionName>-<versionCode>.apk (matches the F-Droid `Binaries:` URL);
 #         set CAMERA_RELEASE_OUT=<dir> to write somewhere else.
 set -euo pipefail
 
-TAG=${1:?usage: $0 <tag> <keystore.jks> [key-alias]}
-KEYSTORE=$(realpath "${2:?usage: $0 <tag> <keystore.jks> [key-alias]}")
-ALIAS=${3:-}
+CONFIG=${CAMERA_RELEASE_CONFIG:-$HOME/.config/camera-release/release.env}
+if [[ -f "$CONFIG" ]]; then
+    if (( 8#$(stat -c %a "$CONFIG") & 8#077 )); then
+        echo "warning: $CONFIG is readable by other users; run: chmod 600 $CONFIG" >&2
+    fi
+    # shellcheck source=/dev/null
+    source "$CONFIG"
+fi
+
+TAG=${1:?usage: $0 <tag> [keystore.jks] [key-alias]}
+KEYSTORE=${2:-${KEYSTORE:-}}
+[[ -n "$KEYSTORE" ]] || { echo "No keystore: pass it as the 2nd argument or set KEYSTORE in $CONFIG" >&2; exit 1; }
+KEYSTORE=$(realpath "$KEYSTORE")
+ALIAS=${3:-${KEY_ALIAS:-}}
 ABIS=(armeabi-v7a arm64-v8a x86 x86_64)
 
 REPO=$(git -C "$(dirname "$0")" rev-parse --show-toplevel)
@@ -29,9 +50,12 @@ APKSIGNER=$(ls -d "$ANDROID_HOME"/build-tools/*/apksigner | sort -V | tail -1)
 git -C "$REPO" rev-parse --verify --quiet "refs/tags/$TAG" >/dev/null \
     || { echo "Tag $TAG does not exist" >&2; exit 1; }
 
-read -rsp "Keystore password: " KS_PASS; echo
-read -rsp "Key password (Enter if same): " KEY_PASS; echo
+if [[ -z "${KS_PASS:-}" ]]; then
+    read -rsp "Keystore password: " KS_PASS; echo
+    read -rsp "Key password (Enter if same): " KEY_PASS; echo
+fi
 export CAMERA_KS_PASS="$KS_PASS" CAMERA_KEY_PASS="${KEY_PASS:-$KS_PASS}"
+unset KS_PASS KEY_PASS
 
 WORK=$(mktemp -d)
 trap 'rm -rf "$WORK"' EXIT
